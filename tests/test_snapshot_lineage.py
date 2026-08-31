@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import date
 from pathlib import Path
@@ -6,11 +7,15 @@ import pytest
 
 from quant_data.snapshot_lineage import (
     assert_snapshot_descendant,
+    canonical_sha256,
     file_contract_sha256,
     make_lineage_id,
     prepare_lineage_metadata,
+    resolve_verified_snapshot_anchor,
     verify_snapshot_lineage,
 )
+
+pytestmark = pytest.mark.no_database
 
 
 def _unit(key: str, digest: str, rows: int) -> dict[str, object]:
@@ -21,6 +26,45 @@ def _write_manifest(root: Path, name: str, manifest: dict[str, object]) -> None:
     path = root / name
     path.mkdir(parents=True)
     (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _write_industry_anchor(root: Path, name: str = "industry-anchor") -> Path:
+    path = root / name
+    dataset_file = path / "parquet" / "index_member_all" / "data.parquet"
+    dataset_file.parent.mkdir(parents=True)
+    dataset_file.write_bytes(b"sealed-industry-history")
+    file_sha256 = hashlib.sha256(dataset_file.read_bytes()).hexdigest()
+    configuration = {"source": "verified-old-contract"}
+    manifest = {
+        "name": name,
+        "profile": "full",
+        "start_date": "2008-01-01",
+        "end_date": "2026-08-28",
+        "quality_gate": {"ok": True},
+        "lineage_id": make_lineage_id("qlib_daily_source", configuration),
+        "lineage_contract": {
+            "kind": "qlib_daily_source",
+            "configuration": configuration,
+        },
+        "lineage_generation": 0,
+        "parent_snapshot": None,
+        "parent_manifest_sha256": None,
+        "datasets": {
+            "index_member_all": {
+                "rows": 1,
+                "source_sha256": "a" * 64,
+                "files": [
+                    {
+                        "path": "parquet/index_member_all/data.parquet",
+                        "bytes": dataset_file.stat().st_size,
+                        "sha256": file_sha256,
+                    }
+                ],
+            }
+        },
+    }
+    (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return path
 
 
 def test_prepares_append_only_snapshot_successor(tmp_path: Path) -> None:
@@ -193,4 +237,135 @@ def test_rejects_cross_lineage_or_earlier_candidate() -> None:
         assert_snapshot_descendant(
             anchor_manifest=ancestor,
             candidate_manifest=candidate,
+        )
+
+
+def test_resolves_verified_cross_lineage_industry_anchor(tmp_path: Path) -> None:
+    anchor = _write_industry_anchor(tmp_path)
+
+    resolved, evidence = resolve_verified_snapshot_anchor(
+        tmp_path,
+        anchor.name,
+        required_profile="full",
+        required_start=date(2008, 1, 1),
+        maximum_end=date(2026, 8, 31),
+        required_dataset="index_member_all",
+    )
+
+    assert resolved == anchor.resolve()
+    assert evidence["snapshot_name"] == anchor.name
+    assert evidence["end_date"] == "2026-08-28"
+    assert evidence["carry_rule_version"] == (
+        "index-member-delisted-parent-carry-v1"
+    )
+    assert len(evidence["manifest_sha256"]) == 64
+    assert len(evidence["dataset_files_sha256"]) == 64
+    unsigned = dict(evidence)
+    evidence_sha256 = unsigned.pop("evidence_sha256")
+    assert evidence_sha256 == canonical_sha256(unsigned)
+
+
+@pytest.mark.parametrize(
+    ("required_profile", "required_start", "maximum_end", "error"),
+    [
+        ("core", date(2008, 1, 1), date(2026, 8, 31), "profile does not match"),
+        ("full", date(2009, 1, 1), date(2026, 8, 31), "start date does not match"),
+        ("full", date(2008, 1, 1), date(2026, 8, 27), "ends after"),
+    ],
+)
+def test_industry_anchor_rejects_incompatible_scope(
+    tmp_path: Path,
+    required_profile: str,
+    required_start: date,
+    maximum_end: date,
+    error: str,
+) -> None:
+    anchor = _write_industry_anchor(tmp_path)
+
+    with pytest.raises(ValueError, match=error):
+        resolve_verified_snapshot_anchor(
+            tmp_path,
+            anchor.name,
+            required_profile=required_profile,
+            required_start=required_start,
+            maximum_end=maximum_end,
+            required_dataset="index_member_all",
+        )
+
+
+def test_industry_anchor_rejects_failed_quality_and_tampered_bytes(
+    tmp_path: Path,
+) -> None:
+    anchor = _write_industry_anchor(tmp_path)
+    manifest_path = anchor / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["quality_gate"] = {"ok": False}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="passing quality gate"):
+        resolve_verified_snapshot_anchor(
+            tmp_path,
+            anchor.name,
+            required_profile="full",
+            required_start=date(2008, 1, 1),
+            maximum_end=date(2026, 8, 31),
+            required_dataset="index_member_all",
+        )
+
+    manifest["quality_gate"] = {"ok": True}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (anchor / "parquet" / "index_member_all" / "data.parquet").write_bytes(
+        b"tampered"
+    )
+    with pytest.raises(ValueError, match="hash does not match"):
+        resolve_verified_snapshot_anchor(
+            tmp_path,
+            anchor.name,
+            required_profile="full",
+            required_start=date(2008, 1, 1),
+            maximum_end=date(2026, 8, 31),
+            required_dataset="index_member_all",
+        )
+
+
+def test_industry_anchor_rejects_unsafe_duplicate_or_unmanifested_files(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="safe snapshot name"):
+        resolve_verified_snapshot_anchor(
+            tmp_path,
+            "../industry-anchor",
+            required_profile="full",
+            required_start=date(2008, 1, 1),
+            maximum_end=date(2026, 8, 31),
+            required_dataset="index_member_all",
+        )
+
+    anchor = _write_industry_anchor(tmp_path)
+    manifest_path = anchor / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["datasets"]["index_member_all"]["files"] *= 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="repeats a dataset file path"):
+        resolve_verified_snapshot_anchor(
+            tmp_path,
+            anchor.name,
+            required_profile="full",
+            required_start=date(2008, 1, 1),
+            maximum_end=date(2026, 8, 31),
+            required_dataset="index_member_all",
+        )
+
+    manifest["datasets"]["index_member_all"]["files"] = manifest["datasets"][
+        "index_member_all"
+    ]["files"][:1]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (anchor / "parquet" / "index_member_all" / "extra.parquet").write_bytes(b"extra")
+    with pytest.raises(ValueError, match="unmanifested dataset files"):
+        resolve_verified_snapshot_anchor(
+            tmp_path,
+            anchor.name,
+            required_profile="full",
+            required_start=date(2008, 1, 1),
+            maximum_end=date(2026, 8, 31),
+            required_dataset="index_member_all",
         )

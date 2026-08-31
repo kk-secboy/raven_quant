@@ -2898,24 +2898,28 @@ class LocalJobWorker:
                 {},
             )
         if job["kind"] == "data_snapshot":
-            return (
-                [
-                    sys.executable,
-                    "-m",
-                    "quant_data.cli",
-                    "snapshot",
-                    "--name",
-                    payload["snapshot_name"],
-                    "--start",
-                    payload["start"],
-                    "--end",
-                    payload["end"],
-                    "--profile",
-                    payload["profile"],
-                ],
-                None,
-                {},
-            )
+            command = [
+                sys.executable,
+                "-m",
+                "quant_data.cli",
+                "snapshot",
+                "--name",
+                payload["snapshot_name"],
+                "--start",
+                payload["start"],
+                "--end",
+                payload["end"],
+                "--profile",
+                payload["profile"],
+            ]
+            if payload.get("industry_history_anchor"):
+                command.extend(
+                    [
+                        "--industry-history-anchor",
+                        str(payload["industry_history_anchor"]),
+                    ]
+                )
+            return command, None, {}
         if job["kind"] == "data_qlib":
             return (
                 [
@@ -5425,6 +5429,16 @@ class LocalJobWorker:
                 and str(step_pipeline_snapshot_name) != pipeline_snapshot_name
             ):
                 raise ValueError("data pipeline step cannot change its snapshot namespace")
+            pipeline_anchor = payload.get("industry_history_anchor")
+            step_anchor = step_payload.get("industry_history_anchor")
+            if (
+                step_anchor is not None
+                and (
+                    pipeline_anchor is None
+                    or str(step_anchor) != str(pipeline_anchor)
+                )
+            ):
+                raise ValueError("data pipeline step cannot change its industry anchor")
             kind = str(step.get("kind") or "")
             allowed = {
                 "data_verify",
@@ -5467,7 +5481,11 @@ class LocalJobWorker:
                 "snapshot_start": snapshot_start,
                 "snapshot_end": snapshot_end,
             }
-            for key in ("download_workers", "requests_per_minute"):
+            for key in (
+                "download_workers",
+                "requests_per_minute",
+                "industry_history_anchor",
+            ):
                 if key in payload and key not in successor_payload:
                     successor_payload[key] = payload[key]
             if kind == "minute_qlib":

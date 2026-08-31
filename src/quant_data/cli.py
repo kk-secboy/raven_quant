@@ -118,6 +118,7 @@ from .snapshot_lineage import (
     file_contract_sha256,
     make_lineage_id,
     prepare_lineage_metadata,
+    resolve_verified_snapshot_anchor,
     verify_snapshot_lineage,
 )
 from .storage import ParquetStore
@@ -156,6 +157,7 @@ RESEARCH_ASSET_SNAPSHOT_PROFILE = "research-assets"
 SNAPSHOT_PROFILES = frozenset(
     {*QLIB_SNAPSHOT_PROFILES, RESEARCH_ASSET_SNAPSHOT_PROFILE}
 )
+INDUSTRY_HISTORY_CARRY_RULE_VERSION = "index-member-delisted-parent-carry-v1"
 
 
 # Provider probes on 2026-08-04 proved that these non-adaptive interfaces can
@@ -1950,6 +1952,16 @@ def snapshot(
             )
         ),
     ] = "core",
+    industry_history_anchor: Annotated[
+        str | None,
+        typer.Option(
+            "--industry-history-anchor",
+            help=(
+                "One verified older snapshot used once to restore missing PIT industry "
+                "rows for explicitly delisted stocks in a new lineage root"
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Build an immutable compacted Parquet snapshot from successful units."""
     context = load_context(require_credentials=False)
@@ -1980,7 +1992,13 @@ def snapshot(
         _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
         raise typer.Exit(3)
     path = _build_snapshot(
-        context, name, start_date, end_date, profile, quality_gate=quality_gate_payload(report)
+        context,
+        name,
+        start_date,
+        end_date,
+        profile,
+        quality_gate=quality_gate_payload(report),
+        industry_history_anchor=industry_history_anchor,
     )
     write_report(report, path / "verification.json")
     console.print(path)
@@ -3731,6 +3749,7 @@ def _build_snapshot(
     end_date: date,
     profile: str,
     quality_gate: dict[str, Any] | None = None,
+    industry_history_anchor: str | None = None,
 ) -> Path:
     if not quality_gate or quality_gate.get("ok") is not True:
         raise ValueError("snapshot publication requires a passing bound quality gate")
@@ -3769,6 +3788,11 @@ def _build_snapshot(
         "legacy_overlap_policy_version": (
             BAOSTOCK_OVERLAP_POLICY_VERSION if mixed_legacy_source else None
         ),
+        "industry_history_carry_rule_version": (
+            INDUSTRY_HISTORY_CARRY_RULE_VERSION
+            if not is_research_asset_source
+            else None
+        ),
         "ingestion_contract_sha256": file_contract_sha256(contract_files),
     }
     lineage_contract = {
@@ -3781,6 +3805,25 @@ def _build_snapshot(
         lineage_contract["kind"],
         lineage_configuration,
     )
+    industry_anchor_path: Path | None = None
+    industry_anchor_evidence: dict[str, Any] | None = None
+    if industry_history_anchor is not None:
+        if is_research_asset_source:
+            raise ValueError(
+                "industry history anchor is not valid for research-assets snapshots"
+            )
+        if industry_history_anchor == name:
+            raise ValueError("industry history anchor must differ from the target snapshot")
+        industry_anchor_path, industry_anchor_evidence = (
+            resolve_verified_snapshot_anchor(
+                context.storage.snapshots_root,
+                industry_history_anchor,
+                required_profile=profile,
+                required_start=start_date,
+                maximum_end=end_date,
+                required_dataset="index_member_all",
+            )
+        )
     existing = context.storage.snapshots_root / name
     if existing.exists():
         manifest_path = existing / "manifest.json"
@@ -3796,6 +3839,10 @@ def _build_snapshot(
         }
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"existing snapshot {name!r} does not match the requested range")
+        if manifest.get("industry_history_anchor") != industry_anchor_evidence:
+            raise ValueError(
+                f"existing snapshot {name!r} does not match the requested industry anchor"
+            )
         if quality_gate:
             gate_scope = quality_gate.get("plan_scope_sha256") or quality_gate.get(
                 "release_window_scope_sha256"
@@ -3853,6 +3900,11 @@ def _build_snapshot(
         end_date=end_date,
         successful_units=units,
     )
+    if industry_anchor_path is not None and lineage.get("parent_snapshot") is not None:
+        raise ValueError(
+            "industry history anchor is only allowed for a new lineage root; "
+            "a compatible parent snapshot already exists"
+        )
     base_snapshot: Path | None = None
     parent_name = lineage.get("parent_snapshot")
     if parent_name:
@@ -3883,9 +3935,15 @@ def _build_snapshot(
                 else {"primary": "tushare-compatible"}
             ),
             **({"quality_gate": quality_gate} if quality_gate else {}),
+            **(
+                {"industry_history_anchor": industry_anchor_evidence}
+                if industry_anchor_evidence is not None
+                else {}
+            ),
             **lineage,
         },
         base_snapshot=base_snapshot,
+        industry_history_anchor=industry_anchor_path,
     )
 
 

@@ -237,6 +237,8 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "生产发布没有 QMT 或任何券商网关例外",
         "不得推导或伪造涨跌停价",
         "逐行 fail-closed 标记覆盖全部缺失行",
+        "当前集合存在即完全优先，上市或状态未知股票不得继承",
+        "锚点快照、文件哈希、继承股票和行数必须写入不可变证据",
     )
     for contract in required_contracts:
         assert contract in specification

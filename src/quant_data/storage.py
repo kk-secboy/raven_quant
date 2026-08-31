@@ -151,11 +151,17 @@ class ParquetStore:
         successful_units: dict[str, list[dict[str, Any]]],
         manifest_extra: dict[str, Any],
         base_snapshot: Path | None = None,
+        industry_history_anchor: Path | None = None,
         duckdb_memory_limit: str = "4GB",
         duckdb_threads: int = 4,
     ) -> Path:
         target = self.snapshots_root / name
         temporary = self.snapshots_root / f".{name}.tmp"
+        if base_snapshot is not None and industry_history_anchor is not None:
+            raise ValueError(
+                "industry history anchor is only valid for a new lineage root; "
+                "a lineage parent is already available"
+            )
         if target.exists():
             raise FileExistsError(f"snapshot already exists: {target}")
         if temporary.exists():
@@ -174,9 +180,37 @@ class ParquetStore:
                 base_manifest = json.loads(
                     (base_snapshot / "manifest.json").read_text(encoding="utf-8")
                 )
-            except (FileNotFoundError, json.JSONDecodeError) as exc:
+            except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError(f"base snapshot {base_snapshot} is incomplete") from exc
             base_root = base_snapshot / "parquet"
+
+        industry_anchor_root: Path | None = None
+        industry_anchor_manifest: dict[str, Any] = {}
+        industry_anchor_evidence: dict[str, Any] | None = None
+        if industry_history_anchor is not None:
+            try:
+                anchor_manifest_raw = (industry_history_anchor / "manifest.json").read_bytes()
+                industry_anchor_manifest = json.loads(anchor_manifest_raw)
+            except (FileNotFoundError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"industry history anchor {industry_history_anchor} is incomplete"
+                ) from exc
+            if not isinstance(industry_anchor_manifest, dict):
+                raise ValueError("industry history anchor manifest is invalid")
+            industry_anchor_evidence = manifest_extra.get("industry_history_anchor")
+            if not isinstance(industry_anchor_evidence, dict):
+                raise ValueError("industry history anchor has no governed evidence")
+            expected_evidence = dict(industry_anchor_evidence)
+            evidence_sha256 = str(expected_evidence.pop("evidence_sha256", ""))
+            if (
+                industry_anchor_evidence.get("snapshot_name")
+                != industry_history_anchor.name
+                or industry_anchor_evidence.get("manifest_sha256")
+                != hashlib.sha256(anchor_manifest_raw).hexdigest()
+                or evidence_sha256 != _canonical_sha256(expected_evidence)
+            ):
+                raise ValueError("industry history anchor evidence does not match")
+            industry_anchor_root = industry_history_anchor / "parquet"
 
         manifest: dict[str, Any] = {
             "name": name,
@@ -193,12 +227,35 @@ class ParquetStore:
             spill_dir = temporary / ".duckdb-spill"
             spill_dir.mkdir(exist_ok=True)
             connection.execute(f"SET temp_directory={_sql_string(str(spill_dir))}")
+            delisted_stock_symbols = self._explicitly_delisted_stock_symbols(
+                connection,
+                successful_units.get("stock_basic", []),
+            )
             for dataset, rows in sorted(successful_units.items()):
                 base_entry = None
                 if base_root is not None:
                     base_entry = (base_manifest.get("datasets") or {}).get(dataset)
                     if not isinstance(base_entry, dict):
                         base_entry = None
+                industry_history_root = base_root
+                industry_history_entry = base_entry
+                industry_history_source = (
+                    base_snapshot.name if base_snapshot is not None else None
+                )
+                industry_history_source_kind = "lineage_parent"
+                if (
+                    dataset == "index_member_all"
+                    and industry_history_entry is None
+                    and industry_anchor_root is not None
+                ):
+                    anchor_entry = (industry_anchor_manifest.get("datasets") or {}).get(
+                        dataset
+                    )
+                    if isinstance(anchor_entry, dict):
+                        industry_history_root = industry_anchor_root
+                        industry_history_entry = anchor_entry
+                        industry_history_source = industry_history_anchor.name
+                        industry_history_source_kind = "explicit_anchor"
                 manifest["datasets"][dataset] = self._build_dataset_snapshot(
                     connection,
                     dataset,
@@ -208,6 +265,20 @@ class ParquetStore:
                     base_entry,
                     snapshot_start,
                     snapshot_end,
+                    industry_history_root=(
+                        industry_history_root
+                        if dataset == "index_member_all"
+                        else None
+                    ),
+                    industry_history_entry=(
+                        industry_history_entry
+                        if dataset == "index_member_all"
+                        else None
+                    ),
+                    industry_history_source=industry_history_source,
+                    industry_history_source_kind=industry_history_source_kind,
+                    delisted_stock_symbols=delisted_stock_symbols,
+                    industry_history_anchor_evidence=industry_anchor_evidence,
                 )
             historical = {
                 dataset: {
@@ -247,6 +318,13 @@ class ParquetStore:
         base_entry: dict[str, Any] | None,
         snapshot_start: str | None,
         snapshot_end: str | None,
+        *,
+        industry_history_root: Path | None = None,
+        industry_history_entry: dict[str, Any] | None = None,
+        industry_history_source: str | None = None,
+        industry_history_source_kind: str | None = None,
+        delisted_stock_symbols: frozenset[str] = frozenset(),
+        industry_history_anchor_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         refresh_metadata = reference_manifest_metadata(rows)
         source_identity = [
@@ -301,13 +379,34 @@ class ParquetStore:
         base_dir = base_root / dataset if base_root is not None else None
         dataset_dir = temporary / "parquet" / dataset
         quoted_paths = "[" + ",".join(_sql_string(path) for path in paths) + "]"
+        raw_source_sql = (
+            f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+        )
         columns = (
-            connection.execute(
-                f"DESCRIBE SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
-            )
+            connection.execute(f"DESCRIBE {raw_source_sql}")
             .fetchdf()["column_name"]
             .tolist()
         )
+        carry_result = self._index_member_parent_carry(
+            connection,
+            dataset=dataset,
+            current_source_sql=raw_source_sql,
+            current_columns=set(columns),
+            history_root=industry_history_root,
+            history_entry=industry_history_entry,
+            history_source=industry_history_source,
+            history_source_kind=industry_history_source_kind,
+            delisted_stock_symbols=delisted_stock_symbols,
+            industry_history_anchor_evidence=industry_history_anchor_evidence,
+        )
+        industry_carry: dict[str, Any] | None = None
+        if carry_result is not None:
+            raw_source_sql, industry_carry = carry_result
+            columns = (
+                connection.execute(f"DESCRIBE {raw_source_sql}")
+                .fetchdf()["column_name"]
+                .tolist()
+            )
         date_field = next(
             (field for field in _date_field_candidates(dataset) if field in columns),
             None,
@@ -322,9 +421,8 @@ class ParquetStore:
             date_expression = _date_sql_expression(date_field)
             has_valid_dates = bool(
                 connection.execute(
-                    f"SELECT count(*) > 0 FROM read_parquet("
-                    f"{quoted_paths}, union_by_name=true"
-                    f") WHERE {date_expression} IS NOT NULL"
+                    f"SELECT count(*) > 0 FROM ({raw_source_sql}) "
+                    f"WHERE {date_expression} IS NOT NULL"
                 ).fetchone()[0]
             )
             if not has_valid_dates:
@@ -390,7 +488,12 @@ class ParquetStore:
             # NOT EXISTS semantics are dataset-wide) keep the single-query
             # export; the memory budget and spill directory still apply.
             dataset_dir.mkdir(parents=True, exist_ok=True)
-            source_sql = _snapshot_source_query(dataset, quoted_paths, set(columns))
+            source_sql = _snapshot_source_query(
+                dataset,
+                quoted_paths,
+                set(columns),
+                source_sql=raw_source_sql,
+            )
             source_sql = _bounded_snapshot_query(
                 source_sql,
                 dataset,
@@ -421,8 +524,7 @@ class ParquetStore:
                 snapshot_start,
                 snapshot_end,
             )
-        raw_source_sql = f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
-        raw_source_sql = _bounded_snapshot_query(
+        bounded_source_sql = _bounded_snapshot_query(
             raw_source_sql,
             dataset,
             date_field,
@@ -431,7 +533,7 @@ class ParquetStore:
             set(columns),
         )
         source_row_count = connection.execute(
-            f"SELECT count(*) FROM ({raw_source_sql})"
+            f"SELECT count(*) FROM ({bounded_source_sql})"
         ).fetchone()[0]
         snapshot_paths = [str(path.resolve()) for path in sorted(dataset_dir.rglob("*.parquet"))]
         if not snapshot_paths:
@@ -515,10 +617,167 @@ class ParquetStore:
             "recoverability": recoverability_level(dataset),
             "availability_policy": availability_contract_label(dataset),
             "reference_refresh": refresh_metadata,
-            "source_sha256": source_sha256,
+            "source_sha256": _effective_source_sha256(source_sha256, industry_carry),
             "source_units": source_identity,
             "files": files,
+            **({"industry_history_carry": industry_carry} if industry_carry else {}),
         }
+
+    def _explicitly_delisted_stock_symbols(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        rows: list[dict[str, Any]],
+    ) -> frozenset[str]:
+        paths = [
+            str((self.root / row["output_path"]).resolve())
+            for row in rows
+            if str(row.get("output_path") or "").endswith(".parquet")
+        ]
+        if not paths:
+            return frozenset()
+        quoted = "[" + ",".join(_sql_string(path) for path in paths) + "]"
+        columns = set(
+            connection.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({quoted}, union_by_name=true)"
+            )
+            .fetchdf()["column_name"]
+            .tolist()
+        )
+        if not {"ts_code", "list_status"}.issubset(columns):
+            return frozenset()
+        records = connection.execute(
+            f"""
+            SELECT upper(trim(CAST(ts_code AS VARCHAR))) AS instrument
+            FROM read_parquet({quoted}, union_by_name=true)
+            WHERE nullif(trim(CAST(ts_code AS VARCHAR)), '') IS NOT NULL
+              AND nullif(trim(CAST(list_status AS VARCHAR)), '') IS NOT NULL
+            GROUP BY instrument
+            HAVING count(DISTINCT upper(trim(CAST(list_status AS VARCHAR)))) = 1
+               AND max(upper(trim(CAST(list_status AS VARCHAR)))) = 'D'
+            """
+        ).fetchall()
+        return frozenset(str(record[0]) for record in records)
+
+    @staticmethod
+    def _index_member_parent_carry(
+        connection: duckdb.DuckDBPyConnection,
+        *,
+        dataset: str,
+        current_source_sql: str,
+        current_columns: set[str],
+        history_root: Path | None,
+        history_entry: dict[str, Any] | None,
+        history_source: str | None,
+        history_source_kind: str | None,
+        delisted_stock_symbols: frozenset[str],
+        industry_history_anchor_evidence: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        if (
+            dataset != "index_member_all"
+            or "ts_code" not in current_columns
+            or history_root is None
+            or not isinstance(history_entry, dict)
+            or not history_source
+            or not delisted_stock_symbols
+        ):
+            return None
+        history_files = _manifest_dataset_paths(
+            history_root,
+            dataset=dataset,
+            entry=history_entry,
+            reject_unmanifested=history_source_kind == "explicit_anchor",
+            verify_hashes=history_source_kind == "explicit_anchor",
+        )
+        if not history_files:
+            return None
+        history_quoted = "[" + ",".join(
+            _sql_string(str(path.resolve())) for path in history_files
+        ) + "]"
+        history_columns = set(
+            connection.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({history_quoted}, union_by_name=true)"
+            )
+            .fetchdf()["column_name"]
+            .tolist()
+        )
+        if "ts_code" not in history_columns:
+            return None
+        delisted = ",".join(_sql_string(value) for value in sorted(delisted_stock_symbols))
+        symbols = [
+            str(record[0])
+            for record in connection.execute(
+                f"""
+                WITH current_symbols AS (
+                    SELECT DISTINCT upper(trim(CAST(ts_code AS VARCHAR))) AS instrument
+                    FROM ({current_source_sql})
+                    WHERE nullif(trim(CAST(ts_code AS VARCHAR)), '') IS NOT NULL
+                ),
+                history_symbols AS (
+                    SELECT DISTINCT upper(trim(CAST(ts_code AS VARCHAR))) AS instrument
+                    FROM read_parquet({history_quoted}, union_by_name=true)
+                    WHERE nullif(trim(CAST(ts_code AS VARCHAR)), '') IS NOT NULL
+                )
+                SELECT history_symbols.instrument
+                FROM history_symbols
+                LEFT JOIN current_symbols USING (instrument)
+                WHERE current_symbols.instrument IS NULL
+                  AND history_symbols.instrument IN ({delisted})
+                ORDER BY history_symbols.instrument
+                """
+            ).fetchall()
+        ]
+        if not symbols:
+            return None
+        symbol_sql = ",".join(_sql_string(value) for value in symbols)
+        parent_filter = (
+            "upper(trim(CAST(ts_code AS VARCHAR))) "
+            f"IN ({symbol_sql})"
+        )
+        carried_rows = int(
+            connection.execute(
+                "SELECT count(*) FROM read_parquet("
+                f"{history_quoted}, union_by_name=true) WHERE {parent_filter}"
+            ).fetchone()[0]
+        )
+        files_evidence = [
+            {
+                "path": str(item.get("path") or ""),
+                "bytes": int(item.get("bytes") or 0),
+                "sha256": str(item.get("sha256") or ""),
+            }
+            for item in history_entry.get("files") or []
+        ]
+        source_sql = (
+            f"SELECT * FROM ({current_source_sql}) UNION ALL BY NAME "
+            f"SELECT * FROM read_parquet({history_quoted}, union_by_name=true) "
+            f"WHERE {parent_filter}"
+        )
+        evidence = {
+            "rule_version": "index-member-delisted-parent-carry-v1",
+            "source_snapshot": history_source,
+            "source_kind": history_source_kind,
+            "parent_dataset_source_sha256": str(
+                history_entry.get("source_sha256") or ""
+            ),
+            "parent_dataset_files_sha256": _canonical_sha256(files_evidence),
+            "symbols": symbols,
+            "symbol_count": len(symbols),
+            "rows": carried_rows,
+            **(
+                {
+                    "anchor_manifest_sha256": str(
+                        industry_history_anchor_evidence.get("manifest_sha256") or ""
+                    ),
+                    "anchor_evidence_sha256": str(
+                        industry_history_anchor_evidence.get("evidence_sha256") or ""
+                    ),
+                }
+                if history_source_kind == "explicit_anchor"
+                and isinstance(industry_history_anchor_evidence, dict)
+                else {}
+            ),
+        }
+        return source_sql, evidence
 
     def _export_partitioned_dataset(
         self,
@@ -683,6 +942,95 @@ def _source_unit_tuples(entry: dict[str, Any]) -> set[tuple[str, str, int]]:
     }
 
 
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _effective_source_sha256(
+    current_source_sha256: str,
+    industry_carry: dict[str, Any] | None,
+) -> str:
+    if not industry_carry:
+        return current_source_sha256
+    return _canonical_sha256(
+        {
+            "current_source_sha256": current_source_sha256,
+            "industry_history_carry": industry_carry,
+        }
+    )
+
+
+def _manifest_dataset_paths(
+    parquet_root: Path,
+    *,
+    dataset: str,
+    entry: dict[str, Any],
+    reject_unmanifested: bool,
+    verify_hashes: bool,
+) -> list[Path]:
+    """Resolve only dataset files sealed by a snapshot manifest."""
+
+    snapshot_root = parquet_root.parent.resolve()
+    declared: list[Path] = []
+    seen: set[Path] = set()
+    files = entry.get("files")
+    if not isinstance(files, list):
+        raise ValueError(f"history snapshot has no sealed {dataset} file list")
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError(f"history snapshot has an invalid {dataset} file entry")
+        relative = Path(str(item.get("path") or ""))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or tuple(relative.parts[:2]) != ("parquet", dataset)
+            or relative.suffix != ".parquet"
+        ):
+            raise ValueError(f"history snapshot has an unsafe {dataset} file path")
+        unresolved = snapshot_root / relative
+        if unresolved.is_symlink() or not unresolved.is_file():
+            raise ValueError(f"history snapshot {dataset} file is missing or unsafe")
+        try:
+            resolved = unresolved.resolve(strict=True)
+            resolved.relative_to(snapshot_root)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"history snapshot {dataset} file escapes its root") from exc
+        if resolved in seen:
+            raise ValueError(f"history snapshot repeats a {dataset} file path")
+        if verify_hashes:
+            expected_bytes = item.get("bytes")
+            expected_sha256 = str(item.get("sha256") or "").lower()
+            if (
+                isinstance(expected_bytes, bool)
+                or not isinstance(expected_bytes, int)
+                or expected_bytes < 0
+                or resolved.stat().st_size != expected_bytes
+                or len(expected_sha256) != 64
+                or hashlib.sha256(resolved.read_bytes()).hexdigest() != expected_sha256
+            ):
+                raise ValueError(f"history snapshot {dataset} file hash does not match")
+        seen.add(resolved)
+        declared.append(resolved)
+    if reject_unmanifested:
+        actual = {
+            path.resolve()
+            for path in (parquet_root / dataset).rglob("*.parquet")
+            if path.is_file()
+        }
+        if actual != seen:
+            raise ValueError(
+                f"industry history anchor contains unmanifested {dataset} parquet files"
+            )
+    return sorted(declared)
+
+
 def _year_month(value: Any) -> tuple[int, int]:
     timestamp = pd.Timestamp(value)
     return (int(timestamp.year), int(timestamp.month))
@@ -843,7 +1191,16 @@ def _bounded_snapshot_query(
     return f"SELECT * FROM ({source_sql}) WHERE {' AND '.join(predicates)}"
 
 
-def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -> str:
+def _snapshot_source_query(
+    dataset: str,
+    quoted_paths: str,
+    columns: set[str],
+    *,
+    source_sql: str | None = None,
+) -> str:
+    source_sql = source_sql or (
+        f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+    )
     if "ingested_at" in columns:
         # ``ingested_at`` is acquisition lineage, not provider row identity.
         # Overlapping/resumed pages can return the exact same provider row at
@@ -868,7 +1225,7 @@ def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -
         selected = ", ".join([projected, *metadata_projections, "min(ingested_at) AS ingested_at"])
         semantic_rows = (
             f"SELECT {selected} "
-            f"FROM read_parquet({quoted_paths}, union_by_name=true) "
+            f"FROM ({source_sql}) "
             f"GROUP BY {projected}"
         )
         quarantine_key = SNAPSHOT_QUARANTINE_KEYS.get(dataset)
@@ -882,7 +1239,7 @@ def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -
         else:
             base = semantic_rows
     else:
-        base = f"SELECT DISTINCT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+        base = f"SELECT DISTINCT * FROM ({source_sql})"
     news_identity = {"datetime", "content", "title", "source"}
     if dataset != "news" or not news_identity.issubset(columns):
         return base

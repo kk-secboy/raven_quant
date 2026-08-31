@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,172 @@ def file_contract_sha256(files: dict[str, Path]) -> str:
             for name, path in sorted(files.items())
         }
     )
+
+
+def resolve_verified_snapshot_anchor(
+    snapshots_root: Path,
+    name: str,
+    *,
+    required_profile: str,
+    required_start: date,
+    maximum_end: date,
+    required_dataset: str,
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve a separately governed cross-lineage repair input.
+
+    An anchor is deliberately not a lineage parent. It may bridge an ingestion
+    contract change, but only after its own lineage, quality gate, and every
+    consumed dataset file have been verified.
+    """
+
+    if (
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name)
+        or Path(name).name != name
+        or name in {".", ".."}
+    ):
+        raise ValueError("industry history anchor must be one safe snapshot name")
+    root = snapshots_root.resolve()
+    unresolved = root / name
+    if unresolved.is_symlink() or not unresolved.is_dir():
+        raise ValueError("industry history anchor snapshot is missing or unsafe")
+    try:
+        anchor = unresolved.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("industry history anchor snapshot is missing") from exc
+    if anchor.parent != root or anchor.name != name or anchor.is_symlink():
+        raise ValueError("industry history anchor escapes the snapshot root")
+
+    manifest_path = anchor / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("industry history anchor manifest is missing or unsafe")
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        manifest = json.loads(manifest_raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("industry history anchor manifest is invalid") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("industry history anchor manifest is invalid")
+    verified_manifest = verify_snapshot_lineage(anchor)
+    if verified_manifest != manifest:
+        raise ValueError("industry history anchor changed during verification")
+    if manifest.get("name") != name:
+        raise ValueError("industry history anchor manifest name does not match")
+    if manifest.get("profile") != required_profile:
+        raise ValueError("industry history anchor profile does not match")
+    if manifest.get("start_date") != required_start.isoformat():
+        raise ValueError("industry history anchor start date does not match")
+    try:
+        anchor_end = date.fromisoformat(str(manifest["end_date"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("industry history anchor end date is invalid") from exc
+    if anchor_end > maximum_end:
+        raise ValueError("industry history anchor ends after the target snapshot")
+    quality_gate = manifest.get("quality_gate")
+    if not isinstance(quality_gate, dict) or quality_gate.get("ok") is not True:
+        raise ValueError("industry history anchor has no passing quality gate")
+    datasets = manifest.get("datasets")
+    entry = datasets.get(required_dataset) if isinstance(datasets, dict) else None
+    if not isinstance(entry, dict) or int(entry.get("rows") or 0) <= 0:
+        raise ValueError(
+            f"industry history anchor has no usable {required_dataset} dataset"
+        )
+    source_sha256 = str(entry.get("source_sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise ValueError("industry history anchor dataset source hash is invalid")
+    files = entry.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("industry history anchor dataset file manifest is missing")
+    file_evidence: list[dict[str, Any]] = []
+    declared_paths: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("industry history anchor dataset file entry is invalid")
+        relative = Path(str(item.get("path") or ""))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or tuple(relative.parts[:2]) != ("parquet", required_dataset)
+            or relative.suffix != ".parquet"
+        ):
+            raise ValueError("industry history anchor contains an unsafe dataset file")
+        relative_posix = relative.as_posix()
+        if relative_posix in declared_paths:
+            raise ValueError("industry history anchor repeats a dataset file path")
+        declared_paths.add(relative_posix)
+        target = anchor / relative
+        if _path_contains_symlink(anchor, relative) or not target.is_file():
+            raise ValueError("industry history anchor dataset file is missing or unsafe")
+        try:
+            resolved = target.resolve(strict=True)
+            resolved.relative_to(anchor)
+        except (OSError, ValueError) as exc:
+            raise ValueError("industry history anchor dataset file escapes snapshot") from exc
+        expected_size_value = item.get("bytes")
+        if (
+            isinstance(expected_size_value, bool)
+            or not isinstance(expected_size_value, int)
+            or expected_size_value < 0
+        ):
+            raise ValueError("industry history anchor dataset file size is invalid")
+        expected_size = expected_size_value
+        expected_sha256 = str(item.get("sha256") or "").lower()
+        if (
+            resolved.stat().st_size != expected_size
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or _sha256_file(resolved) != expected_sha256
+        ):
+            raise ValueError("industry history anchor dataset file hash does not match")
+        file_evidence.append(
+            {
+                "path": relative_posix,
+                "bytes": expected_size,
+                "sha256": expected_sha256,
+            }
+        )
+    dataset_root = anchor / "parquet" / required_dataset
+    if _path_contains_symlink(anchor, Path("parquet") / required_dataset):
+        raise ValueError("industry history anchor dataset directory is unsafe")
+    actual_paths: set[str] = set()
+    if dataset_root.is_dir():
+        for path in dataset_root.rglob("*.parquet"):
+            relative = path.relative_to(anchor)
+            if _path_contains_symlink(anchor, relative) or not path.is_file():
+                raise ValueError("industry history anchor dataset file is unsafe")
+            actual_paths.add(relative.as_posix())
+    if actual_paths != declared_paths:
+        raise ValueError("industry history anchor contains unmanifested dataset files")
+    evidence = {
+        "contract_version": "industry-history-anchor-v1",
+        "snapshot_name": name,
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "lineage_id": str(manifest.get("lineage_id") or ""),
+        "profile": required_profile,
+        "start_date": required_start.isoformat(),
+        "end_date": anchor_end.isoformat(),
+        "dataset": required_dataset,
+        "dataset_source_sha256": source_sha256,
+        "dataset_files_sha256": canonical_sha256(file_evidence),
+        "carry_rule_version": "index-member-delisted-parent-carry-v1",
+    }
+    evidence["evidence_sha256"] = canonical_sha256(evidence)
+    return anchor, evidence
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_contains_symlink(root: Path, relative: Path) -> bool:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
 
 
 def prepare_lineage_metadata(

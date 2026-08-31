@@ -93,6 +93,97 @@ def test_strategy_health_worker_command_is_exact_and_uses_runtime_clock(tmp_path
     assert "--observed-at" not in command
 
 
+def test_snapshot_worker_forwards_only_pipeline_frozen_industry_anchor(tmp_path) -> None:
+    class FakeStore:
+        def create(
+            self,
+            kind,
+            payload,
+            log_path,
+            *,
+            idempotency_key,
+            max_attempts,
+        ):
+            return {
+                "id": f"{kind}-fixture",
+                "kind": kind,
+                "payload": payload,
+                "log_path": str(log_path),
+                "idempotency_key": idempotency_key,
+                "max_attempts": max_attempts,
+            }
+
+    worker = object.__new__(LocalJobWorker)
+    worker.settings = SimpleNamespace(data_root=tmp_path / "data")
+    worker.project_root = tmp_path
+    worker.store = FakeStore()
+    worker.notify = lambda: None
+    base_payload = {
+        "pipeline_id": "industry-anchor-pipeline",
+        "profile": "full",
+        "start": "2008-01-01",
+        "end": "2026-08-31",
+        "snapshot_name": "cn-industry-anchor-fixture",
+    }
+
+    command, _, _ = worker._command(
+        {"kind": "data_snapshot", "payload": dict(base_payload)}
+    )
+    assert "--industry-history-anchor" not in command
+
+    anchor_payload = {
+        **base_payload,
+        "industry_history_anchor": "cn-good-20260828",
+    }
+    snapshot = worker._queue_data_pipeline_successor(
+        {
+            "kind": "data_verify",
+            "payload": anchor_payload,
+            "max_attempts": 3,
+        }
+    )
+    assert snapshot["payload"]["industry_history_anchor"] == "cn-good-20260828"
+    command, _, _ = worker._command(snapshot)
+    anchor_index = command.index("--industry-history-anchor")
+    assert command[anchor_index + 1] == "cn-good-20260828"
+
+    chained_snapshot = worker._queue_data_pipeline_successor(
+        {
+            "kind": "data_verify",
+            "max_attempts": 3,
+            "payload": {
+                **anchor_payload,
+                "pipeline_id": "industry-anchor-step-pipeline",
+                "snapshot_name": "cn-industry-anchor-step-fixture",
+                "pipeline_steps": [{"kind": "data_snapshot", "payload": {}}],
+                "pipeline_next_index": 0,
+            },
+        }
+    )
+    assert chained_snapshot["payload"]["industry_history_anchor"] == (
+        "cn-good-20260828"
+    )
+
+    with pytest.raises(ValueError, match="cannot change its industry anchor"):
+        worker._queue_data_pipeline_successor(
+            {
+                "kind": "data_verify",
+                "payload": {
+                    **base_payload,
+                    "pipeline_steps": [
+                        {
+                            "kind": "data_snapshot",
+                            "payload": {
+                                "industry_history_anchor": "injected-anchor"
+                            },
+                        }
+                    ],
+                    "pipeline_next_index": 0,
+                },
+            }
+        )
+
+
 def test_cpu_affinity_pool_partitions_and_reuses_container_capacity() -> None:
     pool = _CpuAffinityPool(
         platform="linux", affinity_getter=lambda _pid: set(range(24))

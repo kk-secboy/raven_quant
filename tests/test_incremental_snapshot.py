@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +10,11 @@ import pytest
 
 import quant_data.storage as storage_module
 from quant_data.models import ProviderResult
+from quant_data.qlib_builder import QlibBuilder
+from quant_data.snapshot_lineage import (
+    make_lineage_id,
+    resolve_verified_snapshot_anchor,
+)
 from quant_data.storage import ParquetStore
 
 pytestmark = pytest.mark.no_database
@@ -370,6 +376,267 @@ def test_bounded_memberships_do_not_reuse_incompatible_parent(tmp_path: Path) ->
     assert not (
         successor / "parquet" / "index_member_all" / "data.parquet"
     ).samefile(parent / "parquet" / "index_member_all" / "data.parquet")
+
+
+def test_membership_successor_carries_only_missing_explicitly_delisted_stocks(
+    tmp_path: Path,
+) -> None:
+    store = ParquetStore(tmp_path / "data")
+    parent_members = _write_unit(
+        store,
+        "index_member_all",
+        "parent-members",
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801010.SI",
+                "in_date": "20000101",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000002.SZ",
+                "l1_code": "801020.SI",
+                "in_date": "20000101",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000003.SZ",
+                "l1_code": "801030.SI",
+                "in_date": "20000101",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000004.SZ",
+                "l1_code": "801040.SI",
+                "in_date": "20000101",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000005.SZ",
+                "l1_code": "801050.SI",
+                "in_date": "20000101",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000005.SZ",
+                "l1_code": "801060.SI",
+                "in_date": "20010101",
+                "out_date": None,
+            },
+        ],
+    )
+    parent_stock = _write_unit(
+        store,
+        "stock_basic",
+        "parent-stock",
+        [
+            {"ts_code": "000001.SZ", "list_status": "D"},
+            {"ts_code": "000002.SZ", "list_status": "D"},
+            {"ts_code": "000003.SZ", "list_status": "L"},
+            {"ts_code": "000004.SZ", "list_status": "D"},
+            {"ts_code": "000005.SZ", "list_status": "D"},
+        ],
+    )
+    parent = store.build_snapshot(
+        name="membership-parent",
+        successful_units={
+            "index_member_all": [parent_members],
+            "stock_basic": [parent_stock],
+        },
+        manifest_extra={},
+    )
+
+    current_members = _write_unit(
+        store,
+        "index_member_all",
+        "current-members",
+        [
+            {
+                "ts_code": "000002.SZ",
+                "l1_code": "801120.SI",
+                "in_date": "20020101",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000099.SZ",
+                "l1_code": "801990.SI",
+                "in_date": "20200101",
+                "out_date": None,
+            },
+        ],
+    )
+    current_stock = _write_unit(
+        store,
+        "stock_basic",
+        "current-stock",
+        [
+            {"ts_code": "000001.SZ", "list_status": "D"},
+            {"ts_code": "000002.SZ", "list_status": "D"},
+            {"ts_code": "000003.SZ", "list_status": "L"},
+            # 000004.SZ intentionally has no current lifecycle state.
+            {"ts_code": "000005.SZ", "list_status": "D"},
+            {"ts_code": "000099.SZ", "list_status": "L"},
+        ],
+    )
+    successor = store.build_snapshot(
+        name="membership-successor",
+        successful_units={
+            "index_member_all": [current_members],
+            "stock_basic": [current_stock],
+        },
+        manifest_extra={},
+        base_snapshot=parent,
+    )
+
+    frame = _dataset_frame(successor, "index_member_all")
+    assert set(frame["ts_code"]) == {
+        "000001.SZ",
+        "000002.SZ",
+        "000005.SZ",
+        "000099.SZ",
+    }
+    assert frame.loc[frame["ts_code"] == "000002.SZ", "l1_code"].tolist() == [
+        "801120.SI"
+    ]
+    assert "000003.SZ" not in set(frame["ts_code"])
+    assert "000004.SZ" not in set(frame["ts_code"])
+
+    carry = _manifest_entry(successor, "index_member_all")[
+        "industry_history_carry"
+    ]
+    assert carry["rule_version"] == "index-member-delisted-parent-carry-v1"
+    assert carry["source_snapshot"] == parent.name
+    assert carry["source_kind"] == "lineage_parent"
+    assert carry["symbols"] == ["000001.SZ", "000005.SZ"]
+    assert carry["symbol_count"] == 2
+    assert carry["rows"] == 3
+    assert len(carry["parent_dataset_source_sha256"]) == 64
+    assert len(carry["parent_dataset_files_sha256"]) == 64
+
+    conflict = QlibBuilder(successor)._industry_membership_conflict_issue(
+        {"ts_code", "l1_code", "in_date", "out_date"}
+    )
+    assert conflict is not None
+    assert "000005.SZ" in conflict
+
+
+def test_membership_history_anchor_can_cross_snapshot_lineages(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path / "data")
+    anchor_member = _write_unit(
+        store,
+        "index_member_all",
+        "anchor-member",
+        [
+            {
+                "ts_code": "600001.SH",
+                "l1_code": "801040.SI",
+                "in_date": "19980122",
+                "out_date": None,
+            }
+        ],
+    )
+    anchor_configuration = {"source": "old-contract"}
+    anchor = store.build_snapshot(
+        name="old-contract-anchor",
+        successful_units={"index_member_all": [anchor_member]},
+        manifest_extra={
+            "profile": "full",
+            "start_date": "2008-01-01",
+            "end_date": "2026-08-28",
+            "quality_gate": {"ok": True},
+            "lineage_id": make_lineage_id(
+                "qlib_daily_source", anchor_configuration
+            ),
+            "lineage_contract": {
+                "kind": "qlib_daily_source",
+                "configuration": anchor_configuration,
+            },
+            "lineage_generation": 0,
+            "parent_snapshot": None,
+            "parent_manifest_sha256": None,
+        },
+    )
+    anchor_path, anchor_evidence = resolve_verified_snapshot_anchor(
+        store.snapshots_root,
+        anchor.name,
+        required_profile="full",
+        required_start=date(2008, 1, 1),
+        maximum_end=date(2026, 8, 31),
+        required_dataset="index_member_all",
+    )
+    current_member = _write_unit(
+        store,
+        "index_member_all",
+        "new-contract-member",
+        [
+            {
+                "ts_code": "000099.SZ",
+                "l1_code": "801990.SI",
+                "in_date": "20200101",
+                "out_date": None,
+            }
+        ],
+    )
+    current_stock = _write_unit(
+        store,
+        "stock_basic",
+        "new-contract-stock",
+        [
+            {"ts_code": "600001.SH", "list_status": "D"},
+            {"ts_code": "000099.SZ", "list_status": "L"},
+        ],
+    )
+    successor = store.build_snapshot(
+        name="new-contract-root",
+        successful_units={
+            "index_member_all": [current_member],
+            "stock_basic": [current_stock],
+        },
+        manifest_extra={
+            "lineage_id": "new-contract",
+            "industry_history_anchor": anchor_evidence,
+        },
+        industry_history_anchor=anchor_path,
+    )
+
+    frame = _dataset_frame(successor, "index_member_all")
+    assert set(frame["ts_code"]) == {"600001.SH", "000099.SZ"}
+    carry = _manifest_entry(successor, "index_member_all")[
+        "industry_history_carry"
+    ]
+    assert carry["source_kind"] == "explicit_anchor"
+    assert carry["source_snapshot"] == anchor.name
+    assert carry["anchor_manifest_sha256"] == anchor_evidence["manifest_sha256"]
+    assert carry["anchor_evidence_sha256"] == anchor_evidence["evidence_sha256"]
+
+    with pytest.raises(ValueError, match="new lineage root"):
+        store.build_snapshot(
+            name="ambiguous-parent-and-anchor",
+            successful_units={
+                "index_member_all": [current_member],
+                "stock_basic": [current_stock],
+            },
+            manifest_extra={"industry_history_anchor": anchor_evidence},
+            base_snapshot=successor,
+            industry_history_anchor=anchor_path,
+        )
+
+    next_snapshot = store.build_snapshot(
+        name="new-contract-next",
+        successful_units={
+            "index_member_all": [current_member],
+            "stock_basic": [current_stock],
+        },
+        manifest_extra={"lineage_id": "new-contract"},
+        base_snapshot=successor,
+    )
+    next_frame = _dataset_frame(next_snapshot, "index_member_all")
+    assert set(next_frame["ts_code"]) == {"600001.SH", "000099.SZ"}
+    next_carry = _manifest_entry(next_snapshot, "index_member_all")[
+        "industry_history_carry"
+    ]
+    assert next_carry["source_kind"] == "lineage_parent"
+    assert next_carry["source_snapshot"] == successor.name
 
 
 def test_fund_basic_lifecycle_master_keeps_pre_window_listing(tmp_path: Path) -> None:
