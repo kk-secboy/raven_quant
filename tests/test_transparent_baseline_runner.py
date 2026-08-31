@@ -619,6 +619,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0088_forward_only_rehabilitation.py"
     ).read_text(encoding="utf-8")
+    v18_catalog_repair_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0089_forward_only_dataset_catalog_repair.py"
+    ).read_text(encoding="utf-8")
     database_metadata = (
         Path(__file__).parents[1] / "src" / "quant_data" / "database.py"
     ).read_text(encoding="utf-8")
@@ -645,7 +651,16 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 in v17_migration
     )
     assert FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256 in v18_migration
-    assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in v18_migration
+    assert (
+        "c495044915133b41bd7f3c13df3b82fd9624e3e892e51ac4deb892eddbf01dfa"
+        in v18_migration
+    )
+    assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 not in (
+        v18_migration
+    )
+    assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in (
+        v18_catalog_repair_migration
+    )
     assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in (
         database_metadata
     )

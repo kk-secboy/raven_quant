@@ -202,7 +202,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
                 "AND NOT tgisinternal"
             )
         ).scalar_one()
-    assert revision == "0088_forward_only_rehab"
+    assert revision == "0089_v18_catalog_repair"
     assert (
         "source_version.config_json -> 'transparent_baseline_bootstrap' ->> "
         "'recipe_sha256'"
@@ -281,12 +281,21 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
             "strategy_versions", schema="quantlab"
         )
     }
-    assert "ck_strategy_versions_v18_runtime_identity" in {
-        constraint["name"]
+    strategy_version_checks = {
+        constraint["name"]: str(constraint["sqltext"])
         for constraint in inspector.get_check_constraints(
             "strategy_versions", schema="quantlab"
         )
     }
+    assert "ck_strategy_versions_v18_runtime_identity" in strategy_version_checks
+    assert (
+        "3f0c60adbe3b50ff26771e11ce75f6a48d13772ac5bff549f716469748b92874"
+        in strategy_version_checks["ck_strategy_versions_v18_runtime_identity"]
+    )
+    assert (
+        "c495044915133b41bd7f3c13df3b82fd9624e3e892e51ac4deb892eddbf01dfa"
+        not in strategy_version_checks["ck_strategy_versions_v18_runtime_identity"]
+    )
     assert "evidence_mode" in {
         column["name"]
         for column in inspector.get_columns("strategy_versions", schema="quantlab")

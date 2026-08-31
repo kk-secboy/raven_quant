@@ -540,7 +540,11 @@ def _select_forward_only_dataset(datasets: Sequence[Mapping[str, Any]]) -> dict[
     matches = [dict(item) for item in datasets if item.get("name") == SOURCE_DATASET]
     if len(matches) != 1:
         raise ValueError("forward-only rehabilitation source dataset is missing or duplicated")
-    dataset = matches[0]
+    # The production catalog intentionally keeps immutable identity and the
+    # calendar behind its provenance/path boundary.  Normalize through the
+    # same fail-closed validator used by ordinary baseline selection before
+    # comparing the frozen forward-only source identity.
+    dataset = _validate_dataset(matches[0])
     if (
         str(dataset.get("dataset_identity_sha256") or "")
         != SOURCE_DATASET_IDENTITY_SHA256

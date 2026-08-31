@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -13,6 +13,8 @@ from quant_platform.forward_only_rehabilitation import (
     REPLAY_AUTHORITY,
     SOURCE_BACKTEST_ID,
     SOURCE_DATASET,
+    SOURCE_DATASET_IDENTITY_SHA256,
+    SOURCE_DATASET_LINEAGE_ID,
     SOURCE_EXECUTION_CONTRACT_HASH,
     SOURCE_PERIODS,
     SOURCE_RULES_SHA256,
@@ -21,6 +23,7 @@ from quant_platform.forward_only_rehabilitation import (
     rehabilitation_forward_thresholds,
     require_replay_config,
 )
+from quant_platform.services import list_qlib_datasets
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_store import (
     StrategyStore,
@@ -51,6 +54,86 @@ from quant_platform.transparent_baseline_runner import (
 pytestmark = pytest.mark.no_database
 
 _WORKER_IMAGE = "sha256:" + "d" * 64
+
+
+def _raw_source_catalog(tmp_path: Path) -> list[dict]:
+    from governance_fixtures import write_governed_daily_qlib_dataset
+
+    data_root = write_governed_daily_qlib_dataset(
+        tmp_path,
+        sessions=[date(2026, 8, 27), date(2026, 8, 28)],
+        name=SOURCE_DATASET,
+        dataset_identity_sha256=SOURCE_DATASET_IDENTITY_SHA256,
+        dataset_lineage_id=SOURCE_DATASET_LINEAGE_ID,
+    )
+    return list_qlib_datasets(data_root)
+
+
+def test_forward_only_dataset_accepts_raw_production_catalog_shape(tmp_path: Path) -> None:
+    raw_catalog = _raw_source_catalog(tmp_path)
+
+    assert "dataset_identity_sha256" not in raw_catalog[0]
+    assert "calendar" not in raw_catalog[0]
+
+    selected = bootstrap._select_forward_only_dataset(raw_catalog)
+
+    assert selected["dataset_identity_sha256"] == SOURCE_DATASET_IDENTITY_SHA256
+    assert selected["dataset_lineage_id"] == SOURCE_DATASET_LINEAGE_ID
+    assert selected["calendar"] == ["2026-08-27", "2026-08-28"]
+
+
+def test_forward_only_dataset_rejects_changed_nested_identity(tmp_path: Path) -> None:
+    raw_catalog = _raw_source_catalog(tmp_path)
+    raw_catalog[0]["provenance"]["dataset_identity_sha256"] = "f" * 64
+
+    with pytest.raises(ValueError, match="identity or calendar changed"):
+        bootstrap._select_forward_only_dataset(raw_catalog)
+
+
+def test_forward_only_dataset_rejects_catalog_lineage_mismatch(tmp_path: Path) -> None:
+    raw_catalog = _raw_source_catalog(tmp_path)
+    raw_catalog[0]["lineage_id"] = "f" * 64
+
+    with pytest.raises(ValueError, match="catalog and provenance lineage"):
+        bootstrap._select_forward_only_dataset(raw_catalog)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("ready", "not a ready daily publication"),
+        ("reproducible", "not reproducibly sealed"),
+        ("output_files_verified", "not reproducibly sealed"),
+    ],
+)
+def test_forward_only_dataset_rejects_unready_or_unsealed_catalog_rows(
+    tmp_path: Path,
+    field: str,
+    message: str,
+) -> None:
+    raw_catalog = _raw_source_catalog(tmp_path)
+    raw_catalog[0][field] = False
+
+    with pytest.raises(ValueError, match=message):
+        bootstrap._select_forward_only_dataset(raw_catalog)
+
+
+@pytest.mark.parametrize("failure", ["missing", "unordered", "count_mismatch"])
+def test_forward_only_dataset_rejects_invalid_real_calendar(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    raw_catalog = _raw_source_catalog(tmp_path)
+    calendar_path = Path(raw_catalog[0]["path"]) / "calendars" / "day.txt"
+    if failure == "missing":
+        calendar_path.unlink()
+    elif failure == "unordered":
+        calendar_path.write_text("2026-08-28\n2026-08-27\n", encoding="utf-8")
+    else:
+        raw_catalog[0]["trading_days"] = 3
+
+    with pytest.raises(ValueError, match="calendar"):
+        bootstrap._select_forward_only_dataset(raw_catalog)
 
 
 def _source_version() -> dict:

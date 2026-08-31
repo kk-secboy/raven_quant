@@ -1415,7 +1415,7 @@ strategy_versions = Table(
         "'c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runtime_bundle_sha256' = "
-        "'c495044915133b41bd7f3c13df3b82fd9624e3e892e51ac4deb892eddbf01dfa' "
+        "'3f0c60adbe3b50ff26771e11ce75f6a48d13772ac5bff549f716469748b92874' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_worker_runtime_image_digest' ~ '^sha256:[0-9a-f]{64}$'"
         ") ELSE true END) IS TRUE",
