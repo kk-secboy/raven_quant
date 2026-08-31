@@ -518,6 +518,11 @@ def test_trial_ledger_and_independence_controls_prevent_self_deception() -> None
         "`not_computable_incomplete_historical_family`",
         "按试验台账中的真实试验数作 Bonferroni 家族校正",
         "资本 OOS alpha 台账仍是独立且不变的门",
+        "唯一的历史结果已打开恢复例外固定为 `forward-only-rehabilitation-v1`",
+        "`final_oos_opened=true`、`sealed_final_oos=false`、"
+        "`unseen_oos=false` 和 `capital_eligible=false`",
+        "至少 365 个自然日、252 个真实前向交易日、60 次有效决策和 30 个完整交易闭环",
+        "普通未泄露的 `short_1_5d` 新版本仍执行本节和 4.1 节的 90 个交易日前向门",
         "具有完整候选矩阵的 model/`fin_quant` 路径继续执行原有 Holm、PBO 与 DSR 合同",
     ):
         assert required in specification
