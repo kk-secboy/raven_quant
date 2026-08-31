@@ -13,6 +13,7 @@ from quant_platform.rdagent_dataset_view import isolate_rdagent_periods
 from quant_platform.strategy_proposal import STRATEGY_PROPOSAL_VERSION
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_rule_compiler import compile_strategy_proposal
+from quant_platform.strategy_store import _compiled_fin_strategy_materialization_binding
 from quant_platform.worker import Worker
 
 pytestmark = pytest.mark.no_database
@@ -40,6 +41,9 @@ class _StrategyRecorder:
     def find_version_by_source_artifact(self, source_research_artifact_id: str):
         return None
 
+    def find_version_by_compiled_fin_strategy_artifact(self, artifact: dict):
+        return None
+
     def get_version(self, version_id: str) -> dict:
         assert version_id == "a" * 32
         return {
@@ -57,8 +61,14 @@ class _StrategyRecorder:
             "strategy_id": strategy_id,
             "status": "draft",
             "horizon_profile": "short_1_5d",
+            "strategy_rules_sha256": kwargs["config"]["strategy_rules_sha256"],
             "config": kwargs["config"],
         }
+
+    def create_fin_strategy_version_if_absent(
+        self, strategy_id: str, **kwargs
+    ) -> dict:
+        return self.create_version(strategy_id, **kwargs)
 
 
 class _ColdstartStrategyRecorder:
@@ -69,6 +79,16 @@ class _ColdstartStrategyRecorder:
     def find_version_by_source_artifact(self, source_research_artifact_id: str):
         return self._versions_by_source_artifact.get(source_research_artifact_id)
 
+    def find_version_by_compiled_fin_strategy_artifact(self, artifact: dict):
+        artifact_sha256 = artifact["artifact_sha256"]
+        for version in self._versions_by_source_artifact.values():
+            if (
+                version["config"].get("strategy_research_artifact_sha256")
+                == artifact_sha256
+            ):
+                return version
+        return None
+
     def create(self, **kwargs) -> dict:
         self.created.append(kwargs)
         config = kwargs["config"]
@@ -77,6 +97,7 @@ class _ColdstartStrategyRecorder:
             "strategy_id": "coldstart-family",
             "status": "draft",
             "horizon_profile": "short_1_5d",
+            "strategy_rules_sha256": config["strategy_rules_sha256"],
             "config": config,
         }
         self._versions_by_source_artifact[config["source_research_artifact_id"]] = version
@@ -175,6 +196,8 @@ def test_worker_coldstart_materialization_creates_one_draft_and_reuses_it_on_ret
         dataset_identity_sha256="b" * 64,
         incumbent_id=None,
     )
+    binding = _compiled_fin_strategy_materialization_binding(artifact)
+    assert binding["dataset_snapshot_id"] == "b" * 64
     strategies = _ColdstartStrategyRecorder()
     worker = SimpleNamespace(strategies=strategies)
 
@@ -198,6 +221,161 @@ def test_worker_coldstart_materialization_creates_one_draft_and_reuses_it_on_ret
     assert len(strategies.created) == 1
     assert strategies.created[0]["actor"] == "system:strategy-research"
     assert strategies.created[0]["universe"] == "cn_all"
+
+
+def test_worker_coldstart_reuses_same_content_from_a_new_compiled_artifact_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    periods = {
+        "train_start": "2008-01-02",
+        "train_end": "2018-12-28",
+        "valid_start": "2019-01-02",
+        "valid_end": "2022-12-30",
+        "test_start": "2023-01-03",
+        "test_end": "2025-12-31",
+    }
+    feature_set = get_feature_set("governed-baseline")
+    artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="b" * 64,
+        incumbent_id=None,
+    )
+    strategies = _ColdstartStrategyRecorder()
+    worker = SimpleNamespace(strategies=strategies)
+
+    first = Worker._materialize_fin_strategy_candidate(
+        worker,
+        artifact,
+        compiled_artifact_id="compiled-artifact-1",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+    retried = Worker._materialize_fin_strategy_candidate(
+        worker,
+        artifact,
+        compiled_artifact_id="compiled-artifact-2",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+
+    assert retried == first
+    assert retried["config"]["source_research_artifact_id"] == "compiled-artifact-1"
+    assert len(strategies.created) == 1
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (
+            lambda version: version.update(status="candidate"),
+            "exact draft retry",
+        ),
+        (
+            lambda version: version["config"][
+                "strategy_research_data_contract"
+            ].update(dataset_snapshot_id="c" * 64),
+            "exact draft retry",
+        ),
+        (
+            lambda version: version["config"].update(recipe_version="changed"),
+            "exact draft retry",
+        ),
+        (
+            lambda version: version.update(strategy_rules_sha256="d" * 64),
+            "exact draft retry",
+        ),
+    ],
+)
+def test_worker_does_not_reuse_changed_or_non_draft_semantic_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate,
+    expected: str,
+) -> None:
+    periods = {
+        "train_start": "2008-01-02",
+        "train_end": "2018-12-28",
+        "valid_start": "2019-01-02",
+        "valid_end": "2022-12-30",
+        "test_start": "2023-01-03",
+        "test_end": "2025-12-31",
+    }
+    feature_set = get_feature_set("governed-baseline")
+    artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="b" * 64,
+        incumbent_id=None,
+    )
+    strategies = _ColdstartStrategyRecorder()
+    worker = SimpleNamespace(strategies=strategies)
+    Worker._materialize_fin_strategy_candidate(
+        worker,
+        artifact,
+        compiled_artifact_id="compiled-artifact-1",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+    stored = next(iter(strategies._versions_by_source_artifact.values()))
+    mutate(stored)
+
+    with pytest.raises(ValueError, match=expected):
+        Worker._materialize_fin_strategy_candidate(
+            worker,
+            artifact,
+            compiled_artifact_id="compiled-artifact-2",
+            allowed_factor_ids=set(feature_set["features"]),
+        )
+
+    assert len(strategies.created) == 1
+
+
+def test_worker_materializes_distinct_sealed_content_as_a_new_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    periods = {
+        "train_start": "2008-01-02",
+        "train_end": "2018-12-28",
+        "valid_start": "2019-01-02",
+        "valid_end": "2022-12-30",
+        "test_start": "2023-01-03",
+        "test_end": "2025-12-31",
+    }
+    feature_set = get_feature_set("governed-baseline")
+    first_artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="b" * 64,
+        incumbent_id=None,
+    )
+    second_artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="c" * 64,
+        incumbent_id=None,
+    )
+    strategies = _ColdstartStrategyRecorder()
+    worker = SimpleNamespace(strategies=strategies)
+
+    Worker._materialize_fin_strategy_candidate(
+        worker,
+        first_artifact,
+        compiled_artifact_id="compiled-artifact-1",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+    Worker._materialize_fin_strategy_candidate(
+        worker,
+        second_artifact,
+        compiled_artifact_id="compiled-artifact-2",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+
+    assert len(strategies.created) == 2
+    assert (
+        strategies.created[0]["config"]["strategy_research_artifact_sha256"]
+        != strategies.created[1]["config"]["strategy_research_artifact_sha256"]
+    )
 
 
 def test_policy_queue_revalidates_with_the_frozen_feature_allowlist(

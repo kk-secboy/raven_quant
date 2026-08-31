@@ -81,6 +81,17 @@ LOCKBOX_LINK_VERSION = "transparent-baseline-joint-lockbox-link-v1"
 LOCKBOX_LINK_VERSION_V2 = "transparent-baseline-available-horizons-link-v2"
 LOCKBOX_CONFIG_KEY = "transparent_baseline_joint_lockbox"
 BOOTSTRAP_CONFIG_KEY = "transparent_baseline_bootstrap"
+ALL_UNAVAILABLE_CASH_ONLY_CONTRACT_VERSION = (
+    "transparent-baseline-all-unavailable-cash-only-v1"
+)
+ALL_UNAVAILABLE_CASH_ONLY_ACTION = (
+    "transparent_baseline_all_unavailable_cash_only_registered"
+)
+ALL_UNAVAILABLE_CASH_ONLY_AUDIT_PATH = (
+    "transparent-baseline/all-unavailable-cash-only"
+)
+ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY = "cash_only_projection_only"
+ALL_UNAVAILABLE_CASH_ONLY_RUNNER = "cash_only_no_orders"
 UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION = (
     "transparent-baseline-unopened-history-selection-v1"
 )
@@ -2504,6 +2515,132 @@ def validate_joint_lockbox(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def build_all_unavailable_cash_only_receipt(
+    *,
+    dataset: str,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+    current_recipe_version: str,
+    unopened_history_selection: Mapping[str, Any],
+    unavailable_horizons: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Seal a no-orders decision when no public horizon has honest OOS data.
+
+    This is deliberately not a lockbox reservation: no statistically available
+    member exists, so there is no StrategyVersion and no OOS vintage to create.
+    The receipt only authorizes readiness to project three inert cash sleeves.
+    """
+
+    dataset_name = str(dataset or "").strip()
+    recipe_version = str(current_recipe_version or "").strip()
+    if not dataset_name or not recipe_version:
+        raise ValueError("all-unavailable cash-only dataset and recipe are required")
+    selection = validate_unopened_history_selection(unopened_history_selection)
+    if str(selection.get("current_recipe_version") or "") != recipe_version:
+        raise ValueError("cash-only history selection differs from its recipe version")
+    normalized_unavailable = sorted(
+        (_normalize_unavailable_horizon(item) for item in unavailable_horizons),
+        key=lambda item: item["recipe_id"],
+    )
+    if [item["recipe_id"] for item in normalized_unavailable] != sorted(
+        TRANSPARENT_RESEARCH_BASELINE_IDS
+    ):
+        raise ValueError(
+            "all-unavailable cash-only receipt must account for all public horizons"
+        )
+    core = {
+        "contract_version": ALL_UNAVAILABLE_CASH_ONLY_CONTRACT_VERSION,
+        "authority": ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY,
+        "cash_only_scope": ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY,
+        "runner": ALL_UNAVAILABLE_CASH_ONLY_RUNNER,
+        "status": "unavailable",
+        "sleeve_action": "remain_in_cash",
+        "new_entries_allowed": False,
+        "formal_result_complete": False,
+        "strategy_version_created": False,
+        "oos_reserved": False,
+        "approval_eligible": False,
+        "paper_eligible": False,
+        "recommendation_eligible": False,
+        "orders_eligible": False,
+        "performance_information_used": False,
+        "dataset": dataset_name,
+        "dataset_identity_sha256": _require_sha256(
+            dataset_identity_sha256,
+            field="dataset_identity_sha256",
+        ),
+        "dataset_lineage_id": _require_sha256(
+            dataset_lineage_id,
+            field="dataset_lineage_id",
+        ),
+        "current_recipe_version": recipe_version,
+        "unopened_history_selection": selection,
+        "unavailable_horizons": normalized_unavailable,
+    }
+    return {**core, "receipt_sha256": canonical_sha256(core)}
+
+
+def validate_all_unavailable_cash_only_receipt(
+    value: Any,
+    *,
+    expected_recipe_version: str | None = None,
+) -> dict[str, Any]:
+    """Validate an exact all-unavailable receipt and every source digest."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("all-unavailable cash-only receipt is required")
+    raw = dict(value)
+    receipt_sha256 = str(raw.pop("receipt_sha256", ""))
+    unavailable = raw.get("unavailable_horizons")
+    if not isinstance(unavailable, Sequence) or isinstance(
+        unavailable, (str, bytes)
+    ):
+        raise ValueError("all-unavailable cash-only horizons are invalid")
+    rebuilt = build_all_unavailable_cash_only_receipt(
+        dataset=str(raw.get("dataset") or ""),
+        dataset_identity_sha256=str(raw.get("dataset_identity_sha256") or ""),
+        dataset_lineage_id=str(raw.get("dataset_lineage_id") or ""),
+        current_recipe_version=str(raw.get("current_recipe_version") or ""),
+        unopened_history_selection=raw.get("unopened_history_selection") or {},
+        unavailable_horizons=list(unavailable),
+    )
+    expected = str(expected_recipe_version or "").strip()
+    if (
+        dict(value) != rebuilt
+        or receipt_sha256 != rebuilt["receipt_sha256"]
+        or (expected and rebuilt["current_recipe_version"] != expected)
+    ):
+        raise ValueError("all-unavailable cash-only receipt changed")
+    return rebuilt
+
+
+def validate_all_unavailable_cash_only_audit_event(
+    row: Any,
+    *,
+    expected_recipe_version: str | None = None,
+) -> dict[str, Any]:
+    """Validate the internal audit envelope and its no-orders receipt."""
+
+    created_at = _row_field(row, "created_at")
+    if (
+        _row_field(row, "user_id") is not None
+        or not str(_row_field(row, "username") or "").strip()
+        or _row_field(row, "action") != ALL_UNAVAILABLE_CASH_ONLY_ACTION
+        or _row_field(row, "method") != "INTERNAL"
+        or _row_field(row, "path") != ALL_UNAVAILABLE_CASH_ONLY_AUDIT_PATH
+        or int(_row_field(row, "status_code") or 0) != 201
+        or _row_field(row, "ip_hash") is not None
+        or _row_field(row, "user_agent") != "transparent_baseline_bootstrap.py"
+        or not isinstance(created_at, datetime)
+        or created_at.tzinfo is None
+    ):
+        raise ValueError("all-unavailable cash-only audit envelope is invalid")
+    return validate_all_unavailable_cash_only_receipt(
+        _row_field(row, "details_json"),
+        expected_recipe_version=expected_recipe_version,
+    )
+
+
 def build_lockbox_member(
     *,
     config: Mapping[str, Any],
@@ -3301,6 +3438,91 @@ class TransparentBaselineLockboxStore:
 
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
+
+    def register_all_unavailable_cash_only(
+        self,
+        *,
+        dataset: str,
+        dataset_identity_sha256: str,
+        dataset_lineage_id: str,
+        current_recipe_version: str,
+        unopened_history_selection: Mapping[str, Any],
+        unavailable_horizons: Sequence[Mapping[str, Any]],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Append the exact no-OOS/no-orders receipt, idempotently."""
+
+        username = str(actor or "").strip()
+        if len(username) < 2:
+            raise ValueError("cash-only registration requires a responsible actor")
+        receipt = build_all_unavailable_cash_only_receipt(
+            dataset=dataset,
+            dataset_identity_sha256=dataset_identity_sha256,
+            dataset_lineage_id=dataset_lineage_id,
+            current_recipe_version=current_recipe_version,
+            unopened_history_selection=unopened_history_selection,
+            unavailable_horizons=unavailable_horizons,
+        )
+        scope = (
+            receipt["current_recipe_version"],
+            receipt["dataset"],
+            receipt["dataset_identity_sha256"],
+            receipt["dataset_lineage_id"],
+            receipt["unopened_history_selection"]["selection_sha256"],
+        )
+        with self.engine.begin() as connection:
+            for audit_row in connection.execute(
+                select(audit_events)
+                .where(audit_events.c.action == ALL_UNAVAILABLE_CASH_ONLY_ACTION)
+                .order_by(audit_events.c.created_at.desc(), audit_events.c.id.desc())
+            ).all():
+                try:
+                    existing = validate_all_unavailable_cash_only_audit_event(
+                        audit_row
+                    )
+                except ValueError:
+                    raise ValueError(
+                        "existing all-unavailable cash-only audit evidence is invalid"
+                    ) from None
+                existing_scope = (
+                    existing["current_recipe_version"],
+                    existing["dataset"],
+                    existing["dataset_identity_sha256"],
+                    existing["dataset_lineage_id"],
+                    existing["unopened_history_selection"]["selection_sha256"],
+                )
+                if existing_scope != scope:
+                    continue
+                if existing["receipt_sha256"] != receipt["receipt_sha256"]:
+                    raise ValueError(
+                        "cash-only evidence conflicts for the same frozen research input"
+                    )
+                return {
+                    "status": "already_registered",
+                    "audit_event_id": int(audit_row.id),
+                    "receipt": existing,
+                }
+            event_id = connection.execute(
+                insert(audit_events)
+                .values(
+                    user_id=None,
+                    username=username,
+                    action=ALL_UNAVAILABLE_CASH_ONLY_ACTION,
+                    method="INTERNAL",
+                    path=ALL_UNAVAILABLE_CASH_ONLY_AUDIT_PATH,
+                    status_code=201,
+                    ip_hash=None,
+                    user_agent="transparent_baseline_bootstrap.py",
+                    details_json=receipt,
+                    created_at=datetime.now(UTC),
+                )
+                .returning(audit_events.c.id)
+            ).scalar_one()
+        return {
+            "status": "registered",
+            "audit_event_id": int(event_id),
+            "receipt": receipt,
+        }
 
     def resolve_preregistered_single_member_repair(
         self,

@@ -229,6 +229,86 @@ def _is_sha256(value: Any) -> bool:
     return True
 
 
+def _compiled_fin_strategy_materialization_binding(
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the immutable identity used to deduplicate fin_strategy drafts."""
+
+    candidate = artifact.get("strategy_spec_candidate")
+    rule_ir = candidate.get("rule_ir") if isinstance(candidate, Mapping) else None
+    alpha_components = (
+        (((rule_ir or {}).get("slots") or {}).get("alpha_rank") or {}).get(
+            "components"
+        )
+        if isinstance(rule_ir, Mapping)
+        else None
+    )
+    weights = None
+    if isinstance(alpha_components, list):
+        weights = next(
+            (
+                ((item.get("parameters") or {}).get("weights"))
+                for item in alpha_components
+                if isinstance(item, Mapping)
+                and item.get("component") == "weighted_factor_rank"
+            ),
+            None,
+        )
+    allowed_factor_ids = set(weights) if isinstance(weights, Mapping) else None
+    normalized = validate_compiled_strategy_artifact(
+        artifact,
+        allowed_factor_ids=allowed_factor_ids,
+    )
+    proposal = normalized["strategy_proposal"]
+    data_contract = dict(proposal["data_contract"])
+    evaluation_contract = dict(proposal["evaluation_contract"])
+    return {
+        "strategy_research_artifact_sha256": normalized["artifact_sha256"],
+        "strategy_research_proposal_sha256": normalized["proposal_sha256"],
+        "horizon_profile": proposal["horizon"],
+        "strategy_rules_sha256": normalized["rules_sha256"],
+        "recipe_id": proposal["baseline_recipe_id"],
+        "recipe_version": proposal["baseline_recipe_version"],
+        "dataset_snapshot_id": data_contract["dataset_snapshot_id"],
+        "strategy_research_data_contract_sha256": _canonical_sha256(data_contract),
+        "strategy_evaluation_contract_sha256": _canonical_sha256(
+            evaluation_contract
+        ),
+        "parent_strategy_version_id": proposal["parent_strategy_version_id"],
+    }
+
+
+def _fin_strategy_config_materialization_binding(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    data_contract = config.get("strategy_research_data_contract")
+    evaluation_contract = config.get("strategy_evaluation_contract")
+    data_contract_value = dict(data_contract) if isinstance(data_contract, Mapping) else {}
+    evaluation_contract_value = (
+        dict(evaluation_contract) if isinstance(evaluation_contract, Mapping) else {}
+    )
+    return {
+        "strategy_research_artifact_sha256": config.get(
+            "strategy_research_artifact_sha256"
+        ),
+        "strategy_research_proposal_sha256": config.get(
+            "strategy_research_proposal_sha256"
+        ),
+        "horizon_profile": config.get("horizon_profile"),
+        "strategy_rules_sha256": config.get("strategy_rules_sha256"),
+        "recipe_id": config.get("recipe_id"),
+        "recipe_version": config.get("recipe_version"),
+        "dataset_snapshot_id": data_contract_value.get("dataset_snapshot_id"),
+        "strategy_research_data_contract_sha256": _canonical_sha256(
+            data_contract_value
+        ),
+        "strategy_evaluation_contract_sha256": _canonical_sha256(
+            evaluation_contract_value
+        ),
+        "parent_strategy_version_id": config.get("parent_strategy_version_id"),
+    }
+
+
 def _is_image_digest(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -319,7 +399,7 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
             "forward-only rehabilitation entry point"
         )
     if is_current_public_recipe and config.get("evidence_mode") != EVIDENCE_MODE_SEALED:
-        raise ValueError("the v19 strategy-research runtime requires sealed final OOS")
+        raise ValueError("the v20 strategy-research runtime requires sealed final OOS")
     if target_runner_for_recipe(recipe_id, recipe_version) is None:
         raise ValueError("the current transparent runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
@@ -3190,6 +3270,36 @@ class StrategyStore:
             reuse_exact=True,
         )
 
+    def create_fin_strategy_version_if_absent(
+        self,
+        strategy_id: str,
+        *,
+        benchmark: str,
+        universe: str,
+        factors: list[dict[str, Any]],
+        config: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Create one draft per sealed fin_strategy content identity.
+
+        A retried RD-Agent run may archive the same compiled JSON under a new
+        ``research_run_artifacts.id``. That row identity is provenance, not a
+        new strategy hypothesis. The family lock makes content-addressed reuse
+        atomic while retaining the first intact source row on the immutable
+        StrategyVersion.
+        """
+
+        return self._create_version(
+            strategy_id,
+            benchmark=benchmark,
+            universe=universe,
+            factors=factors,
+            config=config,
+            actor=actor,
+            reuse_exact=False,
+            reuse_fin_strategy_artifact=True,
+        )
+
     def _create_version(
         self,
         strategy_id: str,
@@ -3200,6 +3310,7 @@ class StrategyStore:
         config: dict[str, Any],
         actor: str,
         reuse_exact: bool,
+        reuse_fin_strategy_artifact: bool = False,
     ) -> dict[str, Any]:
         joint_bundle_requested = config.get("quant_bundle_candidate_id") is not None
         if joint_bundle_requested and factors:
@@ -3247,6 +3358,82 @@ class StrategyStore:
                 )
                 if family_type != "multifactor":
                     raise ValueError("pair strategy families require a pair strategy version")
+                existing_version_id: str | None = None
+                if reuse_fin_strategy_artifact:
+                    expected_binding = _fin_strategy_config_materialization_binding(
+                        config
+                    )
+                    artifact_sha256 = str(
+                        expected_binding["strategy_research_artifact_sha256"] or ""
+                    )
+                    if not _is_sha256(artifact_sha256):
+                        raise ValueError(
+                            "fin_strategy version requires a sealed artifact identity"
+                        )
+                    semantic_rows = connection.execute(
+                        select(
+                            strategy_versions.c.id,
+                            strategy_versions.c.status,
+                            strategy_versions.c.horizon_profile,
+                            strategy_versions.c.strategy_rules_sha256,
+                            strategy_versions.c.benchmark,
+                            strategy_versions.c.universe,
+                            strategy_versions.c.config_json,
+                        ).where(
+                            strategy_versions.c.strategy_id == strategy_id,
+                            strategy_versions.c.source_research_artifact_id.is_not(None),
+                        )
+                    ).all()
+                    semantic_matches: list[str] = []
+                    for candidate in semantic_rows:
+                        candidate_config = dict(candidate.config_json or {})
+                        if (
+                            candidate_config.get(
+                                "strategy_research_artifact_sha256"
+                            )
+                            != artifact_sha256
+                        ):
+                            continue
+                        candidate_binding = (
+                            _fin_strategy_config_materialization_binding(
+                                candidate_config
+                            )
+                        )
+                        if (
+                            candidate_binding != expected_binding
+                            or str(candidate.horizon_profile)
+                            != str(expected_binding["horizon_profile"])
+                            or str(candidate.strategy_rules_sha256)
+                            != str(expected_binding["strategy_rules_sha256"])
+                            or str(candidate.benchmark) != benchmark
+                            or str(candidate.universe) != universe
+                        ):
+                            raise ValueError(
+                                "sealed fin_strategy artifact conflicts with its stored "
+                                "recipe, dataset, horizon, or rule binding"
+                            )
+                        comparable_candidate = dict(candidate_config)
+                        comparable_candidate.pop("source_research_artifact_id", None)
+                        comparable_requested = dict(config)
+                        comparable_requested.pop("source_research_artifact_id", None)
+                        if comparable_candidate != comparable_requested:
+                            raise ValueError(
+                                "sealed fin_strategy artifact conflicts with its immutable "
+                                "StrategySpec"
+                            )
+                        if str(candidate.status) != "draft":
+                            raise ValueError(
+                                "sealed fin_strategy artifact already entered a non-draft "
+                                "lifecycle"
+                            )
+                        semantic_matches.append(str(candidate.id))
+                    if len(semantic_matches) > 1:
+                        raise ValueError(
+                            "strategy family contains duplicate fin_strategy content"
+                        )
+                    if semantic_matches:
+                        existing_version_id = semantic_matches[0]
+                        version_id = existing_version_id
                 model_evidence = self._model_signal_evidence(
                     connection,
                     config,
@@ -3292,7 +3479,6 @@ class StrategyStore:
                     )
                     for item in factors
                 )
-                existing_version_id: str | None = None
                 if reuse_exact:
                     expected_config_sha256 = _canonical_sha256(config)
                     if config.get("evidence_mode") == EVIDENCE_MODE_REPLAY:
@@ -6728,6 +6914,49 @@ class StrategyStore:
                 )
             )
         return self.get_version(str(version_id)) if version_id else None
+
+    def find_version_by_compiled_fin_strategy_artifact(
+        self, artifact: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Find the sole version with the same sealed fin_strategy content.
+
+        The compiled artifact row id is intentionally excluded. Every semantic
+        binding is checked explicitly so an artifact-hash collision with a
+        changed recipe, dataset, horizon, rules, or parent fails closed.
+        Lifecycle eligibility is decided by the caller.
+        """
+
+        expected = _compiled_fin_strategy_materialization_binding(artifact)
+        artifact_sha256 = str(expected["strategy_research_artifact_sha256"])
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    strategy_versions.c.id,
+                    strategy_versions.c.horizon_profile,
+                    strategy_versions.c.strategy_rules_sha256,
+                    strategy_versions.c.config_json,
+                ).where(strategy_versions.c.source_research_artifact_id.is_not(None))
+            ).all()
+        matches: list[str] = []
+        for row in rows:
+            config = dict(row.config_json or {})
+            if config.get("strategy_research_artifact_sha256") != artifact_sha256:
+                continue
+            actual = _fin_strategy_config_materialization_binding(config)
+            if (
+                actual != expected
+                or str(row.horizon_profile) != str(expected["horizon_profile"])
+                or str(row.strategy_rules_sha256)
+                != str(expected["strategy_rules_sha256"])
+            ):
+                raise ValueError(
+                    "sealed fin_strategy artifact conflicts with its stored recipe, "
+                    "dataset, horizon, or rule binding"
+                )
+            matches.append(str(row.id))
+        if len(matches) > 1:
+            raise ValueError("duplicate versions share one sealed fin_strategy artifact")
+        return self.get_version(matches[0]) if matches else None
 
     def list_health_snapshots(
         self, version_id: str, *, limit: int = 100

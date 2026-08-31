@@ -42,6 +42,7 @@ from quant_platform.transparent_baseline_bootstrap import (
     _select_dataset,
 )
 from quant_platform.transparent_baseline_lockbox import (
+    ALL_UNAVAILABLE_CASH_ONLY_ACTION,
     BOOTSTRAP_CONFIG_KEY,
     CANONICAL_LF_PACKAGING_ERROR,
     CANONICAL_LF_PACKAGING_SOURCE_BINDINGS,
@@ -59,11 +60,13 @@ from quant_platform.transparent_baseline_lockbox import (
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
     TransparentBaselineLockboxStore,
+    build_all_unavailable_cash_only_receipt,
     build_joint_lockbox,
     build_lockbox_member,
     build_unopened_history_selection,
     canonical_sha256,
     lockbox_member_link,
+    validate_all_unavailable_cash_only_receipt,
     validate_joint_lockbox,
     validate_lockbox_link,
     validate_pre_result_repair_receipt,
@@ -2456,6 +2459,7 @@ def test_reconcile_preserves_every_unavailable_horizon_when_no_plan_exists(
         current_recipe_version=current_recipe_version,
         prior_batches=[],
     )
+    registrations: list[dict] = []
 
     class Lockboxes:
         @staticmethod
@@ -2466,12 +2470,34 @@ def test_reconcile_preserves_every_unavailable_horizon_when_no_plan_exists(
         def resolve_unopened_history_selection(**_kwargs: object) -> dict:
             return {"calendar": list(calendar), "evidence": dict(selection)}
 
+        @staticmethod
+        def register_all_unavailable_cash_only(**values: object) -> dict:
+            receipt = build_all_unavailable_cash_only_receipt(
+                dataset=str(values["dataset"]),
+                dataset_identity_sha256=str(values["dataset_identity_sha256"]),
+                dataset_lineage_id=str(values["dataset_lineage_id"]),
+                current_recipe_version=str(values["current_recipe_version"]),
+                unopened_history_selection=dict(
+                    values["unopened_history_selection"]  # type: ignore[arg-type]
+                ),
+                unavailable_horizons=list(
+                    values["unavailable_horizons"]  # type: ignore[arg-type]
+                ),
+            )
+            registrations.append(dict(values))
+            return {
+                "status": "registered",
+                "audit_event_id": 91,
+                "receipt": receipt,
+            }
+
     def unavailable(*, recipe_id: str, dataset: dict) -> dict:
         assert dataset["unopened_history_selection"] == selection
         evidence = {
             "contract_version": "test-unavailable-horizon-v1",
             "recipe_id": recipe_id,
             "capital_evaluation_eligible": False,
+            "capital_evaluation_unavailable_reason": "no honest unopened OOS",
         }
         raise ResearchWindowUnavailableError(
             f"{recipe_id} has no honest window",
@@ -2492,11 +2518,14 @@ def test_reconcile_preserves_every_unavailable_horizon_when_no_plan_exists(
 
     result = service.reconcile(actor="test-all-unavailable")
 
-    assert result["status"] == "failed"
-    assert result["errors"] == [
-        "no transparent baseline horizon has enough unopened evidence"
-    ]
-    assert result["joint_lockbox"]["status"] == "unavailable"
+    assert result["status"] == "no_op"
+    assert result["errors"] == []
+    assert result["joint_lockbox"]["status"] == "cash_only"
+    assert result["joint_lockbox"]["authority"] == "cash_only_projection_only"
+    assert result["joint_lockbox"]["runner"] == "cash_only_no_orders"
+    assert result["joint_lockbox"]["audit_event_id"] == 91
+    assert len(result["joint_lockbox"]["receipt_sha256"]) == 64
+    assert len(registrations) == 1
     unavailable_horizons = result["joint_lockbox"]["unavailable_horizons"]
     assert [item["recipe_id"] for item in unavailable_horizons] == list(
         TRANSPARENT_RESEARCH_BASELINE_IDS
@@ -2507,6 +2536,136 @@ def test_reconcile_preserves_every_unavailable_horizon_when_no_plan_exists(
     )
     assert all(item["state"] == "unavailable" for item in result["members"])
     assert all(item["sleeve_action"] == "remain_in_cash" for item in result["members"])
+
+
+@pytest.mark.no_database
+def test_all_unavailable_cash_only_receipt_rejects_source_tampering() -> None:
+    version = str(get_strategy_recipe("short_relative_strength")["version"])
+    selection = build_unopened_history_selection(
+        calendar_days=["2026-08-27", "2026-08-28"],
+        current_recipe_version=version,
+        prior_batches=[],
+    )
+    unavailable = []
+    for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS:
+        recipe = get_strategy_recipe(recipe_id)
+        evidence = {
+            "capital_evaluation_eligible": False,
+            "capital_evaluation_unavailable_reason": "no honest unopened OOS",
+        }
+        unavailable.append(
+            {
+                "recipe_id": recipe_id,
+                "horizon_profile": str(recipe["horizon"]),
+                "status": "unavailable",
+                "reason": "the sealed OOS window is unavailable",
+                "evidence": evidence,
+                "evidence_sha256": canonical_sha256(evidence),
+            }
+        )
+    receipt = build_all_unavailable_cash_only_receipt(
+        dataset="daily-v19",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        current_recipe_version=version,
+        unopened_history_selection=selection,
+        unavailable_horizons=unavailable,
+    )
+
+    assert validate_all_unavailable_cash_only_receipt(
+        receipt,
+        expected_recipe_version=version,
+    ) == receipt
+    for field, value in (
+        ("dataset_identity_sha256", "c" * 64),
+        ("dataset_lineage_id", "d" * 64),
+        ("current_recipe_version", "stale-v18"),
+        ("orders_eligible", True),
+    ):
+        tampered = deepcopy(receipt)
+        tampered[field] = value
+        with pytest.raises(ValueError):
+            validate_all_unavailable_cash_only_receipt(
+                tampered,
+                expected_recipe_version=version,
+            )
+    tampered_evidence = deepcopy(receipt)
+    tampered_evidence["unavailable_horizons"][0]["reason"] = "runtime crashed"
+    with pytest.raises(ValueError):
+        validate_all_unavailable_cash_only_receipt(
+            tampered_evidence,
+            expected_recipe_version=version,
+        )
+
+
+def test_all_unavailable_cash_only_registration_is_idempotent_and_inert(
+    database_url: str,
+) -> None:
+    version = str(get_strategy_recipe("short_relative_strength")["version"])
+    selection = build_unopened_history_selection(
+        calendar_days=["2026-08-27", "2026-08-28"],
+        current_recipe_version=version,
+        prior_batches=[],
+    )
+    unavailable = []
+    for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS:
+        recipe = get_strategy_recipe(recipe_id)
+        evidence = {
+            "capital_evaluation_eligible": False,
+            "capital_evaluation_unavailable_reason": "no honest unopened OOS",
+        }
+        unavailable.append(
+            {
+                "recipe_id": recipe_id,
+                "horizon_profile": str(recipe["horizon"]),
+                "status": "unavailable",
+                "reason": "the sealed OOS window is unavailable",
+                "evidence": evidence,
+                "evidence_sha256": canonical_sha256(evidence),
+            }
+        )
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        strategy_count = int(
+            connection.scalar(select(func.count()).select_from(strategy_versions))
+            or 0
+        )
+        vintage_count = int(
+            connection.scalar(select(func.count()).select_from(oos_vintages)) or 0
+        )
+    store = TransparentBaselineLockboxStore(database_url)
+    kwargs = {
+        "dataset": "daily-v19",
+        "dataset_identity_sha256": "a" * 64,
+        "dataset_lineage_id": "b" * 64,
+        "current_recipe_version": version,
+        "unopened_history_selection": selection,
+        "unavailable_horizons": unavailable,
+        "actor": "system:test-cash-only",
+    }
+
+    registered = store.register_all_unavailable_cash_only(**kwargs)
+    repeated = store.register_all_unavailable_cash_only(**kwargs)
+
+    assert registered["status"] == "registered"
+    assert repeated["status"] == "already_registered"
+    assert repeated["audit_event_id"] == registered["audit_event_id"]
+    with engine.connect() as connection:
+        assert int(
+            connection.scalar(
+                select(func.count())
+                .select_from(audit_events)
+                .where(audit_events.c.action == ALL_UNAVAILABLE_CASH_ONLY_ACTION)
+            )
+            or 0
+        ) == 1
+        assert int(
+            connection.scalar(select(func.count()).select_from(strategy_versions))
+            or 0
+        ) == strategy_count
+        assert int(
+            connection.scalar(select(func.count()).select_from(oos_vintages)) or 0
+        ) == vintage_count
 
 
 @pytest.mark.no_database

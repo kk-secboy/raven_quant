@@ -118,6 +118,15 @@ def _dataset(feature_set: dict | None = None) -> dict:
     }
 
 
+def _reseal_field_coverage(dataset: dict) -> None:
+    matrix = dataset["provenance"]["field_year_coverage"]
+    unsigned = dict(matrix)
+    unsigned.pop("coverage_sha256")
+    digest = canonical_sha256(unsigned)
+    matrix["coverage_sha256"] = digest
+    dataset["provenance"]["field_coverage_sha256"] = digest
+
+
 @pytest.mark.no_database
 @pytest.mark.parametrize(
     ("profile", "labels", "purge", "embargo", "oos"),
@@ -273,6 +282,67 @@ def test_research_window_contract_binds_dataset_features_and_is_deterministic() 
     assert contract["execution_lag_sessions"] == 1
     assert contract["label_maturity_enforced"] is True
     assert contract["periods"] == left_periods
+    assert contract["requested_data_cutoff_session"] == calendar[-1]
+    assert contract["effective_field_cutoff_session"] == calendar[-1]
+    assert contract["data_cutoff_session"] == calendar[-1]
+
+
+@pytest.mark.no_database
+def test_research_window_uses_latest_common_required_field_session() -> None:
+    calendar = _calendar()
+    feature_set = {
+        "id": "mixed-freshness-test",
+        "definition_sha256": "f" * 64,
+        "features": {
+            "price": "$close",
+            "liquidity": "$turnover_rate_f + $volume_ratio",
+        },
+    }
+    dataset = _dataset(feature_set)
+    field_cutoff = calendar[-3]
+    field_entries = dataset["provenance"]["field_year_coverage"]["fields"]
+    field_entries["turnover_rate_f"]["available_to"] = field_cutoff
+    field_entries["volume_ratio"]["available_to"] = field_cutoff
+    _reseal_field_coverage(dataset)
+
+    periods, evidence = resolve_research_window_contract(
+        dataset,
+        calendar,
+        horizon_profile=SHORT_1_5D,
+        feature_set=feature_set,
+    )
+
+    coverage = evidence["required_field_coverage"]
+    contract = evidence["research_window_contract"]
+    assert coverage["requested_data_cutoff_session"] == calendar[-1]
+    assert coverage["required_field_available_to"] == {
+        "close": "2099-12-31",
+        "turnover_rate_f": field_cutoff,
+        "volume_ratio": field_cutoff,
+    }
+    assert coverage["effective_field_available_to"] == field_cutoff
+    assert coverage["effective_field_cutoff_session"] == field_cutoff
+    assert evidence["calendar_end"] == field_cutoff
+    assert contract["requested_data_cutoff_session"] == calendar[-1]
+    assert contract["effective_field_cutoff_session"] == field_cutoff
+    assert contract["data_cutoff_session"] == field_cutoff
+    assert contract["calendar_end"] == field_cutoff
+    assert contract["dataset_identity_sha256"] == "a" * 64
+    assert periods["test_end"] < field_cutoff
+
+    explicit = dict(periods)
+    explicit["test_end"] = calendar[-2]
+    with pytest.raises(
+        ValueError,
+        match="ends after all selected factor fields are available",
+    ):
+        resolve_research_window_contract(
+            dataset,
+            calendar,
+            periods=explicit,
+            horizon_profile=SHORT_1_5D,
+            feature_set=feature_set,
+        )
 
 
 @pytest.mark.no_database
@@ -292,11 +362,7 @@ def test_research_window_starts_only_after_all_selected_fields_are_usable() -> N
             "research_available_from": "2016-04-30",
         }
     )
-    unsigned = dict(matrix)
-    unsigned.pop("coverage_sha256")
-    digest = canonical_sha256(unsigned)
-    matrix["coverage_sha256"] = digest
-    dataset["provenance"]["field_coverage_sha256"] = digest
+    _reseal_field_coverage(dataset)
 
     periods, evidence = resolve_research_window_contract(
         dataset,

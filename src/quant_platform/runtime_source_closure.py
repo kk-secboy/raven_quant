@@ -57,6 +57,7 @@ _DATABASE_RUNTIME_IDENTITY_CONSTRAINTS = (
     "ck_strategy_versions_v17_runtime_identity",
     "ck_strategy_versions_v18_runtime_identity",
     "ck_strategy_versions_v19_runtime_identity",
+    "ck_strategy_versions_v20_runtime_identity",
 )
 _DYNAMIC_IMPORT_CALLS = frozenset(
     {

@@ -15,6 +15,7 @@ from quant_data.config import Settings
 from quant_data.database import (
     alerts,
     allocation_schedule_groups,
+    audit_events,
     backtest_runs,
     open_database,
     recommendation_portfolios,
@@ -68,8 +69,13 @@ from .scheduler import AUTOMATED_DATA_BUNDLES
 from .services import list_qlib_datasets_for_display
 from .strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS, get_strategy_recipe
 from .transparent_baseline_lockbox import (
+    ALL_UNAVAILABLE_CASH_ONLY_ACTION,
+    ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY,
+    ALL_UNAVAILABLE_CASH_ONLY_CONTRACT_VERSION,
+    ALL_UNAVAILABLE_CASH_ONLY_RUNNER,
     LOCKBOX_CONFIG_KEY,
     LOCKBOX_CONTRACT_VERSION_V3,
+    validate_all_unavailable_cash_only_audit_event,
     validate_joint_lockbox,
 )
 from .transparent_baseline_runner import (
@@ -562,6 +568,102 @@ def _validated_cash_only_horizon_lanes(
                 "status": item["status"],
                 "reason": item["reason"],
                 "evidence_sha256": item["evidence_sha256"],
+            },
+        }
+    return lanes
+
+
+def _validated_all_unavailable_cash_only_horizon_lanes(
+    audit_rows: Sequence[Any],
+    *,
+    lockbox_rows: Sequence[Any],
+) -> dict[str, dict[str, Any]]:
+    """Project the newest current-recipe no-OOS receipt as inert cash sleeves.
+
+    Any current-recipe StrategyVersion supersedes this standalone declaration:
+    partial unavailability must then come from that version's v3 joint lockbox.
+    A malformed or stale newest receipt fails closed and is never replaced by
+    an older declaration.
+    """
+
+    current_versions = {
+        recipe_id: str(get_strategy_recipe(recipe_id)["version"])
+        for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
+    }
+    if len(set(current_versions.values())) != 1:
+        return {}
+    current_recipe_version = next(iter(current_versions.values()))
+    for raw_row in lockbox_rows:
+        row = raw_row._mapping if hasattr(raw_row, "_mapping") else raw_row
+        if not isinstance(row, Mapping):
+            continue
+        config = row.get("config_json")
+        if (
+            isinstance(config, Mapping)
+            and str(config.get("recipe_id") or "") in current_versions
+            and str(config.get("recipe_version") or "")
+            == current_recipe_version
+            and row.get("created_by") == _TRANSPARENT_BASELINE_BOOTSTRAP_ACTOR
+        ):
+            return {}
+    if not audit_rows:
+        return {}
+    try:
+        receipt = validate_all_unavailable_cash_only_audit_event(
+            audit_rows[0],
+            expected_recipe_version=current_recipe_version,
+        )
+    except (TypeError, ValueError):
+        return {}
+    if (
+        receipt.get("contract_version")
+        != ALL_UNAVAILABLE_CASH_ONLY_CONTRACT_VERSION
+        or receipt.get("authority") != ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY
+        or receipt.get("cash_only_scope") != ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY
+        or receipt.get("runner") != ALL_UNAVAILABLE_CASH_ONLY_RUNNER
+        or receipt.get("strategy_version_created") is not False
+        or receipt.get("oos_reserved") is not False
+        or receipt.get("paper_eligible") is not False
+        or receipt.get("recommendation_eligible") is not False
+        or receipt.get("orders_eligible") is not False
+    ):
+        return {}
+    lanes: dict[str, dict[str, Any]] = {}
+    for item in receipt["unavailable_horizons"]:
+        horizon = str(item["horizon_profile"])
+        lanes[horizon] = {
+            "horizon": horizon,
+            "status": "ok",
+            "stage": "cash_only",
+            "strategy_version_id": None,
+            "health_status": "not_applicable",
+            "runner": ALL_UNAVAILABLE_CASH_ONLY_RUNNER,
+            "message": (
+                "the current public baseline has no honest unopened OOS window; "
+                "this sleeve remains in cash"
+            ),
+            "candidates": [],
+            "cash_only": True,
+            "sleeve_action": "remain_in_cash",
+            "new_entries_allowed": False,
+            "recommendation_eligible": False,
+            "cash_only_evidence": {
+                "receipt_sha256": receipt["receipt_sha256"],
+                "authority": receipt["authority"],
+                "dataset": receipt["dataset"],
+                "dataset_identity_sha256": receipt[
+                    "dataset_identity_sha256"
+                ],
+                "dataset_lineage_id": receipt["dataset_lineage_id"],
+                "current_recipe_version": receipt["current_recipe_version"],
+                "history_selection_sha256": receipt[
+                    "unopened_history_selection"
+                ]["selection_sha256"],
+                "recipe_id": item["recipe_id"],
+                "unavailable_evidence_sha256": item["evidence_sha256"],
+                "strategy_version_created": False,
+                "oos_reserved": False,
+                "orders_eligible": False,
             },
         }
     return lanes
@@ -1199,6 +1301,13 @@ class DeploymentReadinessStore:
         }
         terminal_cash_only_lanes: dict[str, dict[str, Any]] = {}
         with self.engine.connect() as connection:
+            all_unavailable_cash_only_rows = connection.execute(
+                select(audit_events)
+                .where(
+                    audit_events.c.action == ALL_UNAVAILABLE_CASH_ONLY_ACTION
+                )
+                .order_by(audit_events.c.created_at.desc(), audit_events.c.id.desc())
+            ).all()
             lockbox_rows = connection.execute(
                 select(
                     strategy_versions.c.id,
@@ -1435,10 +1544,17 @@ class DeploymentReadinessStore:
                 short_lane=short_lane,
             )
         )
+        all_unavailable_cash_only_lanes = (
+            _validated_all_unavailable_cash_only_horizon_lanes(
+                all_unavailable_cash_only_rows,
+                lockbox_rows=lockbox_rows,
+            )
+        )
         # A genuine current-recipe sealed lockbox remains authoritative when it
         # exists. The rehabilitation projection is an independent source
         # reference and never impersonates that sealed path.
         cash_only_lanes = {
+            **all_unavailable_cash_only_lanes,
             **rehabilitation_cash_only_lanes,
             **terminal_cash_only_lanes,
             **_validated_cash_only_horizon_lanes(lockbox_rows),

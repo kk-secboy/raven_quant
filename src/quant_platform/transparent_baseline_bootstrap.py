@@ -444,6 +444,14 @@ def _plan_member(
             horizon_profile=str(recipe["horizon"]),
             feature_set=feature_set,
             universe=str(recipe["universe"]),
+            requested_data_cutoff_session=str(
+                original_research_window.get("requested_data_cutoff_session")
+                or calendar_end
+            ),
+            effective_field_cutoff_session=str(
+                original_research_window.get("effective_field_cutoff_session")
+                or calendar_end
+            ),
         )
         periods = adjusted_periods
         evidence = {
@@ -1564,18 +1572,37 @@ class TransparentBaselineBootstrapService:
             if not plans:
                 reason = "no transparent baseline horizon has enough unopened evidence"
                 # There is no statistical member to reserve, so building a
-                # joint lockbox would be dishonest.  Still project every
-                # deterministic exclusion into the reconcile report instead
-                # of losing it behind the generic terminal error.
+                # joint lockbox or StrategyVersion would be dishonest. Persist
+                # only a hashed no-orders receipt; readiness may project it as
+                # cash/NO_ACTION but it grants no paper or recommendation
+                # authority.
+                registration = self.lockboxes.register_all_unavailable_cash_only(
+                    dataset=str(dataset["name"]),
+                    dataset_identity_sha256=str(
+                        dataset["dataset_identity_sha256"]
+                    ),
+                    dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+                    current_recipe_version=current_recipe_version,
+                    unopened_history_selection=selection_evidence,
+                    unavailable_horizons=unavailable_horizons,
+                    actor=actor,
+                )
+                receipt = dict(registration["receipt"])
                 result["joint_lockbox"] = {
-                    "status": "unavailable",
+                    "status": "cash_only",
                     "reason": reason,
+                    "authority": receipt["authority"],
+                    "runner": receipt["runner"],
+                    "sleeve_action": receipt["sleeve_action"],
+                    "receipt_sha256": receipt["receipt_sha256"],
+                    "audit_event_id": registration["audit_event_id"],
+                    "registration_status": registration["status"],
                     "unavailable_horizons": deepcopy(unavailable_horizons),
                 }
                 result["members"] = _unavailable_member_results(
                     unavailable_horizons
                 )
-                result["errors"].append(reason)
+                result["status"] = "no_op"
                 return result
             lockbox = build_joint_lockbox(
                 dataset=str(dataset["name"]),

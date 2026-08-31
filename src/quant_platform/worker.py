@@ -5910,17 +5910,50 @@ class LocalJobWorker:
         approve, simulate, promote, or expose recommendations.
         """
 
+        artifact = validate_compiled_strategy_artifact(
+            artifact,
+            allowed_factor_ids=allowed_factor_ids,
+        )
+        proposal = artifact["strategy_proposal"]
+
+        def require_reusable(candidate: dict[str, Any]) -> dict[str, Any]:
+            config = dict(candidate.get("config") or {})
+            data_contract = config.get("strategy_research_data_contract")
+            evaluation_contract = config.get("strategy_evaluation_contract")
+            if (
+                candidate.get("status") != "draft"
+                or candidate.get("horizon_profile") != proposal["horizon"]
+                or config.get("horizon_profile") != proposal["horizon"]
+                or candidate.get("strategy_rules_sha256")
+                != artifact["rules_sha256"]
+                or config.get("strategy_rules_sha256") != artifact["rules_sha256"]
+                or config.get("strategy_research_artifact_sha256")
+                != artifact["artifact_sha256"]
+                or config.get("strategy_research_proposal_sha256")
+                != artifact["proposal_sha256"]
+                or config.get("recipe_id") != proposal["baseline_recipe_id"]
+                or config.get("recipe_version")
+                != proposal["baseline_recipe_version"]
+                or data_contract != proposal["data_contract"]
+                or evaluation_contract != proposal["evaluation_contract"]
+                or config.get("parent_strategy_version_id")
+                != proposal["parent_strategy_version_id"]
+            ):
+                raise ValueError(
+                    "compiled strategy artifact materialization conflict is not "
+                    "an exact draft retry"
+                )
+            return candidate
+
         existing = self.strategies.find_version_by_source_artifact(compiled_artifact_id)
         if existing is not None:
-            if (
-                existing["config"].get("strategy_research_artifact_sha256")
-                != artifact["artifact_sha256"]
-                or existing.get("status") != "draft"
-            ):
-                raise ValueError("compiled strategy artifact already maps to another state")
-            return existing
+            return require_reusable(existing)
+        existing = self.strategies.find_version_by_compiled_fin_strategy_artifact(
+            artifact
+        )
+        if existing is not None:
+            return require_reusable(existing)
 
-        proposal = artifact["strategy_proposal"]
         config = materialize_strategy_candidate_config(
             artifact,
             source_research_artifact_id=compiled_artifact_id,
@@ -5933,7 +5966,7 @@ class LocalJobWorker:
                 parent = self.strategies.get_version(str(parent_id))
                 if parent["horizon_profile"] != proposal["horizon"]:
                     raise ValueError("strategy research parent horizon changed")
-                return self.strategies.create_version(
+                return self.strategies.create_fin_strategy_version_if_absent(
                     str(parent["strategy_id"]),
                     benchmark=benchmark,
                     universe=str(parent["universe"]),
@@ -5960,24 +5993,27 @@ class LocalJobWorker:
                 hypothesis_group_cap=0.70,
             )
             return dict(family["versions"][0])
-        except ValueError as exc:
-            # The partial unique index on source_research_artifact_id makes
-            # concurrent/retried materialization idempotent.  Only swallow a
-            # conflict when the exact sealed artifact is now present.
+        except ValueError:
+            # Source-row and semantic lookups cover both concurrent writes and
+            # retries that archived identical JSON under a fresh artifact id.
             existing = self.strategies.find_version_by_source_artifact(
                 compiled_artifact_id
             )
             if existing is None:
+                existing = (
+                    self.strategies.find_version_by_compiled_fin_strategy_artifact(
+                        artifact
+                    )
+                )
+            if existing is None:
                 raise
-            if (
-                existing["config"].get("strategy_research_artifact_sha256")
-                != artifact["artifact_sha256"]
-                or existing.get("status") != "draft"
-            ):
+            try:
+                return require_reusable(existing)
+            except ValueError as conflict:
                 raise ValueError(
-                    "compiled strategy artifact materialization conflict is not idempotent"
-                ) from exc
-            return existing
+                    "compiled strategy artifact materialization conflict is not "
+                    "idempotent"
+                ) from conflict
 
     def _queue_fin_strategy_policy_evaluations(
         self,

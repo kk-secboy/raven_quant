@@ -40,6 +40,7 @@ from quant_platform.services import refresh_qlib_display_catalog
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.transparent_baseline_lockbox import (
     LOCKBOX_CONFIG_KEY,
+    build_all_unavailable_cash_only_receipt,
     build_joint_lockbox,
     build_unopened_history_selection,
 )
@@ -301,6 +302,142 @@ def _cash_only_lockbox_rows() -> tuple[list[dict], dict]:
         for member in members
     ]
     return rows, lockbox
+
+
+def _all_unavailable_cash_only_audit_rows(
+    *, recipe_version: str | None = None
+) -> tuple[list[dict], dict]:
+    version = recipe_version or str(
+        get_strategy_recipe("short_relative_strength")["version"]
+    )
+    selection = build_unopened_history_selection(
+        calendar_days=["2026-08-27", "2026-08-28"],
+        current_recipe_version=version,
+        prior_batches=[],
+    )
+    unavailable = []
+    for recipe_id in (
+        "short_relative_strength",
+        "swing_trend",
+        "long_quality_value",
+    ):
+        recipe = get_strategy_recipe(recipe_id)
+        evidence = {
+            "capital_evaluation_eligible": False,
+            "capital_evaluation_unavailable_reason": "no honest unopened OOS",
+        }
+        unavailable.append(
+            {
+                "recipe_id": recipe_id,
+                "horizon_profile": str(recipe["horizon"]),
+                "status": "unavailable",
+                "reason": "the sealed OOS window is unavailable",
+                "evidence": evidence,
+                "evidence_sha256": readiness_module.canonical_sha256(evidence),
+            }
+        )
+    receipt = build_all_unavailable_cash_only_receipt(
+        dataset="daily-v19",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        current_recipe_version=version,
+        unopened_history_selection=selection,
+        unavailable_horizons=unavailable,
+    )
+    row = {
+        "id": 91,
+        "user_id": None,
+        "username": "system:transparent-baseline-bootstrap",
+        "action": readiness_module.ALL_UNAVAILABLE_CASH_ONLY_ACTION,
+        "method": "INTERNAL",
+        "path": "transparent-baseline/all-unavailable-cash-only",
+        "status_code": 201,
+        "ip_hash": None,
+        "user_agent": "transparent_baseline_bootstrap.py",
+        "details_json": receipt,
+        "created_at": datetime(2026, 9, 1, tzinfo=UTC),
+    }
+    return [row], receipt
+
+
+@pytest.mark.no_database
+def test_readiness_accepts_governed_all_unavailable_cash_only_receipt() -> None:
+    rows, receipt = _all_unavailable_cash_only_audit_rows()
+
+    lanes = readiness_module._validated_all_unavailable_cash_only_horizon_lanes(
+        rows,
+        lockbox_rows=[],
+    )
+
+    assert set(lanes) == {"short_1_5d", "swing_1_6m", "long_1_3y"}
+    for lane in lanes.values():
+        assert lane["status"] == "ok"
+        assert lane["stage"] == "cash_only"
+        assert lane["strategy_version_id"] is None
+        assert lane["runner"] == "cash_only_no_orders"
+        assert lane["sleeve_action"] == "remain_in_cash"
+        assert lane["new_entries_allowed"] is False
+        assert lane["recommendation_eligible"] is False
+        assert lane["cash_only_evidence"]["receipt_sha256"] == (
+            receipt["receipt_sha256"]
+        )
+        assert lane["cash_only_evidence"]["strategy_version_created"] is False
+        assert lane["cash_only_evidence"]["oos_reserved"] is False
+        assert lane["cash_only_evidence"]["orders_eligible"] is False
+
+    production = readiness_module._project_three_horizon_production(
+        {horizon: [] for horizon in lanes},
+        lanes,
+    )
+    assert production["status"] == "ok"
+    assert production["cash_only_horizons"] == [
+        "short_1_5d",
+        "swing_1_6m",
+        "long_1_3y",
+    ]
+
+
+@pytest.mark.no_database
+def test_all_unavailable_cash_only_readiness_fails_closed() -> None:
+    rows, _receipt = _all_unavailable_cash_only_audit_rows()
+    tampered = deepcopy(rows)
+    tampered[0]["details_json"]["unavailable_horizons"][0]["reason"] = (
+        "runtime crashed"
+    )
+    assert (
+        readiness_module._validated_all_unavailable_cash_only_horizon_lanes(
+            tampered,
+            lockbox_rows=[],
+        )
+        == {}
+    )
+
+    stale, _ = _all_unavailable_cash_only_audit_rows(recipe_version="stale-v18")
+    assert (
+        readiness_module._validated_all_unavailable_cash_only_horizon_lanes(
+            stale,
+            lockbox_rows=[],
+        )
+        == {}
+    )
+
+    current_version = str(
+        get_strategy_recipe("short_relative_strength")["version"]
+    )
+    current_strategy_row = {
+        "created_by": "system:transparent-baseline-bootstrap",
+        "config_json": {
+            "recipe_id": "short_relative_strength",
+            "recipe_version": current_version,
+        },
+    }
+    assert (
+        readiness_module._validated_all_unavailable_cash_only_horizon_lanes(
+            rows,
+            lockbox_rows=[current_strategy_row],
+        )
+        == {}
+    )
 
 
 @pytest.mark.no_database

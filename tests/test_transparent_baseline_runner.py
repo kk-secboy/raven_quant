@@ -360,7 +360,7 @@ def test_historical_v17_identity_is_not_rebound_to_current_v18_runtime() -> None
         )
 
 
-def test_historical_v18_identity_is_not_rebound_to_current_v19_runtime() -> None:
+def test_historical_v18_identity_is_not_rebound_to_current_v20_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     with pytest.raises(ValueError, match="transparent v18 runtime bundle differs"):
@@ -384,7 +384,7 @@ def test_historical_v18_identity_is_not_rebound_to_current_v19_runtime() -> None
         )
 
 
-def test_current_v19_identity_is_bound_and_executable() -> None:
+def test_current_v20_identity_is_bound_and_executable() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
     config = _config(
         STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
@@ -412,7 +412,7 @@ def test_current_v19_identity_is_bound_and_executable() -> None:
     ) == STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
 
 
-def test_current_v19_job_identity_cannot_be_changed() -> None:
+def test_current_v20_job_identity_cannot_be_changed() -> None:
     config = _config(
         STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
@@ -684,6 +684,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0090_strategy_research_runtime.py"
     ).read_text(encoding="utf-8")
+    v20_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0091_strategy_runtime_v20.py"
+    ).read_text(encoding="utf-8")
     database_metadata = (
         Path(__file__).parents[1] / "src" / "quant_data" / "database.py"
     ).read_text(encoding="utf-8")
@@ -724,7 +730,8 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         database_metadata
     )
     assert STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 in v19_migration
-    assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in v19_migration
+    assert STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 in v20_migration
+    assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in v20_migration
     assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in database_metadata
 
 

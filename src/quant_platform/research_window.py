@@ -79,6 +79,8 @@ class ResearchWindowContract:
     feature_set_sha256: str | None
     calendar_start: str
     calendar_end: str
+    requested_data_cutoff_session: str
+    effective_field_cutoff_session: str
     data_cutoff_session: str
     signal_time_semantics: str
     earliest_execution_semantics: str
@@ -119,9 +121,15 @@ class ResearchWindowContract:
             raise ValueError("research window feature-set id and digest must be bound together")
         calendar_start = date.fromisoformat(self.calendar_start)
         calendar_end = date.fromisoformat(self.calendar_end)
+        requested_cutoff = date.fromisoformat(self.requested_data_cutoff_session)
+        effective_field_cutoff = date.fromisoformat(self.effective_field_cutoff_session)
         data_cutoff = date.fromisoformat(self.data_cutoff_session)
         if not calendar_start <= data_cutoff == calendar_end:
             raise ValueError("research window data cutoff must equal the calendar end")
+        if effective_field_cutoff != data_cutoff:
+            raise ValueError("research window effective field cutoff must equal the data cutoff")
+        if requested_cutoff < effective_field_cutoff:
+            raise ValueError("research window requested data cutoff precedes its effective cutoff")
         labels = self.label_horizons_sessions
         if not labels or labels != tuple(sorted(set(labels))) or min(labels) < 1:
             raise ValueError("research window labels must be unique positive sessions")
@@ -236,6 +244,7 @@ def resolve_required_field_coverage(
     if not normalized:
         raise ValueError("governed feature set does not reference any dataset fields")
     starts: dict[str, str] = {}
+    ends: dict[str, str] = {}
     sources: dict[str, list[str]] = {}
     cutoff = date.fromisoformat(data_cutoff_session)
     for field in normalized:
@@ -249,11 +258,10 @@ def resolve_required_field_coverage(
             field_end = date.fromisoformat(raw_end)
         except ValueError as exc:
             raise ValueError(f"dataset field {field} has no usable continuous coverage") from exc
-        if field_end < cutoff:
-            raise ValueError(
-                f"dataset field {field} coverage ends before the data cutoff session"
-            )
+        if field_end < field_start:
+            raise ValueError(f"dataset field {field} has no usable continuous coverage")
         starts[field] = field_start.isoformat()
+        ends[field] = field_end.isoformat()
         field_sources = {
             str(source)
             for year in (entry.get("years") or [])
@@ -262,15 +270,23 @@ def resolve_required_field_coverage(
             if str(source)
         }
         sources[field] = sorted(field_sources)
-    effective = max(date.fromisoformat(value) for value in starts.values())
+    effective_start = max(date.fromisoformat(value) for value in starts.values())
+    effective_end = min(
+        cutoff,
+        *(date.fromisoformat(value) for value in ends.values()),
+    )
+    if effective_end < effective_start:
+        raise ValueError("selected dataset fields have no common usable coverage")
     return {
         "coverage_version": str(matrix["version"]),
         "field_coverage_sha256": coverage_sha256,
         "required_fields": list(normalized),
         "required_field_available_from": starts,
+        "required_field_available_to": ends,
         "required_field_sources": sources,
-        "effective_field_start_session": effective.isoformat(),
-        "data_cutoff_session": cutoff.isoformat(),
+        "effective_field_start_session": effective_start.isoformat(),
+        "effective_field_available_to": effective_end.isoformat(),
+        "requested_data_cutoff_session": cutoff.isoformat(),
     }
 
 
@@ -284,6 +300,8 @@ def build_research_window_contract(
     feature_set: Mapping[str, Any] | None = None,
     universe: str = DEFAULT_RESEARCH_UNIVERSE,
     random_seed: int = DEFAULT_RESEARCH_SEED,
+    requested_data_cutoff_session: str | None = None,
+    effective_field_cutoff_session: str | None = None,
 ) -> ResearchWindowContract:
     """Bind a resolved research split to immutable dataset and timing evidence."""
 
@@ -325,6 +343,8 @@ def build_research_window_contract(
     cost_schedule_sha256 = canonical_sha256(
         [asdict(item) for item in CN_COST_SCHEDULE_BOOK.versions]
     )
+    requested_cutoff = str(requested_data_cutoff_session or ordered[-1])
+    effective_cutoff = str(effective_field_cutoff_session or ordered[-1])
     return ResearchWindowContract(
         horizon_profile=horizon.horizon_profile,
         horizon_contract_sha256=horizon.sha256,
@@ -338,7 +358,9 @@ def build_research_window_contract(
         feature_set_sha256=feature_sha,
         calendar_start=ordered[0],
         calendar_end=ordered[-1],
-        data_cutoff_session=ordered[-1],
+        requested_data_cutoff_session=requested_cutoff,
+        effective_field_cutoff_session=effective_cutoff,
+        data_cutoff_session=effective_cutoff,
         signal_time_semantics=DAILY_CLOSE_SIGNAL_SEMANTICS,
         earliest_execution_semantics=NEXT_SESSION_EXECUTION_SEMANTICS,
         execution_lag_sessions=lag,

@@ -122,15 +122,15 @@ FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "3f0c60adbe3b50ff26771e11ce75f6a48d13772ac5bff549f716469748b92874"
 )
 STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
-    "qlib-rdagent-single-mainline-2026-09-01-v19"
+    "qlib-rdagent-single-mainline-2026-09-01-v20"
 )
 STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
     "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
 )
-# Filled after the complete v19 source closure is stable.  The source-closure
-# normalizer excludes both v19 seal assignments from their own digest.
+# Filled after the complete v20 source closure is stable.  The source-closure
+# normalizer excludes both v20 seal assignments from their own digest.
 STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "d6ded80dbe88c6bee0403428132e6def80e14bc7ff540ac41e4d83f8343bf1c3"
+    "a0fe9491b27836526af9d7644c2c396973a95933fcfa4bf9365046cf634be53d"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
@@ -320,7 +320,7 @@ def target_worker_runtime_image_for_recipe(
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v19",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v20",
     }[normalized_recipe_version]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -460,7 +460,7 @@ def require_transparent_baseline_runner(
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v19",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v20",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -505,13 +505,13 @@ def require_transparent_baseline_runner(
         "v16",
         "v17",
         "v18",
-        "v19",
+        "v20",
     }:
         try:
             bundle_sha256 = (
                 position_risk_bundle_sha256(runner_path.parents[1])
                 if version_label
-                in {"v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19"}
+                in {"v12", "v13", "v14", "v15", "v16", "v17", "v18", "v20"}
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
         except OSError as exc:
@@ -528,7 +528,7 @@ def require_transparent_baseline_runner(
             "v16": DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
             "v17": TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
             "v18": FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256,
-            "v19": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v20": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(

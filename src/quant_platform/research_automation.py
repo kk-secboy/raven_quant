@@ -779,6 +779,8 @@ def resolve_research_window_contract(
 
     profile = normalize_research_horizon_profile(horizon_profile)
     effective_calendar = list(calendar_days)
+    requested_data_cutoff_session: str | None = None
+    effective_field_cutoff_session: str | None = None
     field_evidence: dict[str, Any] | None = None
     if profile != LEGACY_AMBIGUOUS:
         features = (feature_set or {}).get("features")
@@ -798,23 +800,38 @@ def resolve_research_window_contract(
         )
         if not ordered_calendar:
             raise ValueError("Qlib trading calendar is empty")
+        requested_data_cutoff_session = ordered_calendar[-1]
         provenance = dataset.get("provenance") or {}
         if not isinstance(provenance, dict):
             raise ValueError("dataset provenance must be an object")
         field_evidence = resolve_required_field_coverage(
             provenance,
             required_fields,
-            data_cutoff_session=ordered_calendar[-1],
+            data_cutoff_session=requested_data_cutoff_session,
         )
         effective_start = str(field_evidence["effective_field_start_session"])
-        effective_calendar = [day for day in ordered_calendar if day >= effective_start]
+        effective_end = str(field_evidence["effective_field_available_to"])
+        effective_calendar = [
+            day
+            for day in ordered_calendar
+            if effective_start <= day <= effective_end
+        ]
         if not effective_calendar:
-            raise ValueError("dataset has no trading sessions after field availability begins")
+            raise ValueError("selected dataset fields have no common Qlib trading sessions")
+        effective_field_cutoff_session = effective_calendar[-1]
+        field_evidence = {
+            **field_evidence,
+            "effective_field_cutoff_session": effective_field_cutoff_session,
+        }
         if periods is not None:
             explicit = normalize_explicit_research_periods(periods)
             if explicit["train_start"] < effective_calendar[0]:
                 raise ValueError(
                     "explicit research begins before all selected factor fields are available"
+                )
+            if explicit["test_end"] > effective_field_cutoff_session:
+                raise ValueError(
+                    "explicit research ends after all selected factor fields are available"
                 )
     resolved, evidence = resolve_research_periods(
         effective_calendar,
@@ -831,6 +848,8 @@ def resolve_research_window_contract(
         feature_set=feature_set,
         universe=universe,
         random_seed=random_seed,
+        requested_data_cutoff_session=requested_data_cutoff_session,
+        effective_field_cutoff_session=effective_field_cutoff_session,
     )
     evidence = {
         **evidence,
