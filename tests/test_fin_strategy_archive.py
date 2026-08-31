@@ -200,6 +200,43 @@ def test_worker_coldstart_materialization_creates_one_draft_and_reuses_it_on_ret
     assert strategies.created[0]["universe"] == "cn_all"
 
 
+def test_policy_queue_revalidates_with_the_frozen_feature_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feature_set = get_feature_set("governed-baseline")
+    observed: dict[str, set[str] | None] = {}
+
+    def validate(_artifact, *, allowed_factor_ids=None):
+        observed["allowed_factor_ids"] = allowed_factor_ids
+        raise RuntimeError("validator-observed")
+
+    monkeypatch.setattr(
+        "quant_platform.worker.validate_compiled_strategy_artifact",
+        validate,
+    )
+    worker = SimpleNamespace()
+    job = {
+        "payload": {
+            "dataset": "snapshot",
+            "dataset_path": str(tmp_path),
+            "dataset_identity_sha256": "b" * 64,
+            "feature_set": feature_set,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="validator-observed"):
+        Worker._queue_fin_strategy_policy_evaluations(
+            worker,
+            "run-1",
+            job,
+            {"strategy_proposals": [{}]},
+            {"strategy_proposal_artifacts": [{}]},
+        )
+
+    assert observed["allowed_factor_ids"] == set(feature_set["features"])
+
+
 def _job_payload(feature_set: dict, periods: dict[str, str]) -> dict:
     incumbent_id = "a" * 32
     return {

@@ -5977,12 +5977,19 @@ class LocalJobWorker:
         dataset_name = str(payload.get("dataset") or "")
         dataset_path = Path(str(payload.get("dataset_path") or ""))
         dataset_identity = str(payload.get("dataset_identity_sha256") or "")
+        feature_set = payload.get("feature_set")
+        allowed_factor_ids = (
+            set(dict(feature_set.get("features") or {}))
+            if isinstance(feature_set, dict)
+            else set()
+        )
         source_artifacts = result.get("strategy_proposals") or []
         archived = strategy_archive.get("strategy_proposal_artifacts") or []
         if (
             not dataset_name
             or not dataset_path.is_dir()
             or not re.fullmatch(r"[0-9a-f]{64}", dataset_identity)
+            or not allowed_factor_ids
             or len(source_artifacts) != len(archived)
         ):
             raise ValueError("fin_strategy competition inputs are incomplete")
@@ -5996,7 +6003,10 @@ class LocalJobWorker:
         for raw_artifact, archived_item in zip(
             source_artifacts, archived, strict=True
         ):
-            artifact = validate_compiled_strategy_artifact(raw_artifact)
+            artifact = validate_compiled_strategy_artifact(
+                raw_artifact,
+                allowed_factor_ids=allowed_factor_ids,
+            )
             version = self.strategies.get_version(
                 str(archived_item["strategy_version_id"])
             )
