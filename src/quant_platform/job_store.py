@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
-from quant_data.database import jobs, open_database, row_dict
+from quant_data.database import backtest_runs, jobs, open_database, row_dict
 from quant_platform.jsonb_safety import normalize_jsonb_document
 
 EVALUATION_STATUS_COUNTS_KEY = "_quantlab_evaluation_status_counts"
@@ -25,6 +25,10 @@ ORDER_PLAN_MATERIALIZED = "materialized"
 ORDER_PLAN_CANCELLED = "cancelled"
 ORDER_PLAN_SUPERSEDED = "superseded"
 ORDER_PLAN_FAILED = "failed"
+INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR = (
+    "Worker restarted after the bounded attempt limit; operator review is required"
+)
+_PENDING_V17_INTERRUPTION_RECOVERY_JOB_ID = "858a75a6f1994c359fa9c3567ed09f57"
 
 # Global heavy-work CPU tokens.  This is deliberately independent of Docker's
 # per-container ceiling: several individually capped containers can still
@@ -231,28 +235,87 @@ class JobStore:
         self.engine = open_database(database_url)
 
     def recover_interrupted(self, allowed_kinds: tuple[str, ...] = ()) -> int:
+        return self._recover_interrupted(allowed_kinds)
+
+    def interrupted_dependency_failures(
+        self, allowed_kinds: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
+        """Return exact restart terminals whose domain state must be projected.
+
+        This query intentionally includes terminals created by an earlier
+        process.  Domain projection and capital-OOS failure settlement are
+        idempotent, so a crash immediately after queue recovery cannot strand
+        them.  The one known v17 source remains untouched at attempts 1/1 until
+        its dedicated append-only recovery transaction seals the running row.
+        """
+
+        predicate = [
+            jobs.c.status == "failed",
+            jobs.c.exit_code == 143,
+            jobs.c.error == INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
+            ~(
+                (jobs.c.id == _PENDING_V17_INTERRUPTION_RECOVERY_JOB_ID)
+                & (jobs.c.attempts == 1)
+                & (jobs.c.max_attempts == 1)
+            ),
+        ]
+        if allowed_kinds:
+            predicate.append(jobs.c.kind.in_(allowed_kinds))
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(jobs).where(*predicate).order_by(jobs.c.finished_at, jobs.c.id)
+            ).all()
+        return [self._decode(row_dict(row)) for row in rows]
+
+    def _recover_interrupted(
+        self, allowed_kinds: tuple[str, ...]
+    ) -> int:
         predicate = [jobs.c.status == "running"]
         if allowed_kinds:
             predicate.append(jobs.c.kind.in_(allowed_kinds))
+        now = _now()
         with self.engine.begin() as connection:
-            exhausted = connection.execute(
+            # A formal backtest is one-shot after its first claim.  Requeueing
+            # one with attempts < max_attempts would strand it forever because
+            # claim_next deliberately excludes every repeated formal attempt.
+            exhausted_rows = connection.execute(
                 update(jobs)
-                .where(*predicate, jobs.c.attempts >= jobs.c.max_attempts)
+                .where(
+                    *predicate,
+                    (jobs.c.kind == "strategy_backtest")
+                    | (jobs.c.attempts >= jobs.c.max_attempts),
+                )
                 .values(
                     status="failed",
                     exit_code=143,
-                    error=(
-                        "Worker restarted after the bounded attempt limit; "
-                        "operator review is required"
-                    ),
+                    error=INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
                     cancel_requested_at=None,
                     next_attempt_at=None,
-                    finished_at=_now(),
+                    finished_at=now,
                 )
-            )
+                .returning(*jobs.c)
+            ).all()
+            exhausted_ids = [str(row.id) for row in exhausted_rows]
+            if exhausted_ids:
+                connection.execute(
+                    update(backtest_runs)
+                    .where(
+                        backtest_runs.c.job_id.in_(exhausted_ids),
+                        backtest_runs.c.status.in_(("queued", "running")),
+                    )
+                    .values(
+                        status="failed",
+                        error=INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
+                        finished_at=now,
+                    )
+                )
             recoverable = connection.execute(
                 update(jobs)
-                .where(*predicate, jobs.c.attempts < jobs.c.max_attempts)
+                .where(
+                    *predicate,
+                    jobs.c.kind != "strategy_backtest",
+                    jobs.c.attempts < jobs.c.max_attempts,
+                )
                 .values(
                     status="queued",
                     started_at=None,
@@ -262,7 +325,7 @@ class JobStore:
                     error="Worker restarted; job safely requeued after warm-up",
                 )
             )
-        return int(exhausted.rowcount or 0) + int(recoverable.rowcount or 0)
+        return len(exhausted_rows) + int(recoverable.rowcount or 0)
 
     def create(
         self,
@@ -350,6 +413,7 @@ class JobStore:
         statement = select(jobs).where(
             jobs.c.status == "queued",
             (jobs.c.next_attempt_at.is_(None)) | (jobs.c.next_attempt_at <= _now()),
+            ~((jobs.c.kind == "strategy_backtest") & (jobs.c.attempts >= 1)),
         )
         if allowed_kinds:
             statement = statement.where(jobs.c.kind.in_(allowed_kinds))
@@ -615,13 +679,23 @@ class JobStore:
         persisted_result = _with_evaluation_status_counts(normalize_jsonb_document(result))
         with self.engine.begin() as connection:
             row = connection.execute(
-                select(jobs.c.status, jobs.c.attempts, jobs.c.max_attempts)
+                select(
+                    jobs.c.kind,
+                    jobs.c.status,
+                    jobs.c.attempts,
+                    jobs.c.max_attempts,
+                )
                 .where(jobs.c.id == job_id)
                 .with_for_update()
             ).first()
             if row is None:
                 raise KeyError(job_id)
-            if retryable and row.status == "running" and int(row.attempts) < int(row.max_attempts):
+            if (
+                retryable
+                and str(row.kind) != "strategy_backtest"
+                and row.status == "running"
+                and int(row.attempts) < int(row.max_attempts)
+            ):
                 delay_seconds = min(900, 30 * (2 ** max(0, int(row.attempts) - 1)))
                 connection.execute(
                     update(jobs)
@@ -660,6 +734,8 @@ class JobStore:
             ).first()
             if row is None:
                 raise KeyError(job_id)
+            if str(row.kind) == "strategy_backtest":
+                raise ValueError("formal final-test jobs cannot be retried")
             progress = dict(row.progress_json or {})
             if str(row.kind) == "simulation_order_plan":
                 materialization_status = str(

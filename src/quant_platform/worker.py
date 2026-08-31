@@ -65,6 +65,7 @@ from .factor_library_store import FactorLibraryStore
 from .feature_set_registry import get_feature_set, register_feature_set
 from .horizon_review import resolve_financial_review_trigger
 from .job_store import (
+    INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
     MAX_NUMERICAL_THREADS_PER_JOB,
     ORDER_PLAN_AWAITING_EXECUTION_DATA,
     ORDER_PLAN_EXECUTION_TRADE_DATE_KEY,
@@ -517,6 +518,12 @@ class LocalJobWorker:
             # pool member doing this after its sibling claimed work would
             # incorrectly classify a healthy running job as interrupted.
             self.store.recover_interrupted(self.settings.worker_job_kinds)
+            for job in self.store.interrupted_dependency_failures(
+                self.settings.worker_job_kinds
+            ):
+                self._mark_unhandled_job_failure(
+                    job, INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR
+                )
         self._thread = threading.Thread(target=self._loop, name="quant-job-worker", daemon=True)
         self._thread.start()
 
@@ -630,20 +637,36 @@ class LocalJobWorker:
         recommendation_snapshot_id = payload.get("recommendation_snapshot_id")
         simulation_batch_id = payload.get("simulation_batch_id")
         if research_run_id:
-            self._retry_transient_database(
-                lambda: self.research.mark_run(research_run_id, "failed", error=error)
+            research_run = self._retry_transient_database(
+                lambda: self.research.get_run(research_run_id)
             )
+            if research_run["status"] in {"queued", "running", "evaluating"}:
+                self._retry_transient_database(
+                    lambda: self.research.mark_run(
+                        research_run_id, "failed", error=error
+                    )
+                )
         if backtest_id:
-            self._retry_transient_database(
-                lambda: self.strategies.mark_backtest(backtest_id, "failed", error=error)
+            backtest = self._retry_transient_database(
+                lambda: self.strategies.get_backtest(backtest_id)
             )
+            if backtest["status"] in {"queued", "running"}:
+                self._retry_transient_database(
+                    lambda: self.strategies.mark_backtest(
+                        backtest_id, "failed", error=error
+                    )
+                )
         self._settle_capital_oos_failure(job, error)
         if parameter_experiment_id:
-            self._retry_transient_database(
-                lambda: self.parameter_experiments.mark(
-                    parameter_experiment_id, "failed", error=error
-                )
+            experiment = self._retry_transient_database(
+                lambda: self.parameter_experiments.get(parameter_experiment_id)
             )
+            if experiment["status"] in {"queued", "running"}:
+                self._retry_transient_database(
+                    lambda: self.parameter_experiments.mark(
+                        parameter_experiment_id, "failed", error=error
+                    )
+                )
         if recommendation_snapshot_id:
             self._retry_transient_database(
                 lambda: self.recommendations.mark_failed(
@@ -4364,7 +4387,12 @@ class LocalJobWorker:
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
         if job["kind"] == "strategy_backtest":
-            output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "backtests"
+                / payload["backtest_id"]
+            )
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
             result_path = output / "result.json"

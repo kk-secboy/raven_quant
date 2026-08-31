@@ -425,6 +425,103 @@ def test_worker_retries_transient_database_claim_failure_without_dying(
     assert processed == ["recovered-job"]
 
 
+def test_worker_start_projects_a_terminal_left_by_an_earlier_recovery_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projected: list[tuple[str, str]] = []
+
+    class FakeFactorLibrary:
+        def sync_builtin_library(self) -> None:
+            return None
+
+        def list_sota(self, *, limit: int) -> list:
+            assert limit == 200
+            return []
+
+    class FakeStore:
+        def recover_interrupted(self, allowed_kinds: tuple[str, ...]) -> int:
+            assert allowed_kinds == ("strategy_backtest",)
+            return 0
+
+        def interrupted_dependency_failures(
+            self, allowed_kinds: tuple[str, ...]
+        ) -> list[dict]:
+            assert allowed_kinds == ("strategy_backtest",)
+            return [{"id": "prior-terminal"}]
+
+    class FakeThread:
+        def __init__(self, **_kwargs) -> None:
+            self.started = False
+
+        def is_alive(self) -> bool:
+            return self.started
+
+        def start(self) -> None:
+            self.started = True
+
+    worker = object.__new__(LocalJobWorker)
+    worker._thread = None
+    worker._initialize_queue = True
+    worker.factor_library = FakeFactorLibrary()
+    worker.store = FakeStore()
+    worker.settings = SimpleNamespace(worker_job_kinds=("strategy_backtest",))
+    worker._mark_unhandled_job_failure = lambda job, error: projected.append(
+        (str(job["id"]), error)
+    )
+    monkeypatch.setattr(worker_module.threading, "Thread", FakeThread)
+
+    worker.start()
+
+    assert projected == [
+        (
+            "prior-terminal",
+            worker_module.INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
+        )
+    ]
+    assert worker._thread is not None and worker._thread.is_alive()
+
+
+def test_reprojecting_interrupted_failure_preserves_terminal_backtest_and_settles_oos() -> None:
+    oos_calls: list[dict] = []
+
+    class FakeStrategies:
+        def get_backtest(self, backtest_id: str) -> dict:
+            assert backtest_id == "backtest-a"
+            return {"status": "failed"}
+
+        def mark_backtest(self, *_args, **_kwargs) -> None:
+            pytest.fail("an existing terminal backtest must not be rewritten")
+
+    class FakeCapitalOOS:
+        def settle_batch(self, _batch_id: str, **kwargs) -> None:
+            oos_calls.append(kwargs)
+
+    worker = object.__new__(LocalJobWorker)
+    worker.strategies = FakeStrategies()
+    worker.capital_oos = FakeCapitalOOS()
+    worker._retry_transient_database = lambda operation: operation()
+    job = {
+        "id": "job-a",
+        "kind": "strategy_backtest",
+        "payload": {
+            "backtest_id": "backtest-a",
+            "strategy_version_id": "version-a",
+            "dataset": "snapshot-a",
+            "capital_oos_batch_id": "batch-a",
+        },
+    }
+
+    worker._mark_unhandled_job_failure(
+        job, worker_module.INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR
+    )
+
+    assert len(oos_calls) == 1
+    assert oos_calls[0]["failed"] is True
+    assert oos_calls[0]["failure_reason"] == (
+        worker_module.INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR
+    )
+
+
 def test_active_child_survives_progress_and_cancellation_database_outages(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

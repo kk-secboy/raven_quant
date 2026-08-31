@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from governance_fixtures import PERIODS, create_strategy_version
 from sqlalchemy import select
 
 from quant_data.checkpoint import CheckpointStore
@@ -10,7 +11,8 @@ from quant_data.models import FetchSpec, UnitResult
 from quant_data.supplemental_data import SUPPORTED_BUNDLES, bundle_datasets
 from quant_platform.api import create_app
 from quant_platform.data_task_store import DATA_TASK_CATALOG, DataTaskStore
-from quant_platform.job_store import JobStore
+from quant_platform.job_store import INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR, JobStore
+from quant_platform.strategy_store import StrategyStore
 
 
 def test_recover_interrupted_requeues_with_warmup_without_resetting_attempts(
@@ -70,6 +72,68 @@ def test_recover_interrupted_fails_job_at_bounded_attempt_limit(
             select(jobs.c.status).where(jobs.c.id == created["id"])
         )
     assert persisted_status == "failed"
+
+
+def test_started_strategy_job_never_requeues_and_projects_failure_idempotently(
+    database_url: str, tmp_path: Path
+) -> None:
+    jobs_store = JobStore(database_url)
+    strategies = StrategyStore(database_url)
+    version_id = create_strategy_version(database_url, tmp_path)
+    backtest = strategies.create_backtest(
+        version_id=version_id,
+        dataset="snapshot",
+        periods={
+            "start": PERIODS["test_start"].isoformat(),
+            "end": PERIODS["test_end"].isoformat(),
+        },
+        artifact_path=tmp_path / "formal-artifacts",
+    )
+    job = jobs_store.create(
+        "strategy_backtest",
+        {
+            "backtest_id": backtest["id"],
+            "strategy_version_id": version_id,
+        },
+        tmp_path / "strategy-backtest.log",
+        # A formal backtest remains one-shot even if legacy or recovery state
+        # raised the generic queue limit above its current attempt count.
+        max_attempts=2,
+    )
+    strategies.attach_job(backtest["id"], job["id"])
+    claimed = jobs_store.claim_next(("strategy_backtest",))
+    assert claimed is not None and claimed["id"] == job["id"]
+    strategies.mark_backtest(backtest["id"], "running")
+    source = strategies.get_backtest(backtest["id"])
+
+    assert jobs_store.recover_interrupted(("strategy_backtest",)) == 1
+
+    failed_job = jobs_store.get(job["id"])
+    failed_backtest = strategies.get_backtest(backtest["id"])
+    assert failed_job["status"] == failed_backtest["status"] == "failed"
+    assert failed_job["error"] == failed_backtest["error"] == (
+        INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR
+    )
+    assert failed_job["finished_at"] == failed_backtest["finished_at"]
+    assert failed_job["attempts"] == 1
+    assert failed_job["max_attempts"] == 2
+    assert failed_job["next_attempt_at"] is None
+    assert failed_backtest["metrics"] is None
+    assert failed_backtest["artifact_path"] == source["artifact_path"]
+    assert failed_backtest["job_id"] == source["job_id"] == job["id"]
+    assert failed_backtest["strategy_version_id"] == source["strategy_version_id"]
+
+    first_projection = jobs_store.interrupted_dependency_failures(
+        ("strategy_backtest",)
+    )
+    second_projection = jobs_store.interrupted_dependency_failures(
+        ("strategy_backtest",)
+    )
+    assert [item["id"] for item in first_projection] == [job["id"]]
+    assert second_projection == first_projection
+    assert jobs_store.recover_interrupted(("strategy_backtest",)) == 0
+    assert jobs_store.get(job["id"]) == failed_job
+    assert strategies.get_backtest(backtest["id"]) == failed_backtest
 
 
 def test_catalog_is_ordered_and_dependency_aware(database_url: str) -> None:

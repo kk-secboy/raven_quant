@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import pytest
+
 from quant_platform.job_store import FORMAL_DATA_AUTO_RETRY_KINDS, JobStore
 from quant_platform.scheduler import INFORMATION_CONFLICTING_JOB_KINDS
 
@@ -99,6 +101,55 @@ def test_final_strategy_backtest_is_never_automatically_retried(
         claimed["id"], exit_code=1, error="final test failed", retryable=True
     )
     assert store.get(claimed["id"])["status"] == "failed"
+
+
+def test_strategy_backtest_failure_cannot_requeue_below_a_raised_attempt_limit(
+    database_url: str, tmp_path: Path
+) -> None:
+    store = JobStore(database_url)
+    created = store.create(
+        "strategy_backtest",
+        {"backtest_id": "one-shot-final-test"},
+        tmp_path / "backtest-raised-limit.log",
+        max_attempts=2,
+    )
+    claimed = store.claim_next(("strategy_backtest",))
+    assert claimed is not None and claimed["id"] == created["id"]
+    assert claimed["attempts"] == 1
+    assert claimed["max_attempts"] == 2
+
+    assert not store.finish_or_retry(
+        claimed["id"],
+        exit_code=1,
+        error="transient runtime failure",
+        retryable=True,
+    )
+
+    failed = store.get(claimed["id"])
+    assert failed["status"] == "failed"
+    assert failed["attempts"] == 1
+    assert failed["next_attempt_at"] is None
+    assert store.claim_next(("strategy_backtest",)) is None
+
+
+def test_generic_retry_cannot_reopen_a_formal_strategy_backtest(
+    database_url: str, tmp_path: Path
+) -> None:
+    store = JobStore(database_url)
+    created = store.create(
+        "strategy_backtest",
+        {"backtest_id": "immutable-final-test"},
+        tmp_path / "backtest.log",
+    )
+    claimed = store.claim_next(("strategy_backtest",))
+    assert claimed is not None and claimed["id"] == created["id"]
+    store.finish(claimed["id"], exit_code=1, error="formal execution failed")
+    before = store.get(claimed["id"])
+
+    with pytest.raises(ValueError, match="formal final-test jobs cannot be retried"):
+        store.retry(claimed["id"])
+
+    assert store.get(claimed["id"]) == before
 
 
 def test_running_job_persists_live_downloader_progress(
