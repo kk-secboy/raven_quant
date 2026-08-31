@@ -237,6 +237,9 @@ def test_strategy_loop_uses_official_costeer_for_governed_ir_repairs() -> None:
     ).read_text(encoding="utf-8")
 
     assert "class StrategyProposalCoSTEER(CoSTEER):" in source
+    # Pinned RD-Agent CoSTEER forwards extra kwargs to Developer.__init__(scen).
+    # Keep the local adapter aligned with the upstream Factor/ModelCoSTEER pattern.
+    assert "scen=scenario" in source
     assert 'self.coder.develop(prev_out["proposal"])' in source
     assert "class StrategyProposalEvaluator(RAGEvaluator):" in source
     assert "previous_deterministic_validation" in source

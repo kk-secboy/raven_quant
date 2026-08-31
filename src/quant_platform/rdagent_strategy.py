@@ -462,6 +462,7 @@ class StrategyProposalCoSTEER(CoSTEER):
                     settings,
                     StrategyProposalEvaluator(),
                     StrategyProposalEvolvingStrategy(scenario),
+                    scen=scenario,
                     evolving_version=2,
                     with_knowledge=True,
                     knowledge_self_gen=False,
