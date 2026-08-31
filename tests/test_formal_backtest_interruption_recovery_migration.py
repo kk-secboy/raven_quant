@@ -23,6 +23,16 @@ def _migration_module():
     return module
 
 
+def _recipe_binding_migration_module():
+    filename = "0087_formal_backtest_recovery_recipe_binding.py"
+    path = Path(__file__).parents[1] / "migrations" / "versions" / filename
+    spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_migration_pins_the_exact_v17_receipt_and_external_journal() -> None:
     migration = _migration_module()
 
@@ -91,6 +101,141 @@ def test_aggregate_trigger_only_fail_closes_partial_terminal_without_erasing_met
     assert "current_job.status IN ('failed', 'cancelled')" in source
     assert "IF controller_failure_finalization IS TRUE" in source
     assert "formal backtest recovery terminal aggregate is immutable" in source
+
+
+class _FunctionDefinitionBind:
+    def __init__(self, definition: str, *, recovery_count: int = 0) -> None:
+        self.definition = definition
+        self.recovery_count = recovery_count
+        self.executed: list[tuple[str, dict[str, str] | None]] = []
+        self.ddl: list[str] = []
+
+    def scalar(self, statement: Any, params: dict[str, str] | None = None):
+        sql = str(statement)
+        if "pg_get_functiondef" in sql:
+            return self.definition
+        if "count(*)" in sql:
+            return self.recovery_count
+        raise AssertionError(f"unexpected scalar statement: {sql}")
+
+    def execute(self, statement: Any, params: dict[str, str] | None = None) -> None:
+        self.executed.append((str(statement), params))
+
+    def exec_driver_sql(self, statement: str) -> None:
+        self.ddl.append(statement)
+        self.definition = statement
+
+
+class _FunctionDefinitionOp:
+    def __init__(self, bind: _FunctionDefinitionBind) -> None:
+        self.bind = bind
+
+    def get_bind(self) -> _FunctionDefinitionBind:
+        return self.bind
+
+
+def test_0087_upgrade_replaces_only_the_deployed_recipe_digest_path() -> None:
+    migration = _recipe_binding_migration_module()
+    bind = _FunctionDefinitionBind(
+        "CREATE OR REPLACE FUNCTION "
+        "quantlab.validate_formal_backtest_interruption_recovery()\n"
+        "RETURNS trigger AS $$\n"
+        "BEGIN\n"
+        "            IF NOT ((NEW.verification_json = '{}'::jsonb) IS TRUE) THEN\n"
+        "                RAISE EXCEPTION 'invalid';\n"
+        "            END IF;\n"
+        f"            IF {migration._TOP_LEVEL_RECIPE_BINDING} THEN\n"
+        "RETURN NEW;\nEND IF;\n$$ LANGUAGE plpgsql;"
+    )
+    migration.op = _FunctionDefinitionOp(bind)
+
+    migration.upgrade()
+
+    assert migration.revision == "0087_recovery_recipe_path"
+    assert migration.down_revision == "0086_formal_bt_interrupt"
+    assert len(bind.ddl) == 4
+    validator_ddl, guard_ddl, drop_trigger_ddl, create_trigger_ddl = bind.ddl
+    assert migration._BOOTSTRAP_RECIPE_BINDING in validator_ddl
+    assert migration._TOP_LEVEL_RECIPE_BINDING not in validator_ddl
+    assert migration._LOCKED_VALIDATOR_BEGIN in validator_ddl
+    for field in (
+        "recipe_id",
+        "recipe_version",
+        "recipe_sha256",
+        "target_runner_sha256",
+        "target_runtime_bundle_sha256",
+        "target_worker_runtime_image_digest",
+        "dataset_identity_sha256",
+        "dataset_lineage_id",
+        "formal_periods",
+    ):
+        assert field in validator_ddl
+    assert "guard_v17_recovery_strategy_version" in guard_ddl
+    assert "recovery_job_status IN ('queued', 'running')" in guard_ddl
+    assert "recovery_backtest_status IN ('queued', 'running')" in guard_ddl
+    assert "to_jsonb(NEW) - ARRAY[" in guard_ddl
+    for field in (
+        "status",
+        "promotion_stage",
+        "approved_by",
+        "approval_reason",
+        "approved_at",
+    ):
+        assert f"'{field}'" in guard_ddl
+    assert "DROP TRIGGER IF EXISTS trg_guard_v17_recovery_strategy_version" in (
+        drop_trigger_ddl
+    )
+    assert "CREATE TRIGGER trg_guard_v17_recovery_strategy_version" in (
+        create_trigger_ddl
+    )
+    assert any("pg_advisory_xact_lock" in sql for sql, _ in bind.executed)
+    assert any(
+        "LOCK TABLE quantlab.formal_backtest_interruption_recoveries" in sql
+        for sql, _ in bind.executed
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "RETURN NEW;",
+        (
+            "source_version.config_json ->> 'recipe_sha256' =\n"
+            "                    "
+            "'dee3551a73f2ebb3fbbbddfafdf99f4618e3dfdd98981fdb4b4d8849723d5fd8'; "
+            "source_version.config_json ->> 'recipe_sha256' =\n"
+            "                    "
+            "'dee3551a73f2ebb3fbbbddfafdf99f4618e3dfdd98981fdb4b4d8849723d5fd8';"
+        ),
+    ],
+)
+def test_0087_upgrade_refuses_an_unexpected_function_source(body: str) -> None:
+    migration = _recipe_binding_migration_module()
+    bind = _FunctionDefinitionBind(
+        "CREATE OR REPLACE FUNCTION "
+        "quantlab.validate_formal_backtest_interruption_recovery() "
+        "RETURNS trigger AS $$\n"
+        "BEGIN\n"
+        "            IF NOT ((NEW.verification_json = '{}'::jsonb) IS TRUE) THEN\n"
+        "                RAISE EXCEPTION 'invalid';\n"
+        "            END IF;\n"
+        f"{body}\n"
+        "END;\n$$ LANGUAGE plpgsql;"
+    )
+    migration.op = _FunctionDefinitionOp(bind)
+
+    with pytest.raises(RuntimeError, match="validator source is not exact"):
+        migration.upgrade()
+
+    assert bind.ddl == []
+
+
+def test_0087_replacement_fragments_match_the_0086_upgrade_source() -> None:
+    current = _recipe_binding_migration_module()
+    previous_source = inspect.getsource(_migration_module().upgrade)
+
+    assert current._VALIDATOR_BEGIN in previous_source
+    assert current._TOP_LEVEL_RECIPE_BINDING in previous_source
 
 
 class _FakeBind:

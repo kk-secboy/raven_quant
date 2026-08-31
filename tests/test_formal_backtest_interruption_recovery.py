@@ -73,6 +73,8 @@ def _version() -> SimpleNamespace:
             "recipe_id": profile.recipe_id,
             "recipe_version": profile.recipe_version,
             "transparent_baseline_bootstrap": {
+                "recipe_id": profile.recipe_id,
+                "recipe_version": profile.recipe_version,
                 "recipe_sha256": profile.recipe_sha256,
                 TRANSPARENT_BASELINE_RUNNER_FIELD: profile.runner_sha256,
                 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: (
@@ -105,6 +107,21 @@ def test_version_binding_rejects_a_top_level_recipe_hash_decoy() -> None:
     version = _version()
     version.config_json["recipe_sha256"] = profile.recipe_sha256
     version.config_json["transparent_baseline_bootstrap"]["recipe_sha256"] = "0" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="v17 formal backtest immutable strategy binding changed",
+    ):
+        _version_binding(version, profile)
+
+
+@pytest.mark.parametrize("field", ["recipe_id", "recipe_version"])
+def test_version_binding_rejects_bootstrap_recipe_identity_mismatch(
+    field: str,
+) -> None:
+    profile = V17_INTERRUPTION_RECOVERY_PROFILE
+    version = _version()
+    version.config_json["transparent_baseline_bootstrap"][field] = "changed"
 
     with pytest.raises(
         ValueError,

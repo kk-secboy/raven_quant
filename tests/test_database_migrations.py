@@ -179,7 +179,49 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0086_formal_bt_interrupt"
+        recovery_validator = connection.execute(
+            text(
+                "SELECT pg_get_functiondef("
+                "'quantlab.validate_formal_backtest_interruption_recovery()'"
+                "::regprocedure)"
+            )
+        ).scalar_one()
+        recovery_strategy_guard = connection.execute(
+            text(
+                "SELECT pg_get_functiondef("
+                "'quantlab.guard_v17_recovery_strategy_version()'::regprocedure)"
+            )
+        ).scalar_one()
+        recovery_strategy_trigger = connection.execute(
+            text(
+                "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+                "WHERE tgrelid = 'quantlab.strategy_versions'::regclass "
+                "AND tgname = 'trg_guard_v17_recovery_strategy_version' "
+                "AND NOT tgisinternal"
+            )
+        ).scalar_one()
+    assert revision == "0087_recovery_recipe_path"
+    assert (
+        "source_version.config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'recipe_sha256'"
+    ) in recovery_validator
+    assert "source_version.config_json ->> 'recipe_sha256'" not in recovery_validator
+    for field in (
+        "recipe_id",
+        "recipe_version",
+        "target_runner_sha256",
+        "target_runtime_bundle_sha256",
+        "target_worker_runtime_image_digest",
+        "dataset_identity_sha256",
+        "dataset_lineage_id",
+        "formal_periods",
+    ):
+        assert field in recovery_validator
+    assert "pg_advisory_xact_lock" in recovery_validator
+    assert "recovery_job_status IN ('queued', 'running')" in recovery_strategy_guard
+    assert "recovery_backtest_status IN ('queued', 'running')" in recovery_strategy_guard
+    assert "to_jsonb(new) - ARRAY" in recovery_strategy_guard.lower()
+    assert "BEFORE UPDATE OR DELETE" in recovery_strategy_trigger
     assert {"horizon_profile", "primary_label_policy_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("autopilot_cycles", schema="quantlab")
@@ -1194,7 +1236,7 @@ def test_0084_downgrade_rejects_each_v7_evidence_atomically(
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ).scalar_one() == "0086_formal_bt_interrupt"
+        ).scalar_one() == "0087_recovery_recipe_path"
 
 
 def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
@@ -1450,7 +1492,7 @@ def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0086_formal_bt_interrupt"
+        ) == "0087_recovery_recipe_path"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
@@ -1528,7 +1570,7 @@ def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0086_formal_bt_interrupt"
+        ) == "0087_recovery_recipe_path"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1596,7 +1638,7 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0086_formal_bt_interrupt"
+        ) == "0087_recovery_recipe_path"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1658,4 +1700,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0086_formal_bt_interrupt"
+        ) == "0087_recovery_recipe_path"

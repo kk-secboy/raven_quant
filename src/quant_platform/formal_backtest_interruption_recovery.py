@@ -504,6 +504,8 @@ def _version_binding(version: Any, profile: InterruptionRecoveryProfile) -> dict
         or str(version.execution_contract_hash) != profile.execution_contract_hash
         or config.get("recipe_id") != profile.recipe_id
         or config.get("recipe_version") != profile.recipe_version
+        or bootstrap.get("recipe_id") != profile.recipe_id
+        or bootstrap.get("recipe_version") != profile.recipe_version
         or bootstrap.get("recipe_sha256") != profile.recipe_sha256
         or bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD) != profile.runner_sha256
         or bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
