@@ -36,6 +36,12 @@ UNSTABLE_PAGINATION_DATASETS = frozenset(
         "dc_member",
         "dc_hot",
         "eco_cal",
+        # An explicit-field contract can overlap an older provider-default
+        # request for the same ETF session. Both immutable source units remain
+        # selected and are compared here: exact semantic rows are safe to
+        # collapse in snapshots, while any price/factor disagreement blocks.
+        "fund_adj",
+        "fund_daily",
         "moneyflow_ind_dc",
         "irm_qa_sh",
         "irm_qa_sz",

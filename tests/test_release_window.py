@@ -4,8 +4,10 @@ import hashlib
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
+from quant_data.catalog import ALL_DEFINITIONS
 from quant_data.models import ProviderResult
 from quant_data.release_window import (
     select_release_window_units,
@@ -29,6 +31,7 @@ def _row(
     row_count: int | None = 1,
     allow_empty: bool = False,
     api_name: str | None = None,
+    fields: tuple[str, ...] = (),
 ) -> dict:
     return {
         "unit_key": unit_key,
@@ -36,7 +39,7 @@ def _row(
         "api_name": api_name or dataset,
         "scope_json": scope,
         "params_json": params or {},
-        "fields_json": [],
+        "fields_json": list(fields),
         "allow_empty": allow_empty,
         "status": status,
         "output_path": output_path,
@@ -445,6 +448,235 @@ def test_selector_keeps_baostock_legacy_rows_but_retires_pre2016_primary_units()
     ]
     assert selected.report()["selector_version"] == (
         "release-window-selector-v6-governed-etf-daily-publication"
+    )
+
+
+def test_selector_keeps_field_contract_overlap_visible_and_fail_closed() -> None:
+    current_fields = ALL_DEFINITIONS["fund_daily"].fields
+    rows = [
+        _row(
+            "legacy-only",
+            "fund_daily",
+            {"trade_date": "20260821"},
+            params={"trade_date": "20260821"},
+        ),
+        _row(
+            "legacy-overlap",
+            "fund_daily",
+            {"trade_date": "20260824"},
+            params={"trade_date": "20260824"},
+        ),
+        _row(
+            "current-overlap",
+            "fund_daily",
+            {"trade_date": "20260824"},
+            params={"trade_date": "20260824"},
+            fields=current_fields,
+            status="pending",
+            row_count=None,
+        ),
+    ]
+
+    selected = select_release_window_units(
+        rows,
+        snapshot_start=date(2026, 8, 21),
+        snapshot_end=date(2026, 8, 24),
+        datasets={"fund_daily"},
+    )
+
+    assert [row["unit_key"] for row in selected.rows] == [
+        "current-overlap",
+        "legacy-only",
+        "legacy-overlap",
+    ]
+    assert summarize_release_plan(selected.rows) == [
+        {
+            "dataset": "fund_daily",
+            "planned": 3,
+            "succeeded": 2,
+            "failed": 0,
+            "pending": 1,
+            "running": 0,
+            "superseded": 0,
+            "empty": 0,
+            "allowed_empty": 0,
+            "unexpected_empty": 0,
+            "rows": 2,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dataset", "values"),
+    [
+        (
+            "fund_daily",
+            {
+                "ts_code": "510300.SH",
+                "trade_date": "20260824",
+                "open": 4.0,
+                "high": 4.1,
+                "low": 3.9,
+                "close": 4.05,
+                "pre_close": 4.0,
+                "change": 0.05,
+                "pct_chg": 1.25,
+                "vol": 100.0,
+                "amount": 405.0,
+            },
+        ),
+        (
+            "fund_adj",
+            {
+                "ts_code": "510300.SH",
+                "trade_date": "20260824",
+                "adj_factor": 1.0,
+            },
+        ),
+    ],
+)
+def test_verify_and_snapshot_deduplicate_identical_etf_contract_overlap(
+    tmp_path: Path, dataset: str, values: dict[str, object]
+) -> None:
+    current_fields = ALL_DEFINITIONS[dataset].fields
+    storage = ParquetStore(tmp_path)
+    rows = []
+    for unit_key, fields in (
+        ("legacy-overlap", ()),
+        ("current-overlap", current_fields),
+    ):
+        written = storage.write_unit(
+            dataset,
+            unit_key,
+            ProviderResult(
+                api_name=dataset,
+                columns=list(values),
+                rows=[values],
+                raw_body=b"{}",
+            ),
+        )
+        rows.append(
+            _row(
+                unit_key,
+                dataset,
+                {"trade_date": "20260824"},
+                params={"trade_date": "20260824"},
+                fields=fields,
+                output_path=written.output_path,
+                sha256=written.sha256,
+                row_count=written.row_count,
+            )
+        )
+
+    class Checkpoint:
+        def active_units(self, datasets=None):
+            return [
+                row
+                for row in rows
+                if datasets is None or row["dataset"] in datasets
+            ]
+
+    report = verify_downloads(
+        Checkpoint(),  # type: ignore[arg-type]
+        tmp_path,
+        snapshot_start=date(2026, 8, 24),
+        snapshot_end=date(2026, 8, 24),
+        dataset_filter={dataset},
+        required_datasets=set(),
+    )
+
+    assert report["ok"] is True
+    assert report["duplicate_checks"] == {dataset: 1}
+    assert report["conflicting_duplicate_checks"] == {dataset: 0}
+    assert report["release_window"]["selected_unit_count"] == 2
+    assert any(
+        f"{dataset}: 1 exact duplicate primary-key rows" in warning
+        for warning in report["warnings"]
+    )
+    assert (tmp_path / rows[0]["output_path"]).is_file()
+    snapshot = storage.build_snapshot(
+        name=f"{dataset}-field-contract-overlap",
+        successful_units={dataset: rows},
+        manifest_extra={"profile": "test"},
+    )
+    published = pd.concat(
+        [
+            pd.read_parquet(path)
+            for path in (snapshot / "parquet" / dataset).rglob("*.parquet")
+        ]
+    )
+    assert len(published) == 1
+    assert published.iloc[0]["ts_code"] == "510300.SH"
+
+
+def test_verify_conflicting_etf_field_contract_overlap_blocks(tmp_path: Path) -> None:
+    fields = ALL_DEFINITIONS["fund_daily"].fields
+    base = {
+        "ts_code": "510300.SH",
+        "trade_date": "20260824",
+        "open": 4.0,
+        "high": 4.1,
+        "low": 3.9,
+        "close": 4.05,
+        "pre_close": 4.0,
+        "change": 0.05,
+        "pct_chg": 1.25,
+        "vol": 100.0,
+        "amount": 405.0,
+    }
+    storage = ParquetStore(tmp_path)
+    rows = []
+    for unit_key, contract, close in (
+        ("legacy-conflict", (), 4.05),
+        ("current-conflict", fields, 4.06),
+    ):
+        values = {**base, "close": close}
+        written = storage.write_unit(
+            "fund_daily",
+            unit_key,
+            ProviderResult(
+                api_name="fund_daily",
+                columns=list(values),
+                rows=[values],
+                raw_body=b"{}",
+            ),
+        )
+        rows.append(
+            _row(
+                unit_key,
+                "fund_daily",
+                {"trade_date": "20260824"},
+                params={"trade_date": "20260824"},
+                fields=contract,
+                output_path=written.output_path,
+                sha256=written.sha256,
+                row_count=written.row_count,
+            )
+        )
+
+    class Checkpoint:
+        def active_units(self, datasets=None):
+            return [
+                row
+                for row in rows
+                if datasets is None or row["dataset"] in datasets
+            ]
+
+    report = verify_downloads(
+        Checkpoint(),  # type: ignore[arg-type]
+        tmp_path,
+        snapshot_start=date(2026, 8, 24),
+        snapshot_end=date(2026, 8, 24),
+        dataset_filter={"fund_daily"},
+        required_datasets=set(),
+    )
+
+    assert report["ok"] is False
+    assert report["duplicate_checks"] == {"fund_daily": 1}
+    assert report["conflicting_duplicate_checks"] == {"fund_daily": 1}
+    assert any(
+        "fund_daily: 1 conflicting business keys" in error
+        for error in report["errors"]
     )
 
 
