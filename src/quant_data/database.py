@@ -1413,10 +1413,10 @@ strategy_versions = Table(
         "evidence_mode = 'consumed_historical_replay' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runner_sha256' = "
-        "'0000000000000000000000000000000000000000000000000000000000000000' "
+        "'c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runtime_bundle_sha256' = "
-        "'0000000000000000000000000000000000000000000000000000000000000000' "
+        "'938e777424ebbaa6afc9f4d68baf18daf081044e883152696041290165b103ed' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_worker_runtime_image_digest' ~ '^sha256:[0-9a-f]{64}$'"
         ") ELSE true END) IS TRUE",

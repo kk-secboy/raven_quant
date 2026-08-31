@@ -22,6 +22,9 @@ from quant_platform.transparent_baseline_runner import (
     FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
     FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256,
     FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256,
+    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+    FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256,
+    FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     POSITION_RISK_TARGET_RECIPE_VERSION,
@@ -136,6 +139,13 @@ def _config(
         bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
             _WORKER_IMAGE_DIGEST
         )
+    if recipe_version == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            _WORKER_IMAGE_DIGEST
+        )
     return {
         "recipe_id": "short_relative_strength",
         "recipe_version": recipe_version,
@@ -219,7 +229,7 @@ def test_historical_v11_identity_is_not_rebound_to_current_v12_bytes() -> None:
 def test_historical_v12_identity_is_not_rebound_to_current_v13_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
-    with pytest.raises(ValueError, match="transparent v12 runtime bundle differs"):
+    with pytest.raises(ValueError, match="transparent v12 runner bytes differ"):
         require_transparent_baseline_runner(
             config=_config(
                 POSITION_RISK_TARGET_RECIPE_VERSION,
@@ -243,7 +253,7 @@ def test_historical_v12_identity_is_not_rebound_to_current_v13_runtime() -> None
 def test_historical_v13_identity_is_not_rebound_to_current_v14_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
-    with pytest.raises(ValueError, match="transparent v13 runtime bundle differs"):
+    with pytest.raises(ValueError, match="transparent v13 runner bytes differ"):
         require_transparent_baseline_runner(
             config=_config(
                 FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
@@ -267,7 +277,7 @@ def test_historical_v13_identity_is_not_rebound_to_current_v14_runtime() -> None
 def test_historical_v15_identity_is_not_rebound_to_current_v17_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
-    with pytest.raises(ValueError, match="transparent v15 runtime bundle differs"):
+    with pytest.raises(ValueError, match="transparent v15 runner bytes differ"):
         require_transparent_baseline_runner(
             config=_config(
                 SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
@@ -291,7 +301,7 @@ def test_historical_v15_identity_is_not_rebound_to_current_v17_runtime() -> None
 def test_historical_v16_identity_is_not_rebound_to_current_v17_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
-    with pytest.raises(ValueError, match="transparent v16 runtime bundle differs"):
+    with pytest.raises(ValueError, match="transparent v16 runner bytes differ"):
         require_transparent_baseline_runner(
             config=_config(
                 DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
@@ -312,30 +322,54 @@ def test_historical_v16_identity_is_not_rebound_to_current_v17_runtime() -> None
         )
 
 
-def test_current_transparent_v17_runner_matches_industry_capacity_identity() -> None:
+def test_historical_v17_identity_is_not_rebound_to_current_v18_runtime() -> None:
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    with pytest.raises(ValueError, match="transparent v17 runner bytes differ"):
+        require_transparent_baseline_runner(
+            config=_config(
+                TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
+                TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
+            runner_path=runner,
+        )
+
+
+def test_current_transparent_v18_runner_matches_forward_only_identity() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     assert require_transparent_baseline_runner(
         config=_config(
-            TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
-            TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
+            FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+            FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256,
         ),
         job_payload={
             TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
-                TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
+                FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
             ),
             TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
-                TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+                FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
             ),
             TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
                 _WORKER_IMAGE_DIGEST
             ),
         },
         runner_path=runner,
-    ) == TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
+    ) == FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
 
 
-def test_v12_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
+def test_v18_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     for relative in _v12_source_paths(root):
         destination = tmp_path / relative
@@ -347,15 +381,15 @@ def test_v12_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="runtime bundle differs"):
         require_transparent_baseline_runner(
             config=_config(
-                POSITION_RISK_TARGET_RECIPE_VERSION,
-                POSITION_RISK_TARGET_RUNNER_SHA256,
+                FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+                FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256,
             ),
             job_payload={
                 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
-                    POSITION_RISK_TARGET_RUNNER_SHA256
+                    FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
                 ),
                 TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
-                    POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+                    FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
                 ),
                 TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
                     _WORKER_IMAGE_DIGEST
@@ -473,7 +507,7 @@ def test_runner_bytes_survive_git_blob_and_archive_with_autocrlf(
     ) == 1
 
 
-def test_v17_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
+def test_v18_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     source_paths = _v12_source_paths(root)
     repo = tmp_path / "runtime-bundle-repo"
@@ -500,13 +534,13 @@ def test_v17_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -
             destination.write_bytes(archived.read())
 
     assert position_risk_bundle_sha256(root) == (
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(repo) == (
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(archive_root) == (
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
     )
 
 
@@ -565,6 +599,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0085_transparent_baseline_v17_industry_capacity_repair.py"
     ).read_text(encoding="utf-8")
+    v18_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0088_forward_only_rehabilitation.py"
+    ).read_text(encoding="utf-8")
 
     assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v9_migration
     assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in v9_migration
@@ -587,6 +627,8 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     assert (
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 in v17_migration
     )
+    assert FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256 in v18_migration
+    assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in v18_migration
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:
