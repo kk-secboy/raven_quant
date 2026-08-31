@@ -325,6 +325,46 @@ def test_swing_family_starts_from_qlib_baseline_before_rdagent_challengers(
     assert runtime["target_worker_runtime_image_digest"] == "sha256:" + "d" * 64
 
 
+def test_strategy_check_failure_is_not_reported_as_a_duplicate_name(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import strategy_store as strategy_store_module
+
+    recipe = get_strategy_recipe("swing_trend")
+    config = StrategyConfigRequest.model_validate(
+        {
+            **recipe["config_overrides"],
+            "recipe_id": recipe["id"],
+            "recipe_version": recipe["version"],
+            "execution_method": "open",
+            "execution_frequency": "day",
+            "execution_days": 1,
+        }
+    ).model_dump()
+    monkeypatch.setattr(
+        strategy_store_module,
+        "_bind_current_transparent_runtime_identity",
+        lambda value: value,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="ck_strategy_versions_v17_runtime_identity",
+    ) as captured:
+        StrategyStore(database_url).create(
+            name=f"integrity-reporting-{uuid.uuid4().hex}",
+            description="Exercise database check-constraint error reporting.",
+            benchmark="SH000300",
+            universe="cn_all",
+            factors=[],
+            config=config,
+            actor="test",
+        )
+
+    assert "already exists" not in str(captured.value)
+
+
 def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(
     database_url: str, tmp_path: Path
 ) -> None:

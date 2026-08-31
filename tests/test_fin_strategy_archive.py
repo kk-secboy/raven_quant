@@ -61,13 +61,43 @@ class _StrategyRecorder:
         }
 
 
+class _ColdstartStrategyRecorder:
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+        self._versions_by_source_artifact: dict[str, dict] = {}
+
+    def find_version_by_source_artifact(self, source_research_artifact_id: str):
+        return self._versions_by_source_artifact.get(source_research_artifact_id)
+
+    def create(self, **kwargs) -> dict:
+        self.created.append(kwargs)
+        config = kwargs["config"]
+        version = {
+            "id": "coldstart-candidate-version",
+            "strategy_id": "coldstart-family",
+            "status": "draft",
+            "horizon_profile": "short_1_5d",
+            "config": config,
+        }
+        self._versions_by_source_artifact[config["source_research_artifact_id"]] = version
+        return {
+            "id": "coldstart-family",
+            "versions": [version],
+        }
+
+    def create_version(self, strategy_id: str, **kwargs) -> dict:
+        raise AssertionError(
+            f"cold-start materialization must create a strategy family, got {strategy_id}"
+        )
+
+
 def _compiled_short_artifact(
     monkeypatch: pytest.MonkeyPatch,
     *,
     feature_set: dict,
     periods: dict[str, str],
     dataset_identity_sha256: str,
-    incumbent_id: str,
+    incumbent_id: str | None,
 ) -> dict:
     isolated = isolate_rdagent_periods(periods)
     monkeypatch.setenv("QUANTLAB_DATASET_SNAPSHOT_ID", dataset_identity_sha256)
@@ -124,6 +154,50 @@ def _compiled_short_artifact(
         proposal,
         allowed_factor_ids=set(feature_set["features"]),
     )
+
+
+def test_worker_coldstart_materialization_creates_one_draft_and_reuses_it_on_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    periods = {
+        "train_start": "2008-01-02",
+        "train_end": "2018-12-28",
+        "valid_start": "2019-01-02",
+        "valid_end": "2022-12-30",
+        "test_start": "2023-01-03",
+        "test_end": "2025-12-31",
+    }
+    feature_set = get_feature_set("governed-baseline")
+    artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="b" * 64,
+        incumbent_id=None,
+    )
+    strategies = _ColdstartStrategyRecorder()
+    worker = SimpleNamespace(strategies=strategies)
+
+    first = Worker._materialize_fin_strategy_candidate(
+        worker,
+        artifact,
+        compiled_artifact_id="compiled-artifact-1",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+    retried = Worker._materialize_fin_strategy_candidate(
+        worker,
+        artifact,
+        compiled_artifact_id="compiled-artifact-1",
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+
+    assert first["id"] == "coldstart-candidate-version"
+    assert retried == first
+    assert first["status"] == "draft"
+    assert first["config"]["source_research_artifact_id"] == "compiled-artifact-1"
+    assert len(strategies.created) == 1
+    assert strategies.created[0]["actor"] == "system:strategy-research"
+    assert strategies.created[0]["universe"] == "cn_all"
 
 
 def _job_payload(feature_set: dict, periods: dict[str, str]) -> dict:

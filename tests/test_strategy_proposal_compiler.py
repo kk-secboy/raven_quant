@@ -112,6 +112,11 @@ def test_strategy_proposal_compiles_deterministically_but_remains_research_only(
 
 def test_compiled_proposal_materializes_only_an_inert_rule_bound_candidate() -> None:
     from quant_platform.api import StrategyConfigRequest
+    from quant_platform.strategy_store import _normalize_multifactor_contract
+    from quant_platform.transparent_baseline_runner import (
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
+    )
 
     proposal = _proposal("swing_trend")
     allowed = _factor_ids(proposal)
@@ -132,6 +137,20 @@ def test_compiled_proposal_materializes_only_an_inert_rule_bound_candidate() -> 
     assert validated.max_holding_sessions == 126
     assert validated.trend_break_lookback_sessions == 20
     assert len(validated.execution_contract_hash or "") == 64
+
+    normalized = _normalize_multifactor_contract(
+        config,
+        factor_count=0,
+        creating_family=True,
+    )
+    runtime = normalized["transparent_baseline_bootstrap"]
+    assert runtime["target_runner_sha256"] == (
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
+    )
+    assert runtime["target_runtime_bundle_sha256"] == (
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+    assert runtime["target_worker_runtime_image_digest"] == "sha256:" + "d" * 64
 
 
 def test_strategy_proposal_rejects_code_unknown_parameters_and_final_oos_visibility() -> None:

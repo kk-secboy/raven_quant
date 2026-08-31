@@ -296,20 +296,28 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
 
     recipe_id = config.get("recipe_id")
     recipe_version = config.get("recipe_version")
-    if str(recipe_version or "") != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
+    is_current_public_recipe = (
+        str(recipe_version or "")
+        == TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+        and target_runner_for_recipe(recipe_id, recipe_version) is not None
+    )
+    is_forward_only_rehabilitation = (
+        str(recipe_version or "") == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+    )
+    if not is_current_public_recipe and not is_forward_only_rehabilitation:
         return config
-    if str(recipe_id or "") != "short_relative_strength":
+    if is_forward_only_rehabilitation and str(recipe_id or "") != "short_relative_strength":
         raise ValueError(
             "the v18 transparent runtime is restricted to the exact short "
             "forward-only rehabilitation entry point"
         )
-    if config.get("evidence_mode") != EVIDENCE_MODE_REPLAY:
+    if is_forward_only_rehabilitation and config.get("evidence_mode") != EVIDENCE_MODE_REPLAY:
         raise ValueError(
             "the current short transparent baseline is restricted to the exact "
             "forward-only rehabilitation entry point"
         )
     if target_runner_for_recipe(recipe_id, recipe_version) is None:
-        raise ValueError("the v18 forward-only runner identity is unavailable")
+        raise ValueError("the current transparent runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
     if bootstrap_raw is not None and not isinstance(bootstrap_raw, Mapping):
         raise ValueError("transparent current bootstrap must be an object")
@@ -333,6 +341,15 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
             )
         bootstrap[field] = expected
     return {**config, "transparent_baseline_bootstrap": bootstrap}
+
+
+def _integrity_constraint_name(exc: IntegrityError) -> str | None:
+    """Return a safe PostgreSQL constraint name without exposing SQL values."""
+
+    diag = getattr(getattr(exc, "orig", None), "diag", None)
+    value = getattr(diag, "constraint_name", None)
+    normalized = str(value or "").strip()
+    return normalized or None
 
 
 def _factor_evaluation_artifact_metrics(
@@ -3110,7 +3127,13 @@ class StrategyStore:
                     payload={"benchmark": benchmark, "universe": universe},
                 )
         except IntegrityError as exc:
-            raise ValueError(f"strategy name {name!r} already exists") from exc
+            constraint = _integrity_constraint_name(exc)
+            if constraint == "strategies_name_key":
+                raise ValueError(f"strategy name {name!r} already exists") from exc
+            detail = f" ({constraint})" if constraint else ""
+            raise ValueError(
+                f"strategy creation violated a database integrity constraint{detail}"
+            ) from exc
         return self.get(strategy_id)
 
     def create_version(
