@@ -223,7 +223,10 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     assert "recovery_job_status IN ('queued', 'running')" in recovery_strategy_guard
     assert "recovery_backtest_status IN ('queued', 'running')" in recovery_strategy_guard
     assert "to_jsonb(new) - array" in recovery_strategy_guard.lower()
-    assert "BEFORE UPDATE OR DELETE" in recovery_strategy_trigger
+    assert (
+        "BEFORE DELETE OR UPDATE ON quantlab.strategy_versions"
+        in recovery_strategy_trigger
+    )
     assert {"horizon_profile", "primary_label_policy_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("autopilot_cycles", schema="quantlab")
