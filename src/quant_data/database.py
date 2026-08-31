@@ -1415,7 +1415,7 @@ strategy_versions = Table(
         "'c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runtime_bundle_sha256' = "
-        "'2a2547f585e016ad9459f1b7bd039541285869eb524b0b43e2b57981eed633cb' "
+        "'c495044915133b41bd7f3c13df3b82fd9624e3e892e51ac4deb892eddbf01dfa' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_worker_runtime_image_digest' ~ '^sha256:[0-9a-f]{64}$'"
         ") ELSE true END) IS TRUE",
@@ -1809,7 +1809,8 @@ strategy_forward_only_rehabilitations = Table(
         "AND jsonb_typeof(source_unavailable_evidence_sha256s_json) = 'object' "
         "AND source_unavailable_evidence_sha256s_json ?& "
         "ARRAY['swing_1_6m','long_1_3y'] "
-        "AND jsonb_object_length(source_unavailable_evidence_sha256s_json) = 2 "
+        "AND (source_unavailable_evidence_sha256s_json - "
+        "ARRAY['swing_1_6m','long_1_3y']) = '{}'::jsonb "
         "AND qualification_json -> 'historical_replay_opened' = 'true'::jsonb "
         "AND qualification_json -> 'final_oos_opened' = 'true'::jsonb "
         "AND qualification_json -> 'capital_eligible' = 'false'::jsonb "

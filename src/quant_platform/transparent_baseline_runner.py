@@ -119,7 +119,7 @@ FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256 = (
 # Filled after the complete v18 source closure is stable. The source-closure
 # normalizer excludes both v18 seal assignments from their own digest.
 FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "2a2547f585e016ad9459f1b7bd039541285869eb524b0b43e2b57981eed633cb"
+    "c495044915133b41bd7f3c13df3b82fd9624e3e892e51ac4deb892eddbf01dfa"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"

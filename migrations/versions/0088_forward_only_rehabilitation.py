@@ -40,7 +40,7 @@ EXECUTION_SHA256 = "0ffa8939a70f0c46499e3ae472b877f68cce1b9fb95dfe81886ab8430ddc
 V18_RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-31-v18"
 V18_RUNNER_SHA256 = "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
 V18_RUNTIME_BUNDLE_SHA256 = (
-    "2a2547f585e016ad9459f1b7bd039541285869eb524b0b43e2b57981eed633cb"
+    "c495044915133b41bd7f3c13df3b82fd9624e3e892e51ac4deb892eddbf01dfa"
 )
 
 
@@ -226,7 +226,8 @@ def upgrade() -> None:
             "AND jsonb_typeof(source_unavailable_evidence_sha256s_json) = 'object' "
             "AND source_unavailable_evidence_sha256s_json ?& "
             "ARRAY['swing_1_6m','long_1_3y'] "
-            "AND jsonb_object_length(source_unavailable_evidence_sha256s_json) = 2 "
+            "AND (source_unavailable_evidence_sha256s_json - "
+            "ARRAY['swing_1_6m','long_1_3y']) = '{}'::jsonb "
             "AND qualification_json -> 'historical_replay_opened' = 'true'::jsonb "
             "AND qualification_json -> 'final_oos_opened' = 'true'::jsonb "
             "AND qualification_json -> 'capital_eligible' = 'false'::jsonb "
@@ -558,7 +559,9 @@ def upgrade() -> None:
                     NEW.forward_criteria_json
                 AND NEW.qualification_json ->> 'forward_criteria_sha256' =
                     NEW.forward_criteria_sha256
-                AND jsonb_object_length(NEW.replay_periods_json) = 4
+                AND (NEW.replay_periods_json -
+                    ARRAY['start','end','historical_start','historical_end']) =
+                    '{{}}'::jsonb
                 AND NEW.replay_periods_json ->> 'historical_start' = '2008-01-02'
                 AND NEW.replay_periods_json ->> 'historical_end' = '2018-10-10'
                 AND NEW.replay_periods_json ->> 'start' = '2018-11-08'

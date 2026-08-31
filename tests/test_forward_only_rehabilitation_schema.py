@@ -110,6 +110,34 @@ def test_rehabilitation_truth_markers_require_json_booleans_not_castable_text() 
         )
 
 
+def test_rehabilitation_jsonb_checks_use_supported_exact_key_operators() -> None:
+    truth_check = _check_sql(
+        strategy_forward_only_rehabilitations,
+        "ck_forward_only_rehabilitation_evidence",
+    )
+    exact_unavailable_keys = (
+        "source_unavailable_evidence_sha256s_json - "
+        "ARRAY['swing_1_6m','long_1_3y']) = '{}'::jsonb"
+    )
+
+    assert "source_unavailable_evidence_sha256s_json ?&" in truth_check
+    assert exact_unavailable_keys in truth_check
+
+    migration_source = _MIGRATION_PATH.read_text(encoding="utf-8")
+    assert "jsonb_object_length" not in migration_source
+    assert '"AND (source_unavailable_evidence_sha256s_json - "' in migration_source
+    assert (
+        '"ARRAY[\'swing_1_6m\',\'long_1_3y\']) = \'{}\'::jsonb "'
+        in migration_source
+    )
+    assert (
+        "NEW.replay_periods_json -\n"
+        "                    ARRAY['start','end','historical_start','historical_end']) ="
+        in migration_source
+    )
+    assert "'{{}}'::jsonb" in migration_source
+
+
 def test_0088_triggers_bind_family_runtime_periods_criteria_and_artifacts() -> None:
     source = _MIGRATION_PATH.read_text(encoding="utf-8")
 
@@ -123,7 +151,8 @@ def test_0088_triggers_bind_family_runtime_periods_criteria_and_artifacts() -> N
         "'target_runtime_bundle_sha256' = NEW.runtime_bundle_sha256",
         "'target_worker_runtime_image_digest' =",
         "source_backtest.periods_json = NEW.replay_periods_json",
-        "jsonb_object_length(NEW.replay_periods_json) = 4",
+        "NEW.replay_periods_json -",
+        "ARRAY['start','end','historical_start','historical_end']",
         "'historical_start' = '2008-01-02'",
         "'historical_end' = '2018-10-10'",
         "NEW.qualification_json -> 'forward_criteria' =",
