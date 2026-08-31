@@ -11,6 +11,7 @@ from quant_data.snapshot_lineage import canonical_sha256
 from quant_platform.statistical_validation import (
     DEFLATED_SHARPE_METHOD_VERSION,
     STATISTICAL_CONTRACT_VERSION,
+    paired_moving_block_bootstrap,
 )
 
 FORMAL_VALIDATION_CONTRACT_VERSION = (
@@ -32,6 +33,33 @@ FROZEN_STRATEGY_OUTER_SCOPE = "pre_final_history_current_frozen_strategy"
 FACTOR_SCORE_INCOMPLETE_FAMILY_DSR_VERSION = (
     "factor-score-incomplete-family-dsr-not-computable-v1"
 )
+PAIRED_BOOTSTRAP_EVIDENCE_CONTRACT_VERSION = (
+    "paired-moving-block-bootstrap-evidence-v1"
+)
+PAIRED_BOOTSTRAP_METHOD = "paired_circular_moving_block_bootstrap"
+PAIRED_BOOTSTRAP_ESTIMAND = "mean_candidate_net_return_minus_baseline_return"
+PAIRED_BOOTSTRAP_INPUT_ALIGNMENT = "ordered_complete_case_pairs"
+PAIRED_BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
+PAIRED_BOOTSTRAP_PARAMETER_KEYS = frozenset({"block_size", "samples", "seed"})
+PAIRED_BOOTSTRAP_EVIDENCE_KEYS = frozenset(
+    {
+        "status",
+        "contract_version",
+        "statistical_contract_version",
+        "method",
+        "estimand",
+        "input_alignment",
+        "input_sha256",
+        "observations",
+        "observed_mean_difference",
+        "confidence_level",
+        "confidence_interval_95",
+        "probability_positive",
+        "one_sided_p_value",
+        *PAIRED_BOOTSTRAP_PARAMETER_KEYS,
+        "evidence_sha256",
+    }
+)
 
 
 def _require_sha256(value: Any, *, label: str) -> str:
@@ -41,6 +69,358 @@ def _require_sha256(value: Any, *, label: str) -> str:
     ):
         raise ValueError(f"{label} must be SHA256")
     return normalized
+
+
+def _require_plain_int(value: Any, *, label: str, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{label} must be an integer")
+    normalized = int(value)
+    if normalized < minimum:
+        raise ValueError(f"{label} must be at least {minimum}")
+    return normalized
+
+
+def validate_paired_bootstrap_parameters(
+    value: Any,
+    *,
+    observations: int | None = None,
+) -> dict[str, int]:
+    """Validate the exact frozen parameter set used by the paired bootstrap.
+
+    The parameters are deliberately supplied independently of claimed evidence.
+    An approval path must never learn its sample count, block size, or seed from
+    the result it is trying to verify.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("paired bootstrap parameters must be an object")
+    keys = set(value)
+    if keys != PAIRED_BOOTSTRAP_PARAMETER_KEYS:
+        missing = sorted(PAIRED_BOOTSTRAP_PARAMETER_KEYS - keys)
+        extra = sorted(keys - PAIRED_BOOTSTRAP_PARAMETER_KEYS)
+        raise ValueError(
+            "paired bootstrap parameters have invalid fields "
+            f"(missing={missing}, extra={extra})"
+        )
+    block_size = _require_plain_int(
+        value["block_size"],
+        label="paired bootstrap block_size",
+        minimum=1,
+    )
+    samples = _require_plain_int(
+        value["samples"],
+        label="paired bootstrap samples",
+        minimum=100,
+    )
+    seed = _require_plain_int(
+        value["seed"],
+        label="paired bootstrap seed",
+        minimum=0,
+    )
+    if observations is not None:
+        count = _require_plain_int(
+            observations,
+            label="paired bootstrap observations",
+            minimum=30,
+        )
+        if block_size > count:
+            raise ValueError("paired bootstrap block_size exceeds observations")
+    return {"block_size": block_size, "samples": samples, "seed": seed}
+
+
+def paired_bootstrap_parameters_from_config(config: Any) -> dict[str, int]:
+    """Resolve the runner's frozen bootstrap parameters from version config."""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("strategy config must be an object")
+    return validate_paired_bootstrap_parameters(
+        {
+            "block_size": config.get("bootstrap_block_days", 20),
+            "samples": config.get("bootstrap_samples", 2000),
+            "seed": config.get("validation_seed", 0),
+        }
+    )
+
+
+def _paired_return_arrays(
+    candidate_net_returns: pd.Series | Sequence[float],
+    baseline_returns: pd.Series | Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    candidate = np.asarray(pd.Series(candidate_net_returns), dtype=float)
+    baseline = np.asarray(pd.Series(baseline_returns), dtype=float)
+    if (
+        len(candidate) != len(baseline)
+        or len(candidate) < 30
+        or not np.isfinite(candidate).all()
+        or not np.isfinite(baseline).all()
+    ):
+        raise ValueError(
+            "paired bootstrap inputs require equal finite series of at least 30 rows"
+        )
+    return candidate, baseline
+
+
+def _daily_return_pairs(daily_returns: Any) -> tuple[pd.Series, pd.Series]:
+    if not isinstance(daily_returns, pd.DataFrame):
+        try:
+            daily_returns = pd.DataFrame(daily_returns)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("daily returns must be tabular") from exc
+    required = {"return", "cost", "bench"}
+    missing = sorted(required - set(daily_returns.columns))
+    if missing:
+        raise ValueError(f"daily returns are missing required columns: {missing}")
+    paired = pd.concat(
+        [
+            (
+                pd.to_numeric(daily_returns["return"], errors="coerce")
+                - pd.to_numeric(daily_returns["cost"], errors="coerce")
+            ).rename("candidate"),
+            pd.to_numeric(daily_returns["bench"], errors="coerce").rename(
+                "baseline"
+            ),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    return paired["candidate"], paired["baseline"]
+
+
+def build_paired_bootstrap_evidence(
+    candidate_net_returns: pd.Series | Sequence[float],
+    baseline_returns: pd.Series | Sequence[float],
+    *,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build canonical paired-bootstrap evidence from already aligned returns."""
+
+    candidate, baseline = _paired_return_arrays(
+        candidate_net_returns,
+        baseline_returns,
+    )
+    frozen = validate_paired_bootstrap_parameters(
+        parameters,
+        observations=len(candidate),
+    )
+    calculated = paired_moving_block_bootstrap(
+        candidate,
+        baseline,
+        block_size=frozen["block_size"],
+        samples=frozen["samples"],
+        seed=frozen["seed"],
+    )
+    payload = {
+        "status": "ok",
+        "contract_version": PAIRED_BOOTSTRAP_EVIDENCE_CONTRACT_VERSION,
+        "statistical_contract_version": STATISTICAL_CONTRACT_VERSION,
+        "method": PAIRED_BOOTSTRAP_METHOD,
+        "estimand": PAIRED_BOOTSTRAP_ESTIMAND,
+        "input_alignment": PAIRED_BOOTSTRAP_INPUT_ALIGNMENT,
+        "input_sha256": canonical_sha256(
+            {
+                "candidate_net_returns": [float(item) for item in candidate],
+                "baseline_returns": [float(item) for item in baseline],
+            }
+        ),
+        "observations": int(calculated["observations"]),
+        "observed_mean_difference": float(
+            calculated["observed_mean_difference"]
+        ),
+        "confidence_level": PAIRED_BOOTSTRAP_CONFIDENCE_LEVEL,
+        "confidence_interval_95": [
+            float(item) for item in calculated["confidence_interval_95"]
+        ],
+        "probability_positive": float(calculated["probability_positive"]),
+        "one_sided_p_value": float(calculated["one_sided_p_value"]),
+        **frozen,
+    }
+    return {**payload, "evidence_sha256": canonical_sha256(payload)}
+
+
+def build_paired_bootstrap_evidence_from_daily_returns(
+    daily_returns: Any,
+    *,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Independently rebuild paired evidence from the persisted Qlib daily report."""
+
+    candidate, baseline = _daily_return_pairs(daily_returns)
+    return build_paired_bootstrap_evidence(
+        candidate,
+        baseline,
+        parameters=parameters,
+    )
+
+
+def _canonical_mismatch_paths(
+    claimed: Any,
+    expected: Any,
+    *,
+    path: str = "$",
+) -> list[str]:
+    if isinstance(claimed, Mapping) and isinstance(expected, Mapping):
+        mismatches: list[str] = []
+        for key in sorted(set(claimed) | set(expected), key=str):
+            child = f"{path}.{key}"
+            if key not in claimed or key not in expected:
+                mismatches.append(child)
+            else:
+                mismatches.extend(
+                    _canonical_mismatch_paths(claimed[key], expected[key], path=child)
+                )
+        return mismatches
+    if isinstance(claimed, list) and isinstance(expected, list):
+        mismatches = []
+        for index in range(max(len(claimed), len(expected))):
+            child = f"{path}[{index}]"
+            if index >= len(claimed) or index >= len(expected):
+                mismatches.append(child)
+            else:
+                mismatches.extend(
+                    _canonical_mismatch_paths(
+                        claimed[index], expected[index], path=child
+                    )
+                )
+        return mismatches
+    try:
+        equal = canonical_sha256(claimed) == canonical_sha256(expected)
+    except (TypeError, ValueError):
+        equal = False
+    return [] if equal else [path]
+
+
+def validate_paired_bootstrap_evidence_schema(
+    value: Any,
+    *,
+    expected_parameters: Mapping[str, Any],
+    expected_observations: int | None = None,
+) -> dict[str, Any]:
+    """Fail closed on missing, surplus, malformed, or re-parameterized evidence."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("paired bootstrap evidence must be an object")
+    keys = set(value)
+    if keys != PAIRED_BOOTSTRAP_EVIDENCE_KEYS:
+        missing = sorted(PAIRED_BOOTSTRAP_EVIDENCE_KEYS - keys)
+        extra = sorted(keys - PAIRED_BOOTSTRAP_EVIDENCE_KEYS)
+        raise ValueError(
+            "paired bootstrap evidence has invalid fields "
+            f"(missing={missing}, extra={extra})"
+        )
+    frozen = validate_paired_bootstrap_parameters(expected_parameters)
+    observed_parameters = validate_paired_bootstrap_parameters(
+        {key: value[key] for key in PAIRED_BOOTSTRAP_PARAMETER_KEYS},
+        observations=expected_observations,
+    )
+    if observed_parameters != frozen:
+        raise ValueError("paired bootstrap evidence parameters differ from frozen config")
+    observations = _require_plain_int(
+        value["observations"],
+        label="paired bootstrap observations",
+        minimum=30,
+    )
+    if expected_observations is not None and observations != int(expected_observations):
+        raise ValueError("paired bootstrap observations differ from persisted returns")
+    if observed_parameters["block_size"] > observations:
+        raise ValueError("paired bootstrap block_size exceeds observations")
+    interval = value["confidence_interval_95"]
+    if not isinstance(interval, list) or len(interval) != 2:
+        raise ValueError("paired bootstrap confidence interval must contain two values")
+    numeric_fields = {
+        "observed_mean_difference": value["observed_mean_difference"],
+        "confidence_interval_95[0]": interval[0],
+        "confidence_interval_95[1]": interval[1],
+        "probability_positive": value["probability_positive"],
+        "one_sided_p_value": value["one_sided_p_value"],
+    }
+    normalized: dict[str, float] = {}
+    for label, raw in numeric_fields.items():
+        if isinstance(raw, bool):
+            raise ValueError(f"paired bootstrap {label} must be finite")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"paired bootstrap {label} must be finite") from exc
+        if not np.isfinite(number):
+            raise ValueError(f"paired bootstrap {label} must be finite")
+        normalized[label] = number
+    if normalized["confidence_interval_95[0]"] > normalized[
+        "confidence_interval_95[1]"
+    ]:
+        raise ValueError("paired bootstrap confidence interval is reversed")
+    for label in ("probability_positive", "one_sided_p_value"):
+        if not 0.0 <= normalized[label] <= 1.0:
+            raise ValueError(f"paired bootstrap {label} must be in [0, 1]")
+    if (
+        value["status"] != "ok"
+        or value["contract_version"]
+        != PAIRED_BOOTSTRAP_EVIDENCE_CONTRACT_VERSION
+        or value["statistical_contract_version"] != STATISTICAL_CONTRACT_VERSION
+        or value["method"] != PAIRED_BOOTSTRAP_METHOD
+        or value["estimand"] != PAIRED_BOOTSTRAP_ESTIMAND
+        or value["input_alignment"] != PAIRED_BOOTSTRAP_INPUT_ALIGNMENT
+        or value["confidence_level"] != PAIRED_BOOTSTRAP_CONFIDENCE_LEVEL
+    ):
+        raise ValueError("paired bootstrap evidence contract is not canonical")
+    _require_sha256(value["input_sha256"], label="paired bootstrap input_sha256")
+    evidence_sha256 = _require_sha256(
+        value["evidence_sha256"],
+        label="paired bootstrap evidence_sha256",
+    )
+    payload = dict(value)
+    payload.pop("evidence_sha256")
+    if evidence_sha256 != canonical_sha256(payload):
+        raise ValueError("paired bootstrap evidence SHA256 is invalid")
+    return dict(value)
+
+
+def validate_paired_bootstrap_evidence(
+    value: Any,
+    *,
+    parameters: Mapping[str, Any],
+    candidate_net_returns: pd.Series | Sequence[float] | None = None,
+    baseline_returns: pd.Series | Sequence[float] | None = None,
+    daily_returns: Any | None = None,
+) -> dict[str, Any]:
+    """Independently recompute and canonically compare every evidence field.
+
+    Callers must provide either the persisted daily-return table or both aligned
+    return series. The claimed payload never supplies recomputation parameters.
+    """
+
+    using_daily = daily_returns is not None
+    using_series = candidate_net_returns is not None or baseline_returns is not None
+    if using_daily == using_series:
+        raise ValueError(
+            "provide either daily_returns or both paired return series, but not both"
+        )
+    if using_daily:
+        expected = build_paired_bootstrap_evidence_from_daily_returns(
+            daily_returns,
+            parameters=parameters,
+        )
+    else:
+        if candidate_net_returns is None or baseline_returns is None:
+            raise ValueError("both paired return series are required")
+        expected = build_paired_bootstrap_evidence(
+            candidate_net_returns,
+            baseline_returns,
+            parameters=parameters,
+        )
+    validate_paired_bootstrap_evidence_schema(
+        value,
+        expected_parameters=parameters,
+        expected_observations=expected["observations"],
+    )
+    mismatches = _canonical_mismatch_paths(dict(value), expected)
+    if mismatches:
+        displayed = ", ".join(mismatches[:8])
+        suffix = " ..." if len(mismatches) > 8 else ""
+        raise ValueError(
+            "paired bootstrap evidence differs from independent recomputation at "
+            f"{displayed}{suffix}"
+        )
+    return expected
 
 
 def build_factor_score_incomplete_family_multiple_testing(
