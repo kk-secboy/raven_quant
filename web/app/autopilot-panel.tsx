@@ -35,6 +35,12 @@ type SimulationPortfolio = {
   latest_batch?: { signal_date?: string; trade_date?: string; status?: string } | null;
   position_count?: number;
 };
+type ResearchRun = {
+  id: string;
+  status: string;
+  scenario?: string;
+  config?: { scenario?: string };
+};
 
 type MarketPermissions = {
   main_board: boolean;
@@ -213,6 +219,7 @@ async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
 
 const SCENARIO_LABELS: Record<string, string> = {
   fin_factor: "因子研究", fin_model: "模型研究", fin_factor_report: "研报研究", fin_quant: "联合优化",
+  fin_strategy: "策略规则研究",
   factor_sota: "因子增量验证",
 };
 const STAGE_LABELS: Record<string, string> = {
@@ -352,8 +359,10 @@ function HorizonCard({ card }: { card: AdviceCard }) {
       {card.signals.slice(0, 5).map((signal, index) => <SignalRow key={`${signal.instrument}-${index}`} signal={signal} simulationOnly={simulationOnly} />)}
       {card.signals.length > 5 ? <small className="novice-more">其余 {card.signals.length - 5} 只请到模拟账本查看。</small> : null}
     </div> : <div className="novice-no-action">
-      <strong>当前没有需要操作的股票</strong>
-      <span>{card.veto_reasons?.[0] ?? "没有股票同时满足收益、成本、风险和交易资格门槛，资金保留为现金。"}</span>
+      <strong>{card.is_investment_advice ? "今天没有需要操作的股票" : "尚未取得正式荐股资格"}</strong>
+      <span>{card.veto_reasons?.[0] ?? (card.is_investment_advice
+        ? "已批准策略今天没有找到同时满足收益、成本、风险和交易资格门槛的机会，资金保留为现金。"
+        : "策略仍在研究、回测或前向模拟阶段；当前 NO_ACTION 表示没有荐股权限，不代表策略筛完后选择了空仓。")}</span>
     </div>}
   </section>;
 }
@@ -673,6 +682,7 @@ function AdvancedAutopilotPanel({
   const [autopilot, setAutopilot] = useState<AutopilotState | null>(null);
   const [automation, setAutomation] = useState<DataAutomation | null>(null);
   const [simulations, setSimulations] = useState<SimulationPortfolio[]>([]);
+  const [strategyRuns, setStrategyRuns] = useState<ResearchRun[]>([]);
   const [paperTarget, setPaperTarget] = useState<PaperTargetProjection | null>(null);
   const [message, setMessage] = useState("");
   const [loadWarning, setLoadWarning] = useState("");
@@ -686,9 +696,10 @@ function AdvancedAutopilotPanel({
       { label: "数据调度", request: jsonResponse<DataAutomation>(apiFetch(`${api}/api/data-automation`, { cache: "no-store" })) },
       { label: "模拟盘", request: jsonResponse<SimulationPortfolio[]>(apiFetch(`${api}/api/simulation-portfolios`, { cache: "no-store" })) },
       { label: "模拟候选", request: jsonResponse<PaperTargetProjection>(apiFetch(`${api}/api/autopilot/paper-target`, { cache: "no-store" })) },
+      { label: "策略规则研究", request: jsonResponse<ResearchRun[]>(apiFetch(`${api}/api/rdagent/runs?limit=50`, { cache: "no-store" })) },
     ] as const;
     const results = await Promise.allSettled(resources.map((item) => item.request));
-    const [autopilotResult, automationResult, simulationResult, paperTargetResult] = results;
+    const [autopilotResult, automationResult, simulationResult, paperTargetResult, strategyRunsResult] = results;
     if (autopilotResult.status === "fulfilled") {
       setAutopilot(autopilotResult.value as AutopilotState);
       setAutopilotLoadState("ready");
@@ -720,6 +731,7 @@ function AdvancedAutopilotPanel({
       }
     }
     if (paperTargetResult.status === "fulfilled") setPaperTarget(paperTargetResult.value as PaperTargetProjection);
+    if (strategyRunsResult.status === "fulfilled") setStrategyRuns(strategyRunsResult.value as ResearchRun[]);
     const failed = results.flatMap((result, index) => result.status === "rejected" ? [resources[index].label] : []);
     setLoadWarning(failed.length ? `部分状态暂未更新，已保留上次成功内容：${failed.join("、")}。` : "");
   }, [api]);
@@ -728,6 +740,7 @@ function AdvancedAutopilotPanel({
   const cycle = autopilot?.current_cycle ?? null;
   const branches = cycle?.branches ?? EMPTY_BRANCHES;
   const branchByScenario = useMemo(() => Object.fromEntries(branches.map((item) => [item.scenario, item])), [branches]);
+  const latestStrategyRun = strategyRuns.find((item) => (item.config?.scenario ?? item.scenario) === "fin_strategy");
   const failures = branches.filter((item) => ["failed", "blocked"].includes(item.status));
   const enabled = autopilot?.config.enabled === true;
   const autopilotUnavailable = !autopilot && autopilotLoadState === "error";
@@ -802,7 +815,7 @@ function AdvancedAutopilotPanel({
       <article className={automation?.coverage.ready ? "ready" : automationLoadState === "error" ? "blocked" : "waiting"}><span>01</span><div><strong>每日数据</strong><small>{automation ? `${automation.coverage.covered}/${automation.coverage.total}项 · ${timeText(nextRun)}` : automationLoadState === "error" ? "状态暂不可用" : "读取中"}</small></div></article>
       <article className={branchClass(researchStatus)}><span>02</span><div><strong>并行研究</strong><small>{["fin_factor", "fin_model", "fin_factor_report"].map((id) => `${SCENARIO_LABELS[id]}：${statusText(branchByScenario[id]?.status)}`).join(" · ")}</small></div></article>
       <article className={branchClass(tournament?.status)}><span>03</span><div><strong>因子 / 模型竞赛</strong><small>{tournament ? `${completedTrials}/${tournament.max_trials}项已有结论` : "等待研究候选"}</small></div></article>
-      <article className={branchClass(branchByScenario.fin_quant?.status)}><span>04</span><div><strong>联合优化</strong><small>{statusText(branchByScenario.fin_quant?.status)} · 仅冠军变化时触发</small></div></article>
+      <article className={branchClass(latestStrategyRun?.status ?? branchByScenario.fin_quant?.status)}><span>04</span><div><strong>联合优化与策略规则</strong><small>因子/模型：{statusText(branchByScenario.fin_quant?.status)} · 策略规则：{statusText(latestStrategyRun?.status)}</small></div></article>
       <article className={["paper", "complete"].includes(stage) ? "ready" : ["portfolio_selection", "formal_backtest", "final_oos"].includes(stage) ? "running" : "waiting"}><span>05</span><div><strong>风险与一次 OOS</strong><small>{["formal_backtest", "final_oos"].includes(stage) ? "唯一冻结冠军正在消费最终样本" : stage === "portfolio_selection" ? "预最终区间比较 TopK 与行业中性 QP" : "前置验证通过后只打开一次"}</small></div></article>
       <article className={latestSimulation ? "ready" : stage === "paper" ? "running" : "waiting"}><span>06</span><div><strong>模拟与每日候选</strong><small>{latestSimulation ? `${latestSimulation.name} · ${statusText(latestSimulation.status)}` : "硬门禁通过后自动创建"}</small></div></article>
     </section>
@@ -827,6 +840,6 @@ function AdvancedAutopilotPanel({
       </> : <div className="empty">{paperTarget?.blocker ? `订单计划校验失败：${paperTarget.blocker}` : "没有合格的模拟账户或订单计划时，系统保持等待，不生成示例股票。"}</div>}
     </section>
 
-    <section className="autopilot-help"><div><h3>无需每天点按钮</h3><p>系统自动更新数据、生成模拟候选与目标仓位、执行 T+1 模拟成交、费用和 NAV；交易日研究因子、按新研报触发研报研究、每月滚动模型竞赛。只有 PIT、独立复算、统计、多重检验、成本、风险和最终 OOS 全部通过后才进入模拟盘。运行满 {autopilot?.real_trading.minimum_paper_calendar_days ?? 183} 天后也只提示人工复核。</p></div><div className="autopilot-help-actions"><button className="action-button action-ghost" onClick={() => onOpenAdvanced(2)}>查看竞赛试验</button><button className="action-button action-ghost" onClick={() => onOpenAdvanced(5)}>查看因子库</button></div></section>
+    <section className="autopilot-help"><div><h3>无需每天点按钮</h3><p>系统自动更新数据、研究因子、模型和策略规则，生成模拟候选与目标仓位，并执行 T+1 模拟成交、费用和 NAV。只有 PIT、独立复算、统计、多重检验、成本、风险和最终 OOS 全部通过后才进入隔离模拟。前向证据达标后自动晋级：短线至少 90 个交易日、60 次决策和 30 个闭环；中线至少 252 个交易日、24 次复核和 6 个周期；长线至少 252 个交易日、12 次月度及 4 次财报复核。长线运行满 3 年只增加成熟度标识，不阻断已达门槛的推荐。</p></div><div className="autopilot-help-actions"><button className="action-button action-ghost" onClick={() => onOpenAdvanced(2)}>查看竞赛试验</button><button className="action-button action-ghost" onClick={() => onOpenAdvanced(5)}>查看因子库</button></div></section>
   </div>;
 }

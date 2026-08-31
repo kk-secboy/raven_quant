@@ -13,6 +13,7 @@ import pandas as pd
 
 from quant_data.execution_contract import strategy_execution_contract_hash
 
+from .cost_model import CN_COST_SCHEDULE_BOOK
 from .statistical_validation import (
     paired_moving_block_bootstrap,
     probability_of_backtest_overfitting,
@@ -155,6 +156,56 @@ def build_public_strategy_control_config(
     result["execution_contract_hash"] = strategy_execution_contract_hash(result)
     validate_strategy_rule_binding(result)
     return result
+
+
+def build_transparent_full_stack_control_config(
+    candidate_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the transparent factor+public-policy control for full-stack comparison.
+
+    ``build_public_strategy_control_config`` deliberately preserves the
+    candidate score source for the policy-only ablation. This second helper
+    removes every model/ensemble/fin_quant identity and rebinds the public Qlib
+    factor baseline, so the later full-stack stage actually tests the complete
+    champion-signal + researched-policy stack.
+    """
+
+    result = build_public_strategy_control_config(candidate_config)
+    for field in {
+        *_SCORE_ID_FIELDS,
+        "model_signal_contract_version",
+        "model_primary_profile_id",
+        "model_primary_seed",
+        "model_refit_policy",
+        "model_refit_policy_sha256",
+        "quant_bundle_factor_contract",
+        "model_ensemble_manifest_sha256",
+        "model_ensemble_evidence_sha256",
+        "model_ensemble_combiner",
+        "model_ensemble_stacking",
+        "model_component_candidate_ids",
+        "model_component_families",
+        "strategy_research_signal_binding",
+        "baseline_definition",
+    }:
+        result.pop(field, None)
+    result.update(
+        {
+            "signal_source": "factor_score",
+            "factor_source_mode": "qlib_baseline",
+            "challenger_weight": 0.0,
+        }
+    )
+    # Use the same authoritative normalizer as StrategyStore. It restores the
+    # exact public baseline definition, horizon/runtime identity and execution
+    # hash without creating another StrategyVersion or state machine.
+    from .strategy_store import _normalize_multifactor_contract
+
+    return _normalize_multifactor_contract(
+        result,
+        factor_count=0,
+        creating_family=True,
+    )
 
 
 def _cost_contract(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -302,6 +353,15 @@ def derive_strategy_research_competition_periods(
         (calendar >= pd.Timestamp(str(research_periods["valid_start"])))
         & (calendar <= pd.Timestamp(str(research_periods["valid_end"])))
     ]
+    # Training history may predate the first effective-dated cost record, but
+    # policy/full-stack trials place simulated orders and therefore must never
+    # trade in that unsupported period.  Clamp both selection segments to the
+    # first authoritative cost date while retaining the earlier ``train`` rows
+    # for the separate historical context below.
+    first_cost_date = pd.Timestamp(
+        CN_COST_SCHEDULE_BOOK.versions[0].effective_from
+    )
+    valid = valid[valid >= first_cost_date]
     purge = int(purge_sessions)
     minimum_oos = int(minimum_oos_observations)
     minimum_history = 252
@@ -311,14 +371,18 @@ def derive_strategy_research_competition_periods(
     if len(valid) < minimum_oos:
         raise ValueError("strategy validation window is shorter than its preregistered OOS")
     split = max(minimum_history - 1, len(train) // 2 - 1)
-    in_start_index = split + purge + 1
+    first_cost_train_index = int(train.searchsorted(first_cost_date, side="left"))
+    in_start_index = max(split + purge + 1, first_cost_train_index)
     in_end_index = len(train) - purge - 1
     if (
         len(train) < minimum_history + minimum_in_sample + (2 * purge)
         or in_start_index > in_end_index
         or in_end_index - in_start_index + 1 < minimum_in_sample
     ):
-        raise ValueError("strategy training window cannot isolate fair-comparison history")
+        raise ValueError(
+            "cost-covered strategy training window cannot isolate "
+            "fair-comparison history"
+        )
     historical = {
         "start": train[0].date().isoformat(),
         "end": train[split].date().isoformat(),
@@ -350,6 +414,7 @@ def build_strategy_research_competition_plan(
     compiled_artifact_sha256: str,
     baseline_config: Mapping[str, Any],
     candidate_config: Mapping[str, Any],
+    full_stack_control_config: Mapping[str, Any] | None = None,
     dataset: str,
     dataset_identity_sha256: str,
     score_inputs_sha256: str,
@@ -382,9 +447,22 @@ def build_strategy_research_competition_plan(
         or baseline_config.get("recipe_version") != candidate_config.get("recipe_version")
     ):
         raise ValueError("strategy candidate and baseline do not share one public control")
+    full_stack_control = (
+        dict(full_stack_control_config)
+        if full_stack_control_config is not None
+        else dict(baseline_config)
+    )
+    full_stack_control_policy = validate_strategy_rule_binding(full_stack_control)
+    if (
+        full_stack_control_policy is None
+        or full_stack_control.get("horizon_profile")
+        != candidate_config.get("horizon_profile")
+    ):
+        raise ValueError("full-stack control belongs to another strategy horizon")
     baseline_cost = _cost_contract(baseline_config)
     candidate_cost = _cost_contract(candidate_config)
-    if baseline_cost != candidate_cost:
+    full_stack_control_cost = _cost_contract(full_stack_control)
+    if baseline_cost != candidate_cost or full_stack_control_cost != candidate_cost:
         raise ValueError("strategy candidate changed the frozen cost/execution contract")
     normalized_periods = _require_periods(periods)
     policy_challenger = _policy_only_challenger(baseline_config, candidate_config)
@@ -418,7 +496,6 @@ def build_strategy_research_competition_plan(
     common = {
         "dataset": dataset,
         "dataset_identity_sha256": dataset_identity_sha256,
-        "score_inputs_sha256": score_inputs_sha256,
         "periods": normalized_periods,
         "benchmark": benchmark,
         "universe": universe,
@@ -431,6 +508,7 @@ def build_strategy_research_competition_plan(
     }
     policy_stage = {
         **common,
+        "score_inputs_sha256": score_inputs_sha256,
         "stage": "policy_only",
         "evaluation_mode": STRATEGY_POLICY_ONLY_MODE,
         "parameter_grid": {
@@ -444,6 +522,17 @@ def build_strategy_research_competition_plan(
     }
     full_stage = {
         **common,
+        "score_inputs_sha256": canonical_sha256(
+            {
+                "contract_version": "full-stack-score-pair-v1",
+                "control": strategy_score_grid_contract(full_stack_control)[
+                    "contract_sha256"
+                ],
+                "challenger": strategy_score_grid_contract(candidate_config)[
+                    "contract_sha256"
+                ],
+            }
+        ),
         "stage": "full_stack",
         "evaluation_mode": STRATEGY_FULL_STACK_MODE,
         "parameter_grid": {
@@ -454,7 +543,7 @@ def build_strategy_research_competition_plan(
         },
         "requires_stage": "policy_only",
         "trials": [
-            trial(0, "public_baseline", baseline_config),
+            trial(0, "public_baseline", full_stack_control),
             trial(1, "full_stack_challenger", candidate_config),
         ],
     }

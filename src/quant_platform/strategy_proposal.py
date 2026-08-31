@@ -8,6 +8,9 @@ from typing import Any
 
 from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS
 from quant_platform.research_contracts import STRATEGY_SLOT_ORDER
+from quant_platform.strategy_research_signal_binding import (
+    validate_strategy_research_signal_binding,
+)
 from quant_platform.strategy_rule_ir import HORIZON_CONTRACTS, canonical_sha256
 
 STRATEGY_PROPOSAL_VERSION = "strategy-proposal-v1"
@@ -101,7 +104,11 @@ def validate_strategy_proposal(raw: Any) -> dict[str, Any]:
         "decision_frequency",
         "label_horizon_trading_days",
     }
-    if not isinstance(data, Mapping) or set(data) != data_fields:
+    actual_data_fields = frozenset(data) if isinstance(data, Mapping) else frozenset()
+    if not isinstance(data, Mapping) or actual_data_fields not in {
+        frozenset(data_fields),
+        frozenset({*data_fields, "research_signal_binding"}),
+    }:
         raise ValueError("strategy proposal data_contract drifted")
     digest = str(data["feature_set_definition_sha256"])
     if not _SHA256.fullmatch(digest):
@@ -155,6 +162,22 @@ def validate_strategy_proposal(raw: Any) -> dict[str, Any]:
         or label_horizon != expected_horizon["label_horizon_trading_days"]
     ):
         raise ValueError("strategy proposal label horizon disagrees with its horizon")
+    research_signal_binding = None
+    if "research_signal_binding" in data:
+        research_signal_binding = validate_strategy_research_signal_binding(
+            data["research_signal_binding"]
+        )
+        if (
+            research_signal_binding["horizon_profile"] != horizon
+            or research_signal_binding["dataset_identity_sha256"]
+            != dataset_snapshot_id
+            or research_signal_binding["research_feature_set_id"] != feature_set_id
+            or research_signal_binding["research_feature_set_definition_sha256"]
+            != digest
+        ):
+            raise ValueError(
+                "strategy proposal signal binding disagrees with its data contract"
+            )
 
     evaluation = raw["evaluation_contract"]
     evaluation_fields = {
@@ -225,6 +248,11 @@ def validate_strategy_proposal(raw: Any) -> dict[str, Any]:
             "research_periods": normalized_periods,
             "decision_frequency": data["decision_frequency"],
             "label_horizon_trading_days": label_horizon,
+            **(
+                {"research_signal_binding": research_signal_binding}
+                if research_signal_binding is not None
+                else {}
+            ),
         },
         "evaluation_contract": {
             "benchmark": _bounded_text(evaluation["benchmark"], field="benchmark", maximum=32),
@@ -260,5 +288,6 @@ def strategy_proposal_json_contract() -> dict[str, Any]:
             "Use only allowlisted components and parameters supplied by the caller.",
             "Never emit Python, shell, SQL, URLs, broker instructions or executable expressions.",
             "Keep final_oos_visible_during_selection=false.",
+            "Preserve research_signal_binding exactly when it is present in the seed.",
         ],
     }

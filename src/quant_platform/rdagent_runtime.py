@@ -26,6 +26,9 @@ from .rdagent_scenarios import (
     validate_feature_set_id,
 )
 from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
+from .strategy_research_signal_binding import (
+    validate_strategy_research_signal_binding,
+)
 from .upstream_versions import (
     RDAGENT_COMMIT,
     require_upstream_runtime_identity,
@@ -697,6 +700,7 @@ def rdagent_command(
     feature_set: dict[str, Any] | None = None,
     strategy_horizon_profile: str | None = None,
     incumbent_strategy_version_id: str | None = None,
+    strategy_research_signal_binding: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     scenario_spec = get_rdagent_scenario(scenario)
     duration = validate_duration_limit(duration, settings.rdagent_max_duration)
@@ -711,7 +715,24 @@ def rdagent_command(
             r"[0-9a-f]{32}", incumbent_strategy_version_id
         ):
             raise ValueError("fin_strategy incumbent strategy version identity is invalid")
-    elif strategy_horizon_profile is not None or incumbent_strategy_version_id is not None:
+        if strategy_research_signal_binding is not None:
+            strategy_research_signal_binding = (
+                validate_strategy_research_signal_binding(
+                    strategy_research_signal_binding
+                )
+            )
+            if (
+                strategy_research_signal_binding["horizon_profile"]
+                != strategy_horizon_profile
+            ):
+                raise ValueError(
+                    "fin_strategy signal binding belongs to another horizon"
+                )
+    elif (
+        strategy_horizon_profile is not None
+        or incumbent_strategy_version_id is not None
+        or strategy_research_signal_binding is not None
+    ):
         raise ValueError("strategy horizon bindings are accepted only by fin_strategy")
     runtime_root = _shared_runtime_root(settings, trace_path)
     is_wsl = os.name == "nt" and settings.rdagent_command.startswith("/")
@@ -822,6 +843,16 @@ def rdagent_command(
         "QUANTLAB_RESEARCH_OBJECTIVE": objective,
         "QUANTLAB_STRATEGY_HORIZON": strategy_horizon_profile or "",
         "QUANTLAB_STRATEGY_PARENT_VERSION_ID": incumbent_strategy_version_id or "",
+        "QUANTLAB_STRATEGY_SIGNAL_BINDING_JSON": (
+            json.dumps(
+                strategy_research_signal_binding,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if strategy_research_signal_binding is not None
+            else ""
+        ),
         "RDAGENT_QLIB_SANDBOX_IMAGE": settings.rdagent_qlib_sandbox_image,
         "RDAGENT_DATA_SCIENCE_IMAGE": settings.rdagent_data_science_image,
         "RDAGENT_FINETUNE_IMAGE": settings.rdagent_finetune_image,
@@ -884,6 +915,20 @@ def rdagent_command(
                 ).encode("utf-8")
             ).hexdigest()
         )
+        if strategy_research_signal_binding is not None and (
+            strategy_research_signal_binding["dataset_identity_sha256"]
+            != dataset_snapshot_id
+            or feature_set is None
+            or strategy_research_signal_binding["research_feature_set_id"]
+            != feature_set.get("id")
+            or strategy_research_signal_binding[
+                "research_feature_set_definition_sha256"
+            ]
+            != feature_set.get("definition_sha256")
+        ):
+            raise ValueError(
+                "fin_strategy signal binding differs from the frozen dataset or feature set"
+            )
         research_dataset_path = prepare_rdagent_dataset_view(
             dataset_path,
             trace_path.parent / "research-dataset",

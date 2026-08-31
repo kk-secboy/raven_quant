@@ -57,9 +57,17 @@ def test_research_schedule_payload_is_normalized() -> None:
     assert normalized["duration"] == "1h"
     assert normalized["periods"]["test_end"] == "2025-01-02"
     assert normalized["horizon_profile"] == "short_1_5d"
+    assert normalized["feature_set_id"] == "governed-baseline"
     assert normalized["primary_label_policy_sha256"] == (
         "f90f34e67b4721c0e7b82181007872cc099093e80ea92f8ed3d2d88e3e7adfdc"
     )
+
+    renormalized = normalize_research_schedule_payload(
+        normalized,
+        max_loops=3,
+        allow_explicit_periods=True,
+    )
+    assert renormalized == normalized
 
 
 @pytest.mark.no_database

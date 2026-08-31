@@ -293,6 +293,51 @@ def _validate_portfolio_trial_comparability(
     return portfolio_trial_comparability_evidence(combined)
 
 
+def _trial_execution_error(trial_results: list[dict[str, Any]]) -> str | None:
+    failed = [item for item in trial_results if item.get("status") == "failed"]
+    if not failed:
+        return None
+    details = []
+    for item in failed:
+        trial_index = int(item.get("trial_index", -1))
+        error = str(item.get("error") or "trial failed without an error").strip()
+        details.append(f"trial {trial_index}: {error}")
+    prefix = (
+        f"{len(failed)} of {len(trial_results)} parameter trials failed during execution: "
+    )
+    return (prefix + "; ".join(details))[:8000]
+
+
+def _build_terminal_result(
+    *,
+    manifest: dict[str, Any],
+    evaluation_mode: str | None,
+    trial_results: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    execution_error = _trial_execution_error(trial_results)
+    execution_failed_count = sum(
+        item.get("status") == "failed" for item in trial_results
+    )
+    summary["execution_succeeded_count"] = len(trial_results) - execution_failed_count
+    summary["execution_failed_count"] = execution_failed_count
+    result = {
+        "status": "failed" if execution_error else "ok",
+        "experiment_id": manifest["experiment_id"],
+        "strategy_version_id": manifest["strategy_version_id"],
+        "dataset": manifest["dataset"],
+        "evaluation_mode": evaluation_mode,
+        "final_oos_opened": False,
+        "periods": manifest["periods"],
+        "trials": trial_results,
+        "summary": summary,
+    }
+    if execution_error:
+        result["failure_kind"] = "trial_execution_error"
+        result["error"] = execution_error
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
@@ -413,7 +458,12 @@ def main() -> None:
         trial_count=len(manifest["trials"]),
         prior_trial_sharpes=prior_trial_sharpes,
     )
-    comparability = _validate_portfolio_trial_comparability(manifest, trial_results)
+    execution_error = _trial_execution_error(trial_results)
+    comparability = (
+        None
+        if execution_error
+        else _validate_portfolio_trial_comparability(manifest, trial_results)
+    )
     # The last in-loop progress snapshot predates the cross-trial DSR. Rewrite
     # it so the live UI and the final result expose the same scores/warnings.
     (output / "progress.json").write_text(
@@ -430,21 +480,18 @@ def main() -> None:
     summary["final_oos_opened"] = False
     if comparability is not None:
         summary["comparability"] = comparability
-    if not summary["succeeded_count"]:
-        raise RuntimeError(
-            "no parameter trial passed statistical acceptance; inspect the trial evidence"
-        )
-    result = {
-        "status": "ok",
-        "experiment_id": manifest["experiment_id"],
-        "strategy_version_id": manifest["strategy_version_id"],
-        "dataset": manifest["dataset"],
-        "evaluation_mode": evaluation_mode,
-        "final_oos_opened": False,
-        "periods": manifest["periods"],
-        "trials": trial_results,
-        "summary": summary,
-    }
+    result = _build_terminal_result(
+        manifest=manifest,
+        evaluation_mode=(str(evaluation_mode) if evaluation_mode else None),
+        trial_results=trial_results,
+        summary=summary,
+    )
+    result_path = output / "result.json"
+    # Publish the complete terminal trial ledger before optional tracking.  A
+    # tracking failure must not erase the actual per-trial execution errors.
+    result_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     with qlib_workflow_run(
         run_kind="portfolio-experiment",
         run_id=str(manifest["experiment_id"]),
@@ -476,11 +523,18 @@ def main() -> None:
             }
         )
         result["qlib_workflow"] = workflow.identity_dict()
-        (output / "result.json").write_text(
+        result_path.write_text(
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         workflow.save_artifacts(output)
-    print(json.dumps({"status": "ok", "summary": summary}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"status": result["status"], "summary": summary},
+                ensure_ascii=False,
+            )
+        )
+        if execution_error:
+            raise RuntimeError(execution_error)
 
 
 if __name__ == "__main__":

@@ -14,9 +14,12 @@ from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_research_evaluation import (
     STRATEGY_FULL_STACK_MODE,
     STRATEGY_POLICY_ONLY_MODE,
+    build_public_strategy_control_config,
     build_strategy_research_competition_plan,
     build_strategy_stage_artifact_from_parameter_experiment,
     build_strategy_stage_evidence,
+    build_transparent_full_stack_control_config,
+    derive_strategy_research_competition_periods,
     strategy_score_grid_contract,
 )
 from quant_platform.strategy_rule_compiler import compile_strategy_rule_policy
@@ -113,6 +116,76 @@ def _periods() -> dict:
     }
 
 
+def _write_business_day_calendar(tmp_path, start: str, end: str):
+    dataset_path = tmp_path / "qlib"
+    calendar_path = dataset_path / "calendars" / "day.txt"
+    calendar_path.parent.mkdir(parents=True)
+    sessions = pd.bdate_range(start, end)
+    calendar_path.write_text(
+        "\n".join(session.date().isoformat() for session in sessions) + "\n",
+        encoding="utf-8",
+    )
+    return dataset_path
+
+
+@pytest.mark.no_database
+def test_competition_periods_keep_history_but_clamp_trades_to_cost_coverage(
+    tmp_path,
+) -> None:
+    dataset_path = _write_business_day_calendar(
+        tmp_path, "2008-01-02", "2025-07-11"
+    )
+
+    periods = derive_strategy_research_competition_periods(
+        {
+            "train_start": "2008-01-02",
+            "train_end": "2022-05-23",
+            "valid_start": "2022-06-01",
+            "valid_end": "2024-04-12",
+            "test_start": "2024-04-18",
+            "test_end": "2025-07-11",
+        },
+        dataset_path=dataset_path,
+        purge_sessions=6,
+        minimum_oos_observations=252,
+    )
+
+    assert periods["governance"]["historical_validation_periods"]["start"] == (
+        "2008-01-02"
+    )
+    assert periods["governance"]["historical_validation_periods"]["end"] == (
+        "2015-03-12"
+    )
+    # 2015-08-01 was a Saturday; the first cost-covered trading session in
+    # this frozen calendar is the following Monday.
+    assert periods["in_sample"]["start"] == "2015-08-03"
+    assert periods["out_of_sample"]["start"] == "2022-06-01"
+
+
+@pytest.mark.no_database
+def test_competition_periods_fail_when_cost_covered_selection_is_too_short(
+    tmp_path,
+) -> None:
+    dataset_path = _write_business_day_calendar(
+        tmp_path, "2013-01-02", "2017-12-29"
+    )
+
+    with pytest.raises(ValueError, match="cost-covered strategy training window"):
+        derive_strategy_research_competition_periods(
+            {
+                "train_start": "2013-01-02",
+                "train_end": "2016-04-29",
+                "valid_start": "2016-05-16",
+                "valid_end": "2016-12-30",
+                "test_start": "2017-01-03",
+                "test_end": "2017-12-29",
+            },
+            dataset_path=dataset_path,
+            purge_sessions=6,
+            minimum_oos_observations=40,
+        )
+
+
 def _plan() -> dict:
     return build_strategy_research_competition_plan(
         research_run_id="run-1",
@@ -125,6 +198,59 @@ def _plan() -> dict:
         score_inputs_sha256=strategy_score_grid_contract(_config())["contract_sha256"],
         periods=_periods(),
     )
+
+
+def test_model_champion_policy_ablation_and_full_stack_use_distinct_controls() -> None:
+    candidate = _candidate()
+    candidate.update(
+        {
+            "signal_source": "model_prediction",
+            "factor_source_mode": "not_applicable_model_prediction",
+            "challenger_weight": 0.0,
+            "baseline_definition": None,
+            "baseline_definition_sha256": None,
+            "model_candidate_id": "model-1",
+            "model_evaluation_id": "evaluation-1",
+            "model_code_sha256": "1" * 64,
+            "model_recipe_sha256": "2" * 64,
+            "model_evidence_sha256": "3" * 64,
+            "feature_set_id": "qlib-alpha158",
+            "feature_set_definition_sha256": "4" * 64,
+        }
+    )
+    candidate["execution_contract_hash"] = strategy_execution_contract_hash(
+        candidate
+    )
+    policy_control = build_public_strategy_control_config(candidate)
+    full_stack_control = build_transparent_full_stack_control_config(candidate)
+    plan = build_strategy_research_competition_plan(
+        research_run_id="run-model-1",
+        compiled_artifact_id="artifact-model-1",
+        compiled_artifact_sha256="a" * 64,
+        baseline_config=policy_control,
+        candidate_config=candidate,
+        full_stack_control_config=full_stack_control,
+        dataset="daily-20260829",
+        dataset_identity_sha256="d" * 64,
+        score_inputs_sha256=strategy_score_grid_contract(policy_control)[
+            "contract_sha256"
+        ],
+        periods=_periods(),
+    )
+
+    policy_stage, full_stage = plan["stages"]
+    policy_scores = [
+        strategy_score_grid_contract(item["config"])["contract_sha256"]
+        for item in policy_stage["trials"]
+    ]
+    full_scores = [
+        strategy_score_grid_contract(item["config"])["contract_sha256"]
+        for item in full_stage["trials"]
+    ]
+    assert len(set(policy_scores)) == 1
+    assert len(set(full_scores)) == 2
+    assert full_stage["trials"][0]["config"]["signal_source"] == "factor_score"
+    assert full_stage["trials"][1]["config"]["model_candidate_id"] == "model-1"
 
 
 def _materialized_competition(tmp_path, *, stage: str = "policy_only") -> dict:

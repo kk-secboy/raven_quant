@@ -105,6 +105,9 @@ from .simulation_store import ExecutionDataNotReadyError, SimulationStore
 from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_health import resolve_feature_drift_episode
 from .strategy_health_collector import StrategyHealthCollector
+from .strategy_research_signal_binding import (
+    build_strategy_research_signal_binding,
+)
 from .strategy_store import StrategyStore
 from .three_horizon_account import ThreeHorizonAccountService
 from .transparent_baseline_bootstrap import (
@@ -2985,6 +2988,36 @@ class SchedulerEngine:
                     "latest reproducible daily Qlib has not published the schedule session"
                 )
 
+        strategy_research_signal_binding: dict[str, Any] | None = None
+        if scenario.id == "fin_strategy":
+            if dataset is None or not isinstance(payload.get("feature_set"), dict):
+                raise ValueError("scheduled fin_strategy governed inputs are incomplete")
+            try:
+                champion_selection = (
+                    self.autopilot.capital_pipeline.completion.select_champion(
+                        dataset=str(dataset["name"]),
+                        dataset_identity_sha256=str(
+                            dataset["provenance"]["dataset_identity_sha256"]
+                        ),
+                        horizon_profile=str(payload["horizon_profile"]),
+                    )
+                )
+            except ValueError as exc:
+                if str(exc) != (
+                    "no independently admitted signal matches this dataset identity"
+                ):
+                    raise
+                champion_selection = None
+            strategy_research_signal_binding = build_strategy_research_signal_binding(
+                horizon_profile=str(payload["horizon_profile"]),
+                dataset=str(dataset["name"]),
+                dataset_identity_sha256=str(
+                    dataset["provenance"]["dataset_identity_sha256"]
+                ),
+                research_feature_set=dict(payload["feature_set"]),
+                champion_selection=champion_selection,
+            )
+
         try:
             runtime = probe_rdagent(
                 self.settings, Path(__file__).resolve().parents[2]
@@ -3067,6 +3100,9 @@ class SchedulerEngine:
                 "feature_set_definition_sha256": payload["feature_set"][
                     "definition_sha256"
                 ],
+                "strategy_research_signal_binding_sha256": (
+                    strategy_research_signal_binding["binding_sha256"]
+                ),
                 "incumbent_strategy_version_id": (
                     incumbent_strategy["id"]
                     if incumbent_strategy is not None
@@ -3101,6 +3137,7 @@ class SchedulerEngine:
             "dataset_binding": dataset_binding,
             "incumbent_strategy": incumbent_strategy,
             "managed_fin_strategy_run": managed_run,
+            "strategy_research_signal_binding": strategy_research_signal_binding,
             **(
                 {
                     "primary_label_policy": primary_label_policy_contract(),
@@ -3247,6 +3284,9 @@ class SchedulerEngine:
                     ),
                     "incumbent_strategy": incumbent_strategy,
                     "managed_fin_strategy_run": managed_run,
+                    "strategy_research_signal_binding": (
+                        strategy_research_signal_binding
+                    ),
                     "expected_rdagent_runtime": expected_runtime_identity,
                 },
                 log_path,

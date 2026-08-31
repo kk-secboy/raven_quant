@@ -319,6 +319,10 @@ def normalize_research_schedule_payload(
         "duration": duration,
         "requested_by": requested_by,
         "asset_ids": asset_ids,
+        # Schedule creation persists the normalized payload and the scheduler
+        # validates it again at dispatch time.  Keep the opaque registry ID as
+        # well as the frozen definition so normalization is idempotent.
+        "feature_set_id": feature_set_id,
         "feature_set": feature_set,
         "horizon_profile": horizon_profile,
     }

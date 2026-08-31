@@ -1020,6 +1020,18 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
     expected_strategy_parent = str(
         os.getenv("QUANTLAB_STRATEGY_PARENT_VERSION_ID") or ""
     ).strip() or None
+    raw_strategy_signal_binding = str(
+        os.getenv("QUANTLAB_STRATEGY_SIGNAL_BINDING_JSON") or ""
+    ).strip()
+    expected_strategy_signal_binding = None
+    if raw_strategy_signal_binding:
+        from quant_platform.strategy_research_signal_binding import (
+            validate_strategy_research_signal_binding,
+        )
+
+        expected_strategy_signal_binding = validate_strategy_research_signal_binding(
+            json.loads(raw_strategy_signal_binding)
+        )
     if args.scenario == "fin_strategy" and expected_strategy_horizon not in {
         "short_1_5d",
         "swing_1_6m",
@@ -1051,6 +1063,8 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
                 != expected_strategy_horizon
                 or artifact["strategy_proposal"]["parent_strategy_version_id"]
                 != expected_strategy_parent
+                or data_contract.get("research_signal_binding")
+                != expected_strategy_signal_binding
             ):
                 raise RuntimeError("fin_strategy artifact input binding disagrees")
             artifact_sha256 = str(artifact["artifact_sha256"])

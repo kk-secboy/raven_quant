@@ -63,6 +63,62 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _terminal_result_state(
+    result: Mapping[str, Any],
+    trial_results: list[dict[str, Any]],
+    summary: Mapping[str, Any],
+) -> tuple[str, str | None]:
+    """Validate an explicit terminal trial ledger and map it to DB state.
+
+    Results created before the terminal-result contract omitted the execution
+    counters; retain their historical behavior.  New explicit results
+    distinguish executable trials rejected by statistics from trials that did
+    not execute.
+    """
+
+    explicit_status = result.get("status")
+    if explicit_status is None:
+        return "succeeded", None
+    status = str(explicit_status)
+    if status not in {"ok", "failed"}:
+        raise ValueError("parameter experiment terminal status is invalid")
+    failed = [item for item in trial_results if item.get("status") == "failed"]
+    missing_errors = [
+        int(item.get("trial_index", -1))
+        for item in failed
+        if not str(item.get("error") or "").strip()
+    ]
+    if missing_errors:
+        raise ValueError("failed parameter trials must retain their execution errors")
+    expected_failed = len(failed)
+    expected_succeeded = len(trial_results) - expected_failed
+    has_failed_count = "execution_failed_count" in summary
+    has_succeeded_count = "execution_succeeded_count" in summary
+    if status == "ok" and not has_failed_count and not has_succeeded_count:
+        # Historical successful artifacts predate the explicit split between
+        # execution failure and statistical rejection.
+        return "succeeded", None
+    if (
+        has_failed_count is not has_succeeded_count
+        or not has_failed_count
+        or int(summary.get("execution_failed_count", -1)) != expected_failed
+        or int(summary.get("execution_succeeded_count", -1)) != expected_succeeded
+    ):
+        raise ValueError("parameter experiment execution counts are inconsistent")
+    if status == "ok":
+        if failed:
+            raise ValueError("successful parameter experiment contains failed executions")
+        return "succeeded", None
+    error = str(result.get("error") or "").strip()
+    if (
+        result.get("failure_kind") != "trial_execution_error"
+        or not failed
+        or not error
+    ):
+        raise ValueError("failed parameter experiment terminal evidence is incomplete")
+    return "failed", error
+
+
 def _portfolio_competition_spec_sha256(
     *,
     strategy_version_id: str,
@@ -872,7 +928,7 @@ class ParameterExperimentStore:
         if mode not in {STRATEGY_POLICY_ONLY_MODE, STRATEGY_FULL_STACK_MODE}:
             return
         if (
-            result.get("status") != "ok"
+            result.get("status") not in {"ok", "failed"}
             or result.get("experiment_id") != experiment_id
             or result.get("strategy_version_id")
             != str(experiment_row.strategy_version_id)
@@ -1027,6 +1083,11 @@ class ParameterExperimentStore:
             result_indexes = {int(item["trial_index"]) for item in trial_results}
             if expected_indexes != result_indexes:
                 raise ValueError("parameter experiment result does not cover every trial")
+            experiment_status, experiment_error = _terminal_result_state(
+                result,
+                trial_results,
+                summary,
+            )
             self._validate_strategy_research_result(
                 experiment_id=experiment_id,
                 experiment_row=experiment_row,
@@ -1037,7 +1098,10 @@ class ParameterExperimentStore:
                 summary=summary,
                 expected_trials=list(expected),
             )
-            if governance.get("mode") == "model_portfolio_pre_final":
+            if (
+                governance.get("mode") == "model_portfolio_pre_final"
+                and experiment_status == "succeeded"
+            ):
                 registered = {int(row.trial_index): row for row in expected}
                 combined = [
                     {
@@ -1106,9 +1170,9 @@ class ParameterExperimentStore:
                 update(parameter_experiments)
                 .where(parameter_experiments.c.id == experiment_id)
                 .values(
-                    status="succeeded",
+                    status=experiment_status,
                     summary_json=summary,
-                    error=None,
+                    error=experiment_error,
                     finished_at=now,
                 )
             )

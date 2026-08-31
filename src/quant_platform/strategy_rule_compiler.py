@@ -6,6 +6,9 @@ from typing import Any
 
 from quant_platform.research_horizon import research_horizon_contract
 from quant_platform.strategy_proposal import validate_strategy_proposal
+from quant_platform.strategy_research_signal_binding import (
+    signal_config_from_strategy_research_binding,
+)
 from quant_platform.strategy_rule_ir import (
     STRATEGY_RULE_IR_VERSION,
     canonical_sha256,
@@ -476,6 +479,15 @@ def materialize_strategy_candidate_config(
     cost["cost_schedule_version"] = cost.pop("version")
     config.update(cost)
     horizon = research_horizon_contract(str(candidate["horizon"]))
+    research_signal_binding = proposal["data_contract"].get(
+        "research_signal_binding"
+    )
+    if research_signal_binding is not None:
+        config.update(
+            signal_config_from_strategy_research_binding(
+                research_signal_binding
+            )
+        )
     config.update(
         {
             "recipe_id": proposal["baseline_recipe_id"],
@@ -501,6 +513,15 @@ def materialize_strategy_candidate_config(
             "strategy_research_artifact_sha256": normalized["artifact_sha256"],
             "parent_strategy_version_id": proposal["parent_strategy_version_id"],
             "strategy_research_data_contract": deepcopy(proposal["data_contract"]),
+            **(
+                {
+                    "strategy_research_signal_binding": deepcopy(
+                        research_signal_binding
+                    )
+                }
+                if research_signal_binding is not None
+                else {}
+            ),
             "strategy_evaluation_contract": deepcopy(
                 proposal["evaluation_contract"]
             ),

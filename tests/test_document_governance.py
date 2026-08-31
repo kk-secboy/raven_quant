@@ -166,6 +166,8 @@ def test_readme_declares_the_document_and_technical_authorities() -> None:
     assert "三周期账户净额" in readme
     assert "`fin_strategy`" in readme
     assert "满足各周期真实前向门后由系统原子自动晋级" in readme
+    assert "`policy_only` 只比较买卖和持仓规则，保持同一份分数" in readme
+    assert "区间不得早于成本制度首个有效交易日" in readme
     assert "旧 `/api/research-programs` 与 `/api/research-campaigns` 只保留历史 GET 查询" in readme
     assert "Loop、Hypothesis、Feedback 和 Trace 摘要" in readme
     assert "本 README 只提供项目入口和" in readme
@@ -211,6 +213,9 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "已经开始模拟的版本保留其原门槛",
         "`fin_strategy`",
         "不得因为缺少已批准旧策略而形成“先有正式策略才能研究新策略”的循环等待",
+        "`fin-strategy-signal-binding-v1`",
+        "LLM 不能替换分数源",
+        "不得早于对应成本制度首个有效交易日",
         "`StrategyProposal`",
         "确定性编译",
         "`strategy-rule-ir-v1`",

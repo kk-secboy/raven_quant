@@ -738,6 +738,93 @@ def test_outer_failure_finalization_retries_without_killing_consumer(
     assert finalize_attempts == 2
 
 
+def test_failed_parameter_trial_ledger_is_applied_before_process_failure() -> None:
+    applied: list[tuple[str, dict]] = []
+
+    class Experiments:
+        def apply_result(self, experiment_id: str, result: dict) -> None:
+            applied.append((experiment_id, result))
+
+    worker = object.__new__(LocalJobWorker)
+    worker.parameter_experiments = Experiments()
+    worker._settle_fin_strategy_experiment = lambda *_args, **_kwargs: (  # type: ignore[method-assign]
+        (_ for _ in ()).throw(AssertionError("failed trials reached strategy settlement"))
+    )
+    terminal_result = {
+        "status": "failed",
+        "failure_kind": "trial_execution_error",
+        "error": "trial 1: price-limit column is missing",
+        "trials": [
+            {
+                "trial_index": 1,
+                "status": "failed",
+                "error": "price-limit column is missing",
+            }
+        ],
+        "summary": {
+            "execution_succeeded_count": 0,
+            "execution_failed_count": 1,
+        },
+    }
+
+    exit_code, error = worker._settle_parameter_experiment_process_result(
+        {
+            "kind": "parameter_experiment",
+            "payload": {"parameter_experiment_id": "experiment-1"},
+        },
+        terminal_result,
+        exit_code=1,
+        process_error="generic process error",
+    )
+
+    assert applied == [("experiment-1", terminal_result)]
+    assert exit_code == 1
+    assert error == "trial 1: price-limit column is missing"
+
+
+def test_statistical_rejection_keeps_successful_parameter_process_semantics() -> None:
+    applied: list[str] = []
+    settlements: list[dict] = []
+
+    class Experiments:
+        def apply_result(self, experiment_id: str, _result: dict) -> None:
+            applied.append(experiment_id)
+
+    worker = object.__new__(LocalJobWorker)
+    worker.parameter_experiments = Experiments()
+    worker._settle_fin_strategy_experiment = (  # type: ignore[method-assign]
+        lambda _job, result: settlements.append(result) or {"next_gate": "research_rejected"}
+    )
+    result = {
+        "status": "ok",
+        "trials": [{"trial_index": 0, "status": "succeeded"}],
+        "summary": {
+            "succeeded_count": 0,
+            "statistically_rejected_count": 1,
+            "execution_succeeded_count": 1,
+            "execution_failed_count": 0,
+        },
+    }
+
+    exit_code, error = worker._settle_parameter_experiment_process_result(
+        {
+            "kind": "parameter_experiment",
+            "payload": {"parameter_experiment_id": "experiment-2"},
+        },
+        result,
+        exit_code=0,
+        process_error=None,
+    )
+
+    assert applied == ["experiment-2"]
+    assert settlements == [result]
+    assert result["strategy_research_settlement"] == {
+        "next_gate": "research_rejected"
+    }
+    assert exit_code == 0
+    assert error is None
+
+
 @pytest.mark.parametrize("failure_mode", ["returned", "raised"])
 def test_failed_periodic_probe_retries_quickly_before_normal_interval(
     failure_mode: str,

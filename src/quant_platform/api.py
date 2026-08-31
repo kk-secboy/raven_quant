@@ -185,6 +185,9 @@ from .services import (
 from .simulation_store import SimulationStore
 from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
+from .strategy_research_signal_binding import (
+    build_strategy_research_signal_binding,
+)
 from .strategy_rule_compiler import validate_strategy_rule_binding
 from .strategy_store import StrategyStore
 from .transparent_baseline_runner import bind_transparent_baseline_job_identity
@@ -4450,6 +4453,43 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         feature_set = (
             get_feature_set(str(payload.feature_set_id)) if scenario.requires_feature_set else None
         )
+        strategy_research_signal_binding: dict[str, Any] | None = None
+        if scenario.id == "fin_strategy":
+            if dataset is None or feature_set is None or research_horizon_profile is None:
+                raise HTTPException(409, "fin_strategy governed inputs are incomplete")
+            try:
+                champion_selection = (
+                    autopilot.capital_pipeline.completion.select_champion(
+                        dataset=str(dataset["name"]),
+                        dataset_identity_sha256=str(
+                            dataset["provenance"]["dataset_identity_sha256"]
+                        ),
+                        horizon_profile=research_horizon_profile,
+                    )
+                )
+            except ValueError as exc:
+                if str(exc) != (
+                    "no independently admitted signal matches this dataset identity"
+                ):
+                    raise HTTPException(
+                        409,
+                        f"governed fin_strategy champion selection failed: {exc}",
+                    ) from exc
+                champion_selection = None
+            try:
+                strategy_research_signal_binding = (
+                    build_strategy_research_signal_binding(
+                        horizon_profile=research_horizon_profile,
+                        dataset=str(dataset["name"]),
+                        dataset_identity_sha256=str(
+                            dataset["provenance"]["dataset_identity_sha256"]
+                        ),
+                        research_feature_set=feature_set,
+                        champion_selection=champion_selection,
+                    )
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
         artifact = settings.data_root / "artifacts" / "rdagent"
         config: dict[str, Any] = {
             "scenario": scenario.id,
@@ -4461,6 +4501,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "strategy_horizon_profile": strategy_horizon_profile,
             "horizon_profile": research_horizon_profile,
             "incumbent_strategy": incumbent_binding,
+            "strategy_research_signal_binding": strategy_research_signal_binding,
             **(
                 {
                     "primary_label_policy": primary_label_policy_contract(),
@@ -4556,6 +4597,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 else None
             ),
             "incumbent_strategy": incumbent_binding,
+            "strategy_research_signal_binding": strategy_research_signal_binding,
             **(
                 {
                     "primary_label_policy": primary_label_policy_contract(),

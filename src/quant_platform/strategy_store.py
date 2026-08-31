@@ -171,6 +171,9 @@ from quant_platform.strategy_research_admission import (
     build_fin_strategy_formal_admission,
     validate_fin_strategy_formal_admission,
 )
+from quant_platform.strategy_research_signal_binding import (
+    require_strategy_research_signal_config,
+)
 from quant_platform.strategy_rule_compiler import (
     validate_compiled_strategy_artifact,
     validate_strategy_rule_binding,
@@ -189,6 +192,7 @@ from quant_platform.transparent_baseline_runner import (
     POSITION_RISK_TARGET_RECIPE_VERSION,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
     STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
+    STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
@@ -336,6 +340,7 @@ def _transparent_worker_runtime_failures(
             DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
             TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
             FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
         or target_runner_for_recipe(
@@ -399,7 +404,7 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
             "forward-only rehabilitation entry point"
         )
     if is_current_public_recipe and config.get("evidence_mode") != EVIDENCE_MODE_SEALED:
-        raise ValueError("the v20 strategy-research runtime requires sealed final OOS")
+        raise ValueError("the v21 strategy-research runtime requires sealed final OOS")
     if target_runner_for_recipe(recipe_id, recipe_version) is None:
         raise ValueError("the current transparent runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
@@ -882,10 +887,21 @@ def _require_strategy_source_artifact(
         "strategy_research_artifact_sha256": artifact["artifact_sha256"],
         "parent_strategy_version_id": proposal["parent_strategy_version_id"],
         "strategy_research_data_contract": proposal["data_contract"],
+        "strategy_research_signal_binding": proposal["data_contract"].get(
+            "research_signal_binding"
+        ),
         "strategy_evaluation_contract": proposal["evaluation_contract"],
     }
     if any(config.get(key) != value for key, value in expected_values.items()):
         raise ValueError("StrategySpec differs from its compiled research artifact")
+    research_signal_binding = proposal["data_contract"].get(
+        "research_signal_binding"
+    )
+    if research_signal_binding is not None:
+        require_strategy_research_signal_config(
+            research_signal_binding,
+            config,
+        )
     parent_id = proposal["parent_strategy_version_id"]
     if parent_id is None:
         if expected_strategy_id is not None:

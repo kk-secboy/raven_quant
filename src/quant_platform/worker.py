@@ -154,8 +154,13 @@ from .strategy_research_evaluation import (
     build_public_strategy_control_config,
     build_strategy_research_competition_plan,
     build_strategy_stage_artifact_from_parameter_experiment,
+    build_transparent_full_stack_control_config,
     derive_strategy_research_competition_periods,
     strategy_score_grid_contract,
+)
+from .strategy_research_signal_binding import (
+    require_strategy_research_signal_config,
+    validate_strategy_research_signal_binding,
 )
 from .strategy_rule_compiler import (
     materialize_strategy_candidate_config,
@@ -1183,7 +1188,11 @@ class LocalJobWorker:
             result = None
             result_read_error: str | None = None
             if (
-                (exit_code == 0 or job["kind"] == "research_asset_acquire")
+                (
+                    exit_code == 0
+                    or job["kind"]
+                    in {"research_asset_acquire", "parameter_experiment"}
+                )
                 and result_path
                 and result_path.exists()
             ):
@@ -1399,16 +1408,18 @@ class LocalJobWorker:
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
-            if exit_code == 0 and job["kind"] == "parameter_experiment":
+            if job["kind"] == "parameter_experiment":
                 try:
-                    if not isinstance(result, dict):
-                        raise ValueError("parameter experiment result is missing")
-                    self.parameter_experiments.apply_result(str(parameter_experiment_id), result)
-                    strategy_settlement = self._settle_fin_strategy_experiment(
-                        job, result
+                    exit_code, terminal_error = (
+                        self._settle_parameter_experiment_process_result(
+                            job,
+                            result,
+                            exit_code=exit_code,
+                            process_error=process_error,
+                        )
                     )
-                    if strategy_settlement is not None:
-                        result["strategy_research_settlement"] = strategy_settlement
+                    if terminal_error is not None:
+                        logical_error = terminal_error
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
@@ -3077,6 +3088,13 @@ class LocalJobWorker:
             )
         if is_rdagent_job(job["kind"]):
             scenario = get_rdagent_scenario(str(payload.get("scenario") or "fin_factor"))
+            raw_strategy_signal_binding = payload.get(
+                "strategy_research_signal_binding"
+            )
+            if raw_strategy_signal_binding is not None and not isinstance(
+                raw_strategy_signal_binding, dict
+            ):
+                raise ValueError("fin_strategy signal binding payload is invalid")
             llm = self.runtime_secrets.get("llm")
             runtime_env = None
             if llm:
@@ -3137,6 +3155,11 @@ class LocalJobWorker:
                 incumbent_strategy_version_id=(
                     str(payload["incumbent_strategy"]["id"])
                     if isinstance(payload.get("incumbent_strategy"), dict)
+                    else None
+                ),
+                strategy_research_signal_binding=(
+                    dict(raw_strategy_signal_binding)
+                    if isinstance(raw_strategy_signal_binding, dict)
                     else None
                 ),
             )
@@ -5686,6 +5709,18 @@ class LocalJobWorker:
             or not re.fullmatch(r"[0-9a-f]{64}", dataset_identity_sha256)
         ):
             raise ValueError("fin_strategy archive input identities are invalid")
+        raw_signal_binding = payload.get("strategy_research_signal_binding")
+        if raw_signal_binding is not None and not isinstance(
+            raw_signal_binding, dict
+        ):
+            raise ValueError("fin_strategy archive signal binding payload is invalid")
+        expected_signal_binding = (
+            validate_strategy_research_signal_binding(
+                raw_signal_binding
+            )
+            if isinstance(raw_signal_binding, dict)
+            else None
+        )
         horizon = str(
             payload.get("strategy_horizon_profile")
             or payload.get("horizon_profile")
@@ -5770,6 +5805,8 @@ class LocalJobWorker:
                 or data_contract["feature_set_definition_sha256"]
                 != feature_set_sha256
                 or data_contract["research_periods"] != expected_periods
+                or data_contract.get("research_signal_binding")
+                != expected_signal_binding
             ):
                 raise ValueError("fin_strategy artifact input binding disagrees with its job")
             artifact_sha256 = str(artifact["artifact_sha256"])
@@ -5801,6 +5838,11 @@ class LocalJobWorker:
                     "feature_set_id": feature_set_id,
                     "feature_set_definition_sha256": feature_set_sha256,
                     "parent_strategy_version_id": incumbent_id,
+                    "strategy_research_signal_binding_sha256": (
+                        expected_signal_binding["binding_sha256"]
+                        if expected_signal_binding is not None
+                        else None
+                    ),
                 },
             )
             compiled_path = write_immutable_json(
@@ -5828,6 +5870,11 @@ class LocalJobWorker:
                     "feature_set_id": feature_set_id,
                     "feature_set_definition_sha256": feature_set_sha256,
                     "parent_strategy_version_id": incumbent_id,
+                    "strategy_research_signal_binding_sha256": (
+                        expected_signal_binding["binding_sha256"]
+                        if expected_signal_binding is not None
+                        else None
+                    ),
                 },
             )
             strategy_version = LocalJobWorker._materialize_fin_strategy_candidate(
@@ -5865,6 +5912,7 @@ class LocalJobWorker:
             "dataset_identity_sha256": dataset_identity_sha256,
             "feature_set_id": feature_set_id,
             "feature_set_definition_sha256": feature_set_sha256,
+            "strategy_research_signal_binding": expected_signal_binding,
             "sanitized_result_artifact_id": sanitized_result_artifact_id,
             "sanitized_result_sha256": sanitized_result_sha256,
             "artifacts": archived,
@@ -5942,6 +5990,14 @@ class LocalJobWorker:
                 raise ValueError(
                     "compiled strategy artifact materialization conflict is not "
                     "an exact draft retry"
+                )
+            research_signal_binding = proposal["data_contract"].get(
+                "research_signal_binding"
+            )
+            if research_signal_binding is not None:
+                require_strategy_research_signal_config(
+                    research_signal_binding,
+                    config,
                 )
             return candidate
 
@@ -6063,6 +6119,16 @@ class LocalJobWorker:
             )
             candidate_config = dict(version["config"])
             baseline_config = build_public_strategy_control_config(candidate_config)
+            incumbent = payload.get("incumbent_strategy")
+            full_stack_control_config = (
+                dict(
+                    self.strategies.get_version(str(incumbent["id"]))["config"]
+                )
+                if isinstance(incumbent, dict)
+                else build_transparent_full_stack_control_config(
+                    candidate_config
+                )
+            )
             evaluation_contract = artifact["strategy_proposal"][
                 "evaluation_contract"
             ]
@@ -6083,6 +6149,7 @@ class LocalJobWorker:
                 compiled_artifact_sha256=str(artifact["artifact_sha256"]),
                 baseline_config=baseline_config,
                 candidate_config=candidate_config,
+                full_stack_control_config=full_stack_control_config,
                 dataset=dataset_name,
                 dataset_identity_sha256=dataset_identity,
                 score_inputs_sha256=str(score_contract["contract_sha256"]),
@@ -6756,6 +6823,39 @@ class LocalJobWorker:
                 actor="strategy-evaluation-worker",
             )
         return decision
+
+    def _settle_parameter_experiment_process_result(
+        self,
+        job: dict[str, Any],
+        result: Any,
+        *,
+        exit_code: int,
+        process_error: str | None,
+    ) -> tuple[int, str | None]:
+        """Persist a complete trial ledger before exposing process failure."""
+
+        if not isinstance(result, dict):
+            if exit_code == 0:
+                raise ValueError("parameter experiment result is missing")
+            return exit_code, None
+        terminal_failed = result.get("status") == "failed"
+        if exit_code != 0 and not terminal_failed:
+            return exit_code, None
+        experiment_id = str(job.get("payload", {}).get("parameter_experiment_id") or "")
+        if not experiment_id:
+            raise ValueError("parameter experiment identity is missing")
+        self.parameter_experiments.apply_result(experiment_id, result)
+        if terminal_failed:
+            error = str(
+                result.get("error")
+                or process_error
+                or "parameter trial execution failed"
+            )
+            return (exit_code if exit_code != 0 else 3), error
+        strategy_settlement = self._settle_fin_strategy_experiment(job, result)
+        if strategy_settlement is not None:
+            result["strategy_research_settlement"] = strategy_settlement
+        return exit_code, None
 
     def _settle_fin_strategy_experiment(
         self, job: dict[str, Any], result: dict[str, Any]

@@ -1,0 +1,31 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE_ID
+ARG RELEASE_ID
+ARG SOURCE_COMMIT
+ARG CONFIG_DIGEST
+ARG EXPECTED_RUNTIME_CLOSURE_SHA256
+
+WORKDIR /app
+
+# An incremental release must replace both source views.  The platform seals
+# economic/runtime code from /app/src, while Python imports the installed wheel
+# from site-packages.  Updating only one view makes a release impossible to
+# reproduce and is therefore rejected by the verification step below.
+RUN rm -rf /app/src /app/scripts /app/migrations
+COPY pyproject.toml README.md alembic.ini ./
+COPY migrations ./migrations
+COPY src ./src
+COPY scripts ./scripts
+
+RUN python -m pip install --no-deps --force-reinstall . \
+    && python /app/scripts/verify_governed_runtime_overlay.py \
+        --project-root /app \
+        --expected-closure-sha256 "${EXPECTED_RUNTIME_CLOSURE_SHA256}"
+
+LABEL quantlab.release="${RELEASE_ID}" \
+      quantlab.config-digest="${CONFIG_DIGEST}" \
+      quantlab.source-commit="${SOURCE_COMMIT}" \
+      quantlab.base-image-id="${BASE_IMAGE_ID}" \
+      quantlab.build-mode="governed-full-source-overlay"

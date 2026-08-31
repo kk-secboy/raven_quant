@@ -5,12 +5,23 @@ from copy import deepcopy
 import pytest
 
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
+from quant_platform.model_research_governance import (
+    MODEL_REFIT_POLICY,
+    MODEL_REFIT_POLICY_SHA256,
+    PRIMARY_MODEL_PROFILE,
+    PRIMARY_MODEL_SEED,
+)
 from quant_platform.strategy_proposal import (
     STRATEGY_PROPOSAL_VERSION,
     parse_strategy_proposal_json,
     validate_strategy_proposal,
 )
 from quant_platform.strategy_recipes import get_strategy_recipe
+from quant_platform.strategy_research_signal_binding import (
+    build_strategy_research_signal_binding,
+    require_strategy_research_signal_config,
+    validate_strategy_research_signal_binding,
+)
 from quant_platform.strategy_rule_compiler import (
     compile_strategy_proposal,
     materialize_strategy_candidate_config,
@@ -151,6 +162,126 @@ def test_compiled_proposal_materializes_only_an_inert_rule_bound_candidate() -> 
         STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert runtime["target_worker_runtime_image_digest"] == "sha256:" + "d" * 64
+
+
+def test_strategy_proposal_freezes_governed_model_champion_into_candidate() -> None:
+    from quant_platform.strategy_store import _normalize_multifactor_contract
+
+    evidence = {
+        "contract_version": "autopilot-completion-v1",
+        "selection_policy_version": "pre-final-incumbent-challenge-equal-profile-v2",
+        "dataset": "daily-20260831",
+        "dataset_identity_sha256": "b" * 64,
+        "horizon_profile": "short_1_5d",
+        "final_oos_opened": False,
+        "research_screening_only": True,
+        "not_capital_confirmation": True,
+        "cross_cycle_fwer_claimed": False,
+        "selected_kind": "model",
+        "selected_candidate_id": "model-1",
+        "selected_strategy_config": {
+            "signal_source": "model_prediction",
+            "model_candidate_id": "model-1",
+            "model_evaluation_id": "evaluation-1",
+            "model_code_sha256": "1" * 64,
+            "model_recipe_sha256": "2" * 64,
+            "model_evidence_sha256": "3" * 64,
+            "feature_set_id": "qlib-alpha158",
+            "feature_set_definition_sha256": "4" * 64,
+            "model_primary_profile_id": PRIMARY_MODEL_PROFILE,
+            "model_primary_seed": PRIMARY_MODEL_SEED,
+            "model_refit_policy": dict(MODEL_REFIT_POLICY),
+            "model_refit_policy_sha256": MODEL_REFIT_POLICY_SHA256,
+        },
+    }
+    from quant_platform.strategy_rule_ir import canonical_sha256
+
+    binding = build_strategy_research_signal_binding(
+        horizon_profile="short_1_5d",
+        dataset="daily-20260831",
+        dataset_identity_sha256="b" * 64,
+        research_feature_set={
+            "id": "governed-baseline",
+            "definition_sha256": "a" * 64,
+            "features": {"relative_strength_5d": "$close/Ref($close,5)-1"},
+        },
+        champion_selection={
+            "champion_selection_evidence": evidence,
+            "champion_selection_evidence_sha256": canonical_sha256(evidence),
+        },
+    )
+    assert validate_strategy_research_signal_binding(binding) == binding
+
+    proposal = _proposal("short_relative_strength")
+    proposal["data_contract"]["research_signal_binding"] = binding
+    artifact = compile_strategy_proposal(
+        proposal, allowed_factor_ids=_factor_ids(proposal)
+    )
+    config = materialize_strategy_candidate_config(
+        artifact,
+        source_research_artifact_id="artifact-model-1",
+        allowed_factor_ids=_factor_ids(proposal),
+    )
+
+    assert config["signal_source"] == "model_prediction"
+    assert config["model_candidate_id"] == "model-1"
+    assert config["model_evaluation_id"] == "evaluation-1"
+    assert config["factor_source_mode"] == "not_applicable_model_prediction"
+    assert config["baseline_definition"] is None
+    assert config["strategy_research_signal_binding"] == binding
+    assert config["strategy_research_data_contract"][
+        "research_signal_binding"
+    ] == binding
+    assert require_strategy_research_signal_config(binding, config) == binding
+    substituted = deepcopy(config)
+    substituted["model_candidate_id"] = "model-substituted"
+    with pytest.raises(ValueError, match="differs from its frozen research signal"):
+        require_strategy_research_signal_config(binding, substituted)
+    normalized = _normalize_multifactor_contract(
+        config,
+        factor_count=0,
+        creating_family=True,
+    )
+    assert normalized["model_candidate_id"] == "model-1"
+    assert normalized["factor_source_mode"] == "not_applicable_model_prediction"
+
+    changed = deepcopy(binding)
+    changed["signal_config"]["model_candidate_id"] = "substituted"
+    proposal = _proposal("short_relative_strength")
+    proposal["data_contract"]["research_signal_binding"] = changed
+    with pytest.raises(ValueError, match="changed after freezing"):
+        validate_strategy_proposal(proposal)
+
+
+def test_strategy_proposal_cold_start_freezes_transparent_signal_control() -> None:
+    binding = build_strategy_research_signal_binding(
+        horizon_profile="short_1_5d",
+        dataset="daily-20260831",
+        dataset_identity_sha256="b" * 64,
+        research_feature_set={
+            "id": "governed-baseline",
+            "definition_sha256": "a" * 64,
+            "features": {"relative_strength_5d": "$close/Ref($close,5)-1"},
+        },
+        champion_selection=None,
+    )
+    proposal = _proposal("short_relative_strength")
+    proposal["data_contract"]["research_signal_binding"] = binding
+
+    artifact = compile_strategy_proposal(
+        proposal, allowed_factor_ids=_factor_ids(proposal)
+    )
+    config = materialize_strategy_candidate_config(
+        artifact,
+        source_research_artifact_id="artifact-cold-start",
+        allowed_factor_ids=_factor_ids(proposal),
+    )
+
+    assert binding["source"] == "transparent_public_baseline"
+    assert config["signal_source"] == "factor_score"
+    assert config["factor_source_mode"] == "qlib_baseline"
+    assert config["feature_set_id"] == "governed-baseline"
+    assert config["strategy_research_signal_binding"] == binding
 
 
 def test_strategy_proposal_rejects_code_unknown_parameters_and_final_oos_visibility() -> None:
