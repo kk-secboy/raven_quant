@@ -72,8 +72,8 @@ def _version() -> SimpleNamespace:
         config_json={
             "recipe_id": profile.recipe_id,
             "recipe_version": profile.recipe_version,
-            "recipe_sha256": profile.recipe_sha256,
             "transparent_baseline_bootstrap": {
+                "recipe_sha256": profile.recipe_sha256,
                 TRANSPARENT_BASELINE_RUNNER_FIELD: profile.runner_sha256,
                 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: (
                     profile.runtime_bundle_sha256
@@ -88,6 +88,29 @@ def _version() -> SimpleNamespace:
             },
         },
     )
+
+
+def test_version_binding_reads_recipe_hash_from_the_bootstrap_contract() -> None:
+    profile = V17_INTERRUPTION_RECOVERY_PROFILE
+    version = _version()
+
+    assert "recipe_sha256" not in version.config_json
+    binding = _version_binding(version, profile)
+
+    assert binding["recipe_sha256"] == profile.recipe_sha256
+
+
+def test_version_binding_rejects_a_top_level_recipe_hash_decoy() -> None:
+    profile = V17_INTERRUPTION_RECOVERY_PROFILE
+    version = _version()
+    version.config_json["recipe_sha256"] = profile.recipe_sha256
+    version.config_json["transparent_baseline_bootstrap"]["recipe_sha256"] = "0" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="v17 formal backtest immutable strategy binding changed",
+    ):
+        _version_binding(version, profile)
 
 
 def _receipt() -> dict:
