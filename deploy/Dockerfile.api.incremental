@@ -1,0 +1,17 @@
+ARG BASE_API_IMAGE=quantlab-api-runtime:v2
+FROM ${BASE_API_IMAGE}
+
+ARG BASE_API_IMAGE_ID=unknown
+LABEL quantlab.base_api_image_id=${BASE_API_IMAGE_ID}
+LABEL quantlab.build_mode=verified-incremental-runtime-layer
+
+WORKDIR /app
+COPY pyproject.toml README.md alembic.ini ./
+COPY migrations ./migrations
+COPY src ./src
+COPY scripts ./scripts
+
+RUN python -m pip install --no-deps . \
+    && python -m pip check
+
+CMD ["quant-web", "--host", "0.0.0.0", "--port", "8765"]
