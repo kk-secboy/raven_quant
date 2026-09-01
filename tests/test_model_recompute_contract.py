@@ -100,6 +100,17 @@ def test_model_sandbox_explicitly_opts_into_ephemeral_qlib_file_tracking() -> No
     assert '"mlflow_allow_file_store": MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE' in source
 
 
+def test_model_sandbox_closes_implicit_training_run_before_governed_workflow() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
+    ).read_text(encoding="utf-8")
+    close_index = source.index("R.end_exp()")
+    governed_run_index = source.index("with qlib_workflow_run(")
+    assert "mlflow.active_run() is not None" in source
+    assert close_index < governed_run_index
+    assert "Qlib training recorder remained active after model fit" in source
+
+
 def test_live_inference_requires_an_immutable_checkpoint_before_docker(
     tmp_path: Path,
 ) -> None:

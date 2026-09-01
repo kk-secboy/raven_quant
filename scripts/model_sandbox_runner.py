@@ -284,6 +284,7 @@ def main() -> None:
     prediction_end = periods[f"{prediction_segment}_end"]
 
     import lightgbm as lgb
+    import mlflow
     import qlib
     import torch
     from qlib.contrib.evaluate import risk_analysis
@@ -292,6 +293,7 @@ def main() -> None:
     from qlib.contrib.model.pytorch_general_nn import GeneralPTNN
     from qlib.data.dataset import DatasetH, TSDatasetH
     from qlib.data.dataset.handler import DataHandlerLP
+    from qlib.workflow import R
     from qlib.workflow.record_temp import PortAnaRecord
 
     seed = int(manifest["seed"])
@@ -648,6 +650,14 @@ def main() -> None:
                 json.dumps(ridge_payload, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
             )
+    # Qlib models log training metrics through the global Recorder and lazily
+    # open a local MLflow run.  Close that implicit run through Qlib before the
+    # governed portfolio-evidence run starts; closing MLflow alone would leave
+    # Qlib's experiment manager pointing at a stale active recorder.
+    if not inference_only and mlflow.active_run() is not None:
+        R.end_exp()
+    if mlflow.active_run() is not None:
+        raise RuntimeError("Qlib training recorder remained active after model fit")
     if pytorch_engine:
         predictions = model.predict(dataset).rename("score").sort_index()
     else:
