@@ -19,7 +19,7 @@ from .model_research_governance import (
 )
 
 MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v3-cpu-tournament"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v4-cpu-tournament-16gb"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 MODEL_TEMPLATE_FILENAME = "platform_model_templates.py"
@@ -34,7 +34,8 @@ DEEP_EARLY_STOP_CAP = 3
 QLIB_EVALUATION_CONCURRENCY_CAP = 3
 TRANSFORMER_CONCURRENCY_CAP = 1
 RESERVED_SERVICE_RESOURCE_FRACTION = 0.25
-MODEL_SANDBOX_MEMORY_GB = 16
+MODEL_SANDBOX_MEMORY_GB = 40
+MODEL_QLIB_KERNELS = 3
 TOURNAMENT_SCREEN_SEED = 11
 TOURNAMENT_FULL_SEEDS = (11, 29, 47)
 GOVERNED_MODEL_ENGINES = frozenset(
@@ -303,6 +304,7 @@ def governed_model_resource_policy(
             "timeout_seconds": timeout_seconds,
             "cpu_count": 4,
             "memory_gb": MODEL_SANDBOX_MEMORY_GB,
+            "qlib_kernels": MODEL_QLIB_KERNELS,
             "network": "none",
             "date_segments_modified": False,
             "universe_modified": False,

@@ -24,7 +24,7 @@ MODEL_LABEL_HORIZON_TRADING_DAYS = 2
 MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS = 5
 LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
 MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v4-cpu-tournament-16gb"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 GOVERNED_MODEL_ENGINES = {
@@ -198,6 +198,8 @@ def main() -> None:
         raise ValueError("model sandbox requires a CPU-only policy")
     if limits.get("qlib_evaluation_concurrency_cap") != 3:
         raise ValueError("model sandbox Qlib concurrency policy is invalid")
+    if limits.get("qlib_kernels") != 3:
+        raise ValueError("model sandbox Qlib kernel policy is invalid")
     if float(limits.get("reserved_service_resource_fraction", -1.0)) != 0.25:
         raise ValueError("model sandbox service reservation policy is invalid")
     if model_engine == "platform_transformer" and limits.get("exclusive_concurrency") != 1:
@@ -318,7 +320,11 @@ def main() -> None:
         TEMPLATE_CONTRACT_VERSION,
     )
 
-    qlib.init(provider_uri=manifest["provider_uri"], region="cn")
+    qlib.init(
+        provider_uri=manifest["provider_uri"],
+        region="cn",
+        kernels=int(limits["qlib_kernels"]),
+    )
     names = list(features)
     expressions = [features[name] for name in names]
     qlib_loader: dict[str, Any] = {

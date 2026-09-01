@@ -29,6 +29,10 @@ def test_research_resource_costs_match_the_governed_queue_contract() -> None:
     assert research_job_memory_gb("rdagent_factor_report") == 8
     assert research_job_cpu_cost("rdagent_quant") == 12
     assert research_job_memory_gb("rdagent_quant") == 20
+    assert research_job_memory_gb("factor_sota_evaluate") == 40
+    assert research_job_memory_gb("model_evaluate") == 40
+    assert research_job_memory_gb("quant_bundle_evaluate") == 40
+    assert research_job_memory_gb("strategy_backtest") == 40
     assert research_job_cpu_cost("strategy_health_collect") == 4
     assert research_job_memory_gb("strategy_health_collect") == 8
     assert (

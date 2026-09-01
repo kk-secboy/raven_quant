@@ -7,6 +7,7 @@ import pytest
 
 from quant_platform.model_recompute import (
     MODEL_DATA_CONTRACT_VERSION,
+    MODEL_QLIB_KERNELS,
     MODEL_RESOURCE_POLICY_VERSION,
     MODEL_SANDBOX_MEMORY_GB,
     execute_model_candidate,
@@ -171,8 +172,10 @@ def test_governed_model_resource_policy_caps_compute_not_research_data() -> None
         "weight_decay": 1e-4,
     }
     assert screening["limits"]["timeout_seconds"] == 1800
-    assert MODEL_SANDBOX_MEMORY_GB == 16
+    assert MODEL_SANDBOX_MEMORY_GB == 40
     assert screening["limits"]["memory_gb"] == MODEL_SANDBOX_MEMORY_GB
+    assert MODEL_QLIB_KERNELS == 3
+    assert screening["limits"]["qlib_kernels"] == MODEL_QLIB_KERNELS
     assert screening["limits"]["date_segments_modified"] is False
     assert screening["limits"]["universe_modified"] is False
     assert screening["limits"]["qlib_evaluation_concurrency_cap"] == 3
