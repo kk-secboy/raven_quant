@@ -26,6 +26,7 @@ CONTROLLED_DOCUMENTS = {
     Path("docs/information-factor-refresh.md"),
     Path("docs/information-pipeline-operations.md"),
     Path("docs/legacy-market-backfill.md"),
+    Path("docs/peripheral-market-data-plan.md"),
     Path("docs/pit-nlp-gap-report.md"),
     Path("docs/financial-correctness-audit-2026-08-25.md"),
     Path("docs/qlib-rdagent-capability-audit-2026-08-25.md"),
