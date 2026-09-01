@@ -174,6 +174,8 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
             "feature_set_id": feature_set["id"],
             "feature_set_definition_sha256": feature_set["definition_sha256"],
             "feature_set": feature_set,
+            "evaluation_stage": "feature_screen",
+            "evaluation_profiles": [{"id": "recent_3y"}],
             "candidates": [
                 {
                     "id": "candidate-1",
@@ -202,3 +204,5 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
     assert manifest["research_window_contract"] == window
     assert manifest["research_window_contract_sha256"] == window_sha256
     assert manifest["label_horizon_sessions"] == 63
+    assert manifest["evaluation_stage"] == "feature_screen"
+    assert manifest["evaluation_profiles"] == [{"id": "recent_3y"}]

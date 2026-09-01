@@ -3550,6 +3550,9 @@ class LocalJobWorker:
                 "feature_set": feature_set,
                 **(
                     {
+                        "evaluation_stage": str(
+                            payload.get("evaluation_stage") or "model_full"
+                        ),
                         "research_window_contract": payload[
                             "research_window_contract"
                         ],
