@@ -18,6 +18,7 @@ from quant_data.path_utils import to_wsl_path as _to_wsl_path
 from ..feature_set_registry import get_feature_set
 from ..model_recompute import GOVERNED_MODEL_ENGINES
 from ..model_research_governance import canonical_sha256 as model_canonical_sha256
+from ..rdagent_scenarios import FROZEN_RDAGENT_SCENARIOS, get_rdagent_scenario
 from ..simulation_store import (
     build_settlement_calendar_binding,
     validate_settlement_calendar_binding,
@@ -129,6 +130,24 @@ def _require_supported_simulation_execution(
     ):
         raise ValueError(
             "pair simulation execution is retired; historical ledgers are read-only"
+        )
+
+def _require_supported_rdagent_execution(payload: dict) -> None:
+    """Fail closed for every frozen RD-Agent scenario.
+
+    Frozen scenarios keep their registry entries and historical runs, but the
+    worker is the final authority boundary: neither an old queued job nor a
+    retried cancelled job may start fin_factor, fin_model, general_model,
+    data_science, or llm_finetune execution after the freeze.  fin_strategy
+    shares the generic rdagent_run kind with general_model, so the payload
+    scenario, not the job kind, decides that case.
+    """
+
+    scenario = get_rdagent_scenario(str(payload.get("scenario") or "fin_factor"))
+    if scenario.id in FROZEN_RDAGENT_SCENARIOS:
+        raise ValueError(
+            f"RD-Agent scenario {scenario.id} is frozen; "
+            "historical runs and artifacts are read-only"
         )
 
 def _bind_daily_simulation_settlement_calendar(

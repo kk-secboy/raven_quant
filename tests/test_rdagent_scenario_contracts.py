@@ -13,6 +13,7 @@ from quant_data.config import Settings
 from quant_data.database import jobs
 from quant_platform import api
 from quant_platform import worker as worker_module
+from quant_platform.job_commands import research as job_research_module
 from quant_platform.job_store import (
     EVALUATION_STATUS_COUNTS_KEY,
     JobStore,
@@ -229,12 +230,12 @@ def test_report_worker_keeps_research_horizon_without_strategy_binding(
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
-        worker_module,
+        job_research_module,
         "probe_rdagent",
         lambda *_args, **_kwargs: {"runtime_identity": {"commit": "pinned"}},
     )
     monkeypatch.setattr(
-        worker_module,
+        job_research_module,
         "require_matching_rdagent_runtime_identity",
         lambda *_args, **_kwargs: None,
     )
@@ -243,7 +244,7 @@ def test_report_worker_keeps_research_horizon_without_strategy_binding(
         captured.update(kwargs)
         return ["rdagent"], {}
 
-    monkeypatch.setattr(worker_module, "rdagent_command", capture_command)
+    monkeypatch.setattr(job_research_module, "rdagent_command", capture_command)
 
     worker = object.__new__(LocalJobWorker)
     worker.settings = SimpleNamespace(data_root=tmp_path)
