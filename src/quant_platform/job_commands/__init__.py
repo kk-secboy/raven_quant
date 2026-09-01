@@ -11,10 +11,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from . import data
+from . import data, evaluation
 
 _COMMAND_BUILDERS = {
     **data.COMMANDS,
+    **evaluation.COMMANDS,
 }
 
 KNOWN_JOB_COMMAND_KINDS = frozenset(_COMMAND_BUILDERS)

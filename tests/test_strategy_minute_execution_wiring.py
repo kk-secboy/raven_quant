@@ -103,7 +103,7 @@ def test_worker_persists_and_passes_minute_execution_dataset(
         return "c" * 64
 
     monkeypatch.setattr(
-        "quant_platform.worker.require_transparent_baseline_runner",
+        "quant_platform.job_commands.evaluation.require_transparent_baseline_runner",
         require_runner,
     )
     execution_path = tmp_path / "qlib" / "ashare-5m"
