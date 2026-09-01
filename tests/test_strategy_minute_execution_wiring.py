@@ -52,6 +52,7 @@ def test_worker_persists_and_passes_minute_execution_dataset(
         def get_version(_version_id: str) -> dict:
             return {
                 "id": "version-1",
+                "evidence_mode": "sealed_final_oos",
                 "strategy_rules_sha256": "d" * 64,
                 "benchmark": "SH000300",
                 "universe": "cn_all",
@@ -67,6 +68,14 @@ def test_worker_persists_and_passes_minute_execution_dataset(
                         "direction": 1,
                     }
                 ],
+            }
+
+        @staticmethod
+        def get_backtest(_backtest_id: str) -> dict:
+            return {
+                "id": "backtest-1",
+                "strategy_version_id": "version-1",
+                "evidence_mode": "sealed_final_oos",
             }
 
         @staticmethod

@@ -275,6 +275,18 @@ def qlib_workflow_run(
     )
 
 
+def end_implicit_qlib_recorder() -> None:
+    """Close Qlib's implicit global recorder opened during model training.
+
+    Qlib models log training metrics through the global Recorder and lazily
+    open a local MLflow run.  Closing MLflow alone would leave Qlib's
+    experiment manager pointing at a stale active recorder, so runners must
+    end the experiment through the recorder itself.
+    """
+
+    _load_qlib_recorder().end_exp()
+
+
 def require_qlib_workflow_identity(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ValueError("Qlib Workflow/Recorder identity is required")

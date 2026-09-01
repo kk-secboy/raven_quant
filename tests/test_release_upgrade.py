@@ -1262,8 +1262,9 @@ def test_governed_sandboxes_are_network_free_and_reuse_pinned_worker() -> None:
     assert "python -m pip check" in worker
     assert "from qlib.contrib.strategy import TopkDropoutStrategy" in worker
     assert "--no-build-isolation --no-deps --force-reinstall /opt/qlib" in worker
-    assert worker.rfind("python -m pip check") > worker.rfind("python -m pip install .")
-    final_worker_gate = worker[worker.rfind("python -m pip install .") :]
+    app_install = 'python -m pip install --index-url "${APP_PIP_INDEX_URL}" .'
+    assert worker.rfind("python -m pip check") > worker.rfind(app_install)
+    final_worker_gate = worker[worker.rfind(app_install) :]
     assert "np.__version__ == '1.26.4'" in final_worker_gate
     assert "torch.__version__ == '2.2.2+cpu'" in final_worker_gate
     assert "torch.version.cuda is None" in final_worker_gate

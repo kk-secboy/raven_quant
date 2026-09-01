@@ -19,6 +19,7 @@ from quant_platform.qlib_portfolio_calendar import (  # noqa: E402
     resolve_qlib_portfolio_calendar_boundary,
 )
 from quant_platform.qlib_workflow import (  # noqa: E402
+    end_implicit_qlib_recorder,
     qlib_workflow_run,
     qlib_workflow_tracking_uri,
 )
@@ -419,7 +420,6 @@ def main() -> None:
     from qlib.contrib.model.pytorch_general_nn import GeneralPTNN
     from qlib.data.dataset import DatasetH, TSDatasetH
     from qlib.data.dataset.handler import DataHandlerLP
-    from qlib.workflow import R
     from qlib.workflow.record_temp import PortAnaRecord
 
     seed = int(manifest["seed"])
@@ -814,7 +814,7 @@ def main() -> None:
     # governed portfolio-evidence run starts; closing MLflow alone would leave
     # Qlib's experiment manager pointing at a stale active recorder.
     if not inference_only and mlflow.active_run() is not None:
-        R.end_exp()
+        end_implicit_qlib_recorder()
     if mlflow.active_run() is not None:
         raise RuntimeError("Qlib training recorder remained active after model fit")
     memory_stages.append(

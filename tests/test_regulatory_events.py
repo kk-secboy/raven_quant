@@ -248,6 +248,7 @@ def _eligibility_snapshot(tmp_path: Path, *, with_anns_d: bool) -> Path:
                 {
                     "ts_code": "000001.SZ",
                     "ann_date": "2023-10-09",
+                    "f_ann_date": "2023-10-09",
                     "total_hldr_eqy_exc_min_int": 10_000_000.0,
                 }
             ]
@@ -261,6 +262,7 @@ def _eligibility_snapshot(tmp_path: Path, *, with_anns_d: bool) -> Path:
                 {
                     "ts_code": "000001.SZ",
                     "ann_date": "2023-10-09",
+                    "f_ann_date": "2023-10-09",
                     "audit_result": "standard_unqualified",
                 }
             ]

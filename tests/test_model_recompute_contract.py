@@ -249,7 +249,7 @@ def test_model_sandbox_closes_implicit_training_run_before_governed_workflow() -
     source = (
         Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
     ).read_text(encoding="utf-8")
-    close_index = source.index("R.end_exp()")
+    close_index = source.index("end_implicit_qlib_recorder()")
     governed_run_index = source.index("with qlib_workflow_run(")
     assert "mlflow.active_run() is not None" in source
     assert close_index < governed_run_index

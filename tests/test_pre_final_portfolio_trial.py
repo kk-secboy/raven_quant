@@ -35,7 +35,14 @@ def _model_periods() -> dict[str, str | int]:
 
 
 def test_default_model_execution_mode_remains_formal_final_oos() -> None:
-    assert _evaluation_mode({}) == FORMAL_FINAL_OOS_MODE
+    # The default mode is unchanged, but a formal final OOS run is fail-closed:
+    # it must carry sealed evidence authority instead of an empty manifest.
+    with pytest.raises(ValueError, match="sealed_final_oos evidence mode"):
+        _evaluation_mode({})
+    assert (
+        _evaluation_mode({"evidence_mode": "sealed_final_oos"})
+        == FORMAL_FINAL_OOS_MODE
+    )
     authorization = _model_execution_authorization(
         evaluation_mode=FORMAL_FINAL_OOS_MODE,
         candidate_manifest=_candidate(),

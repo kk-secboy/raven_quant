@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from pydantic import ValidationError
 from qlib_test_doubles import qlib_workflow_identity
@@ -8,6 +9,10 @@ from qlib_test_doubles import qlib_workflow_identity
 from quant_platform.api import (
     StrategyConfigRequest,
     _rebind_strategy_execution_contract,
+)
+from quant_platform.formal_validation import (
+    build_paired_bootstrap_evidence_from_daily_returns,
+    paired_bootstrap_parameters_from_config,
 )
 from quant_platform.strategy_artifact_manifest import (
     write_backtest_artifact_manifest,
@@ -147,6 +152,7 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     }
     version = {
         "id": "version-1",
+        "evidence_mode": "sealed_final_oos",
         "benchmark": "SH000300",
         "universe": "cn_all",
         "config": dict(config),
@@ -163,6 +169,7 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     }
     backtest = {
         "dataset": "snapshot-1",
+        "evidence_mode": "sealed_final_oos",
         "periods": {
             "start": "2024-01-01",
             "end": "2026-07-10",
@@ -174,6 +181,9 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     manifest = {
         "strategy_version_id": version["id"],
         "dataset": backtest["dataset"],
+        "evidence_mode": "sealed_final_oos",
+        "evaluation_mode": "formal_final_oos",
+        "final_oos_opened": True,
         "benchmark": version["benchmark"],
         "universe": version["universe"],
         "periods": {
@@ -204,15 +214,34 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    daily_returns = pd.DataFrame(
+        {
+            "return": [0.001 + 0.0001 * (index % 7) for index in range(40)],
+            "cost": [0.0002] * 40,
+            "bench": [0.0005 + 0.0001 * (index % 5) for index in range(40)],
+        }
+    )
+    daily_returns.to_parquet(tmp_path / "daily_returns.parquet", index=False)
+    paired_bootstrap = build_paired_bootstrap_evidence_from_daily_returns(
+        daily_returns,
+        parameters=paired_bootstrap_parameters_from_config(config),
+    )
     artifact_manifest = write_backtest_artifact_manifest(tmp_path)
     metrics = {
+        "evidence_mode": "sealed_final_oos",
+        "evaluation_mode": "formal_final_oos",
+        "final_oos_opened": True,
         "formal_validation": {
             "pre_final_history": {
                 "requested_periods": manifest["historical_validation_periods"],
                 "final_test_periods": manifest["periods"],
-            }
+            },
+            "paired_block_bootstrap": paired_bootstrap,
         },
         "provenance": {
+            "evidence_mode": "sealed_final_oos",
+            "evaluation_mode": "formal_final_oos",
+            "final_oos_opened": True,
             "artifact_manifest_version": artifact_manifest["version"],
             "artifact_manifest_sha256": artifact_manifest["sha256"],
             "artifact_manifest_file_count": artifact_manifest["file_count"],
