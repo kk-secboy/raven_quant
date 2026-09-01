@@ -12,6 +12,8 @@ from quant_platform.rdagent_candidate_store import RDAGentCandidateStore
 from quant_platform.research_execution_cadence import (
     build_research_execution_cadence_contract,
 )
+from quant_platform.research_horizon import SWING_1_6M, research_horizon_contract
+from quant_platform.research_label_binding import resolve_research_label_binding
 from quant_platform.research_store import ResearchStore
 from quant_platform.research_tournament import canonical_sha256
 from quant_platform.worker import LocalJobWorker
@@ -38,12 +40,55 @@ class _CapturingTournamentStore:
         self.completed.append((tournament_id, values))
 
 
+def _label_binding() -> dict:
+    horizon = research_horizon_contract(SWING_1_6M)
+    feature_set = {
+        "id": "qlib-alpha158",
+        "definition_sha256": "f" * 64,
+        "features": {"close": {"expression": "$close"}},
+    }
+    periods = {
+        "train_start": "2018-01-02",
+        "train_end": "2022-12-30",
+        "valid_start": "2023-01-03",
+        "valid_end": "2023-12-29",
+        "test_start": "2024-07-02",
+        "test_end": "2026-08-20",
+    }
+    window = {
+        "contract_version": "research-window-v1",
+        "horizon_profile": SWING_1_6M,
+        "horizon_contract_sha256": horizon.sha256,
+        "label_horizons_sessions": list(horizon.label_horizons_sessions),
+        "purge_sessions": horizon.purge_sessions,
+        "embargo_sessions": horizon.embargo_sessions,
+        "label_maturity_enforced": True,
+        "dataset_name": "sealed-dataset",
+        "dataset_identity_sha256": "d" * 64,
+        "feature_set_id": feature_set["id"],
+        "feature_set_sha256": feature_set["definition_sha256"],
+        "periods": periods,
+    }
+    return resolve_research_label_binding(
+        {
+            "horizon_profile": SWING_1_6M,
+            "dataset": "sealed-dataset",
+            "dataset_identity_sha256": "d" * 64,
+            "periods": periods,
+            "feature_set": feature_set,
+            "research_window_contract": window,
+            "research_window_contract_sha256": canonical_sha256(window),
+        }
+    )
+
+
 def _model_job(run_id: str, *, attempts: int = 1) -> dict:
     feature_set = {
         "id": "qlib-alpha158",
         "definition_sha256": "f" * 64,
         "features": {"close": {"expression": "$close"}},
     }
+    binding = _label_binding()
     return {
         "id": "model-evaluate-job-1",
         "kind": "model_evaluate",
@@ -61,24 +106,15 @@ def _model_job(run_id: str, *, attempts: int = 1) -> dict:
             "research_window_contract": {"contract_version": "research-window-v1"},
             "research_window_contract_sha256": "w" * 64,
             "label_horizon_sessions": 2,
+            "research_label_binding": binding,
+            "research_label_binding_sha256": binding["binding_sha256"],
             "candidates": [],
         },
     }
 
 
 def _quant_binding() -> dict:
-    return {
-        "horizon_profile": "swing_1_6m",
-        "periods": {
-            "train": ["2018-01-01", "2022-12-31"],
-            "valid": ["2023-01-01", "2023-12-31"],
-            "test": ["2024-01-01", "2024-12-31"],
-        },
-        "research_window_contract": {"contract_version": "research-window-v1"},
-        "research_window_contract_sha256": "w" * 64,
-        "label_horizon_sessions": 20,
-        "binding_sha256": "b" * 64,
-    }
+    return _label_binding()
 
 
 def _quant_job(
@@ -115,6 +151,8 @@ def _quant_job(
             "not_capital_confirmation": True,
             "cross_cycle_fwer_claimed": False,
             "final_oos_opened": False,
+            "research_label_binding": binding,
+            "research_label_binding_sha256": binding["binding_sha256"],
             "candidates": [
                 {
                     "id": "quant-candidate-1",
@@ -183,6 +221,17 @@ def _write_result(path: Path, result: dict) -> bytes:
     return content
 
 
+def _model_result(*, attempt: str) -> dict:
+    cadence = build_research_execution_cadence_contract(SWING_1_6M)
+    return {
+        "status": "ok",
+        "evaluations": [],
+        "attempt": attempt,
+        "research_execution_cadence": cadence,
+        "research_execution_cadence_sha256": cadence["evidence_sha256"],
+    }
+
+
 @pytest.mark.no_database
 def test_model_evaluation_registers_content_archive_not_retry_workspace(
     tmp_path: Path,
@@ -209,7 +258,7 @@ def test_model_evaluation_registers_content_archive_not_retry_workspace(
     assert working_result != legacy_result
     assert working_result.parent.parent.name == "attempts"
     assert str(working_result) in command
-    result = {"status": "ok", "evaluations": [], "attempt": "new"}
+    result = _model_result(attempt="new")
     content = _write_result(working_result, result)
 
     worker._import_model_evaluations(job, result, working_result)
@@ -339,7 +388,7 @@ def test_model_evaluation_retry_preserves_registered_and_legacy_artifacts(
 
     _command, first_working, _environment = worker._command(job)
     assert first_working is not None
-    first_result = {"status": "ok", "evaluations": [], "attempt": "first"}
+    first_result = _model_result(attempt="first")
     first_content = _write_result(first_working, first_result)
     worker._import_model_evaluations(job, first_result, first_working)
 
@@ -348,7 +397,7 @@ def test_model_evaluation_retry_preserves_registered_and_legacy_artifacts(
     _command, retry_working, _environment = worker._command(job)
     assert retry_working is not None
     assert retry_working != first_working
-    retry_result = {"status": "ok", "evaluations": [], "attempt": "retry"}
+    retry_result = _model_result(attempt="retry")
     retry_content = _write_result(retry_working, retry_result)
     worker._import_model_evaluations(job, retry_result, retry_working)
 
