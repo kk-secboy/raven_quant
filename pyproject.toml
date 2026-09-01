@@ -48,6 +48,9 @@ quant-web = "quant_platform.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/quant_data", "src/quant_platform"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/baseline_model_stub.py" = "quant_platform/_artifacts/baseline_model_stub.py"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

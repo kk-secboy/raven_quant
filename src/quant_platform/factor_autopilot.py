@@ -15,6 +15,7 @@ from quant_data.database import (
     research_runs,
 )
 
+from .baseline_model_stub_resource import resolve_governed_baseline_model_stub
 from .cost_model import CostModelConfig
 from .factor_library_store import (
     FactorLibraryStore,
@@ -938,9 +939,7 @@ class FactorAutopilotService:
                         "label_horizon_days": label_horizon_sessions,
                     }
                 )
-        stub = self.project_root / "scripts" / "baseline_model_stub.py"
-        if not stub.is_file():
-            raise ValueError("factor SOTA frozen LightGBM stub is unavailable")
+        stub = resolve_governed_baseline_model_stub(self.project_root)
         recipe = {
             "contract_version": FACTOR_SOTA_MODEL_CONTRACT_VERSION,
             "kind": "governed_lightgbm_factor_ablation",

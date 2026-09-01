@@ -19,6 +19,7 @@ from quant_data.database import (
     research_runs,
 )
 
+from .baseline_model_stub_resource import resolve_governed_baseline_model_stub
 from .feature_set_registry import get_feature_set
 from .job_store import JobStore
 from .rdagent_candidate_store import RDAGentCandidateStore
@@ -349,9 +350,7 @@ class PlatformModelTournamentService:
             if str(existing_run.status) in {"failed", "cancelled"}:
                 raise ValueError("failed platform model tournament requires explicit retry")
 
-        stub_path = self.project_root / "scripts" / "baseline_model_stub.py"
-        if not stub_path.is_file():
-            raise ValueError("governed platform model stub is unavailable")
+        stub_path = resolve_governed_baseline_model_stub(self.project_root)
         with self.engine.connect() as connection:
             artifact_row = connection.execute(
                 select(research_run_artifacts).where(
