@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RDAGENT_PYTHON=/usr/local/bin/python \
     RDAGENT_COMMAND=/usr/local/bin/rdagent \
     QLIB_PYTHON=/usr/local/bin/python \
-    WORKER_JOB_KINDS=rdagent_factor,rdagent_run \
+    WORKER_JOB_KINDS=rdagent_run \
     MODEL_CoSTEER_env_type=docker \
     RDAGENT_COMMIT=${RDAGENT_COMMIT}
 

@@ -54,8 +54,8 @@ def test_all_cpu_research_workers_share_one_host_budget() -> None:
         encoding="utf-8"
     )
 
-    assert compose.count('RESEARCH_CPU_BUDGET: "24"') == 7
-    assert compose.count('RESEARCH_MEMORY_BUDGET_GB: "40"') == 7
+    assert compose.count('RESEARCH_CPU_BUDGET: "24"') == 6
+    assert compose.count('RESEARCH_MEMORY_BUDGET_GB: "40"') == 6
     assert 'WORKER_JOB_KINDS: model_refit,recommendation_refresh,' in compose
 
 

@@ -38,7 +38,6 @@ from quant_data.database import (
     strategies,
     strategy_events,
     strategy_factors,
-    strategy_forward_gates,
     strategy_health_snapshots,
     strategy_pairs,
     strategy_versions,
@@ -90,19 +89,12 @@ from quant_platform.forward_only_rehabilitation import (
     EVIDENCE_MODE_SEALED,
     audit_incomplete_family_artifacts,
     build_incomplete_family_eligibility,
-    build_qualification,
-    incomplete_family_eligibility_for_version,
     insert_incomplete_family_eligibility,
-    insert_qualification,
     register_terminal_cash_only_receipt,
-    rehabilitation_forward_thresholds,
     require_consumed_vintage,
     require_incomplete_family_eligibility,
     require_replay_config,
     require_replay_markers,
-)
-from quant_platform.forward_only_rehabilitation import (
-    canonical_sha256 as rehabilitation_canonical_sha256,
 )
 from quant_platform.horizon_factor_bundle import validate_horizon_factor_bundle
 from quant_platform.model_ensemble import prediction_grid_from_admission
@@ -5400,34 +5392,12 @@ class StrategyStore:
         version = self.get_version(version_id)
         if str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY) == EVIDENCE_MODE_REPLAY:
             raise ValueError(
-                "consumed historical replay requires the dedicated forward-only admission"
+                "consumed historical replay versions are read-only and cannot be approved"
             )
         return self._approve_version(
             version_id,
             actor=actor,
             reason=reason,
-            allow_forward_only_rehabilitation=False,
-        )
-
-    def admit_forward_only_rehabilitation(
-        self,
-        version_id: str,
-        *,
-        actor: str,
-        reason: str,
-    ) -> dict[str, Any]:
-        """Admit one exact descriptive replay into the existing forward paper stage."""
-
-        version = self.get_version(version_id)
-        if str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY) != EVIDENCE_MODE_REPLAY:
-            raise ValueError(
-                "forward-only rehabilitation admission requires consumed historical replay"
-            )
-        return self._approve_version(
-            version_id,
-            actor=actor,
-            reason=reason,
-            allow_forward_only_rehabilitation=True,
         )
 
     def _approve_version(
@@ -5436,7 +5406,6 @@ class StrategyStore:
         *,
         actor: str,
         reason: str,
-        allow_forward_only_rehabilitation: bool,
     ) -> dict[str, Any]:
         if not actor.strip() or len(reason.strip()) < 10:
             raise ValueError("actor and a meaningful approval reason are required")
@@ -5451,27 +5420,11 @@ class StrategyStore:
             raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
         evidence_mode = str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY)
-        replay_admission = evidence_mode == EVIDENCE_MODE_REPLAY
-        if replay_admission is not allow_forward_only_rehabilitation:
-            raise ValueError("strategy approval evidence mode is not authorized by this action")
         if version.get("strategy_type") == "multifactor":
             if evidence_mode not in {EVIDENCE_MODE_SEALED, EVIDENCE_MODE_REPLAY}:
                 raise ValueError("multifactor strategy evidence authority is ambiguous")
             if backtests[0].get("evidence_mode") != evidence_mode:
                 raise ValueError("strategy and backtest evidence authority differ")
-        if replay_admission:
-            require_replay_config(config)
-            for label, value in (
-                ("metrics", metrics),
-                ("provenance", metrics.get("provenance") or {}),
-            ):
-                require_replay_markers(value, label=f"historical replay {label}")
-                if value.get("final_oos_opened") is not True:
-                    raise ValueError(
-                        "historical replay must admit that its consumed window was opened"
-                    )
-            if metrics.get("capital_eligible") is not False:
-                raise ValueError("historical replay must be explicitly capital-ineligible")
         conservative_incomplete_family = (
             _valid_factor_score_incomplete_family_alternative(version, metrics)
         )
@@ -5504,10 +5457,6 @@ class StrategyStore:
             == "autopilot-completion-v1"
             or bool(source_research_artifact_id)
         )
-        if replay_admission and requires_capital_oos_receipt:
-            raise ValueError(
-                "forward-only rehabilitation cannot reuse a capital OOS or research admission"
-            )
         if requires_capital_oos_receipt:
             try:
                 receipt = require_capital_oos_receipt(
@@ -5981,29 +5930,6 @@ class StrategyStore:
                 backtests_root=backtest_artifact_root.parent,
             )
         now = _now()
-        replay_gate = None
-        replay_criteria: dict[str, Any] | None = None
-        if replay_admission:
-            from .promotion import (
-                ForwardGateThresholds,
-                build_forward_gate_criteria,
-                forward_gate_thresholds_for_horizon,
-            )
-
-            replay_gate = ForwardGateThresholds(
-                **rehabilitation_forward_thresholds(
-                    asdict(
-                        forward_gate_thresholds_for_horizon(
-                            str(version["horizon_profile"])
-                        )
-                    )
-                )
-            )
-            replay_criteria = build_forward_gate_criteria(
-                horizon_profile=str(version["horizon_profile"]),
-                horizon_contract_sha256=str(version["horizon_contract_sha256"]),
-                thresholds=replay_gate,
-            )
         with self.engine.begin() as connection:
             locked_version = connection.execute(
                 select(strategy_versions)
@@ -6029,10 +5955,6 @@ class StrategyStore:
                 or str(locked_backtest.status) != "succeeded"
             ):
                 raise ValueError("approval backtest changed during approval")
-            fresh_hypothesis = self.hypothesis_group_evidence(
-                version_id,
-                connection=connection,
-            )
             fresh_family_failures = self._hypothesis_group_manifest_failures(
                 version_id,
                 backtests[0],
@@ -6043,28 +5965,6 @@ class StrategyStore:
                     "strategy trial family changed during approval: "
                     + "; ".join(fresh_family_failures)
                 )
-            if replay_admission:
-                frozen_eligibility = incomplete_family_eligibility_for_version(
-                    connection,
-                    strategy_version_id=version_id,
-                    hypothesis_group_evidence=fresh_hypothesis,
-                )
-                formal = dict(locked_backtest.metrics_json or {}).get(
-                    "formal_validation"
-                )
-                multiple = (
-                    formal.get("multiple_testing")
-                    if isinstance(formal, Mapping)
-                    else None
-                )
-                if (
-                    not isinstance(multiple, Mapping)
-                    or multiple.get("eligibility_receipt_sha256")
-                    != frozen_eligibility["receipt_sha256"]
-                ):
-                    raise ValueError(
-                        "conservative statistics do not bind the frozen family eligibility"
-                    )
             from .promotion import require_horizon_challenger_capacity
 
             require_horizon_challenger_capacity(
@@ -6158,43 +6058,6 @@ class StrategyStore:
                     )
                 )
                 activated_model_artifact_id = str(artifact.id)
-            rehabilitation_receipt: dict[str, Any] | None = None
-            if replay_admission:
-                if replay_gate is None or replay_criteria is None:
-                    raise ValueError("forward-only rehabilitation gate was not frozen")
-                locked_version_value = row_dict(locked_version)
-                locked_version_value["config"] = dict(locked_version.config_json or {})
-                locked_backtest_value = row_dict(locked_backtest)
-                locked_backtest_value["periods"] = dict(
-                    locked_backtest.periods_json or {}
-                )
-                locked_backtest_value["metrics"] = dict(
-                    locked_backtest.metrics_json or {}
-                )
-                rehabilitation_receipt = insert_qualification(
-                    connection,
-                    build_qualification(
-                        connection,
-                        version=locked_version_value,
-                        backtest=locked_backtest_value,
-                        forward_criteria=replay_criteria,
-                        created_by=actor,
-                    ),
-                    created_at=now,
-                )
-                connection.execute(
-                    insert(strategy_forward_gates).values(
-                        strategy_version_id=version_id,
-                        **asdict(replay_gate),
-                        criteria_json=replay_criteria,
-                        criteria_sha256=rehabilitation_canonical_sha256(
-                            replay_criteria
-                        ),
-                        registered_by=actor.strip(),
-                        registered_at=now,
-                        updated_at=now,
-                    )
-                )
             connection.execute(
                 update(strategy_versions)
                 .where(strategy_versions.c.id == version_id)
@@ -6240,17 +6103,7 @@ class StrategyStore:
                         if activated_model_artifact_id is not None
                         else {}
                     ),
-                    **(
-                        {
-                            "evidence_mode": EVIDENCE_MODE_REPLAY,
-                            "authority": "historical_description_only",
-                            "forward_only_receipt_sha256": rehabilitation_receipt[
-                                "receipt_sha256"
-                            ],
-                        }
-                        if rehabilitation_receipt is not None
-                        else {"evidence_mode": evidence_mode}
-                    ),
+                    "evidence_mode": evidence_mode,
                 },
             )
         # Design 6.11/7.4: candidate -> paper is automatic once the formal

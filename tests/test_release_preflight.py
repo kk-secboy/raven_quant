@@ -332,9 +332,11 @@ def test_default_and_gpu_service_contracts() -> None:
     default = type("Context", (), {"profiles": ()})()
     gpu = type("Context", (), {"profiles": ("gpu",)})()
 
-    assert "rdagent-data-science-worker" in release_preflight.expected_services(default)
+    assert "rdagent-data-science-worker" not in release_preflight.expected_services(
+        default
+    )
     assert "rdagent-llm-finetune-worker" not in release_preflight.expected_services(default)
-    assert "rdagent-llm-finetune-worker" in release_preflight.expected_services(gpu)
+    assert "rdagent-llm-finetune-worker" not in release_preflight.expected_services(gpu)
 
 
 def test_immutable_image_contract_is_profile_aware(
@@ -353,7 +355,6 @@ def test_immutable_image_contract_is_profile_aware(
             (
                 f"RDAGENT_RUNTIME_IMAGE_DIGEST=sha256:{digest}",
                 f"RDAGENT_QLIB_SANDBOX_IMAGE=example/qlib@sha256:{digest}",
-                f"RDAGENT_DATA_SCIENCE_IMAGE=example/ds@sha256:{digest}",
                 f"MODEL_SANDBOX_IMAGE=example/model@sha256:{digest}",
             )
         )
@@ -369,20 +370,6 @@ def test_immutable_image_contract_is_profile_aware(
     )
     assert valid is False
     assert "RDAGENT_FINETUNE_IMAGE" in evidence
-
-    content = env_file.read_text(encoding="utf-8")
-    env_file.write_text(
-        content.replace(
-            f"RDAGENT_DATA_SCIENCE_IMAGE=example/ds@sha256:{digest}",
-            f"RDAGENT_DATA_SCIENCE_IMAGE=example/qlib@sha256:{digest}",
-        ),
-        encoding="utf-8",
-    )
-    valid, evidence = _REAL_IMMUTABLE_IMAGE_CONFIGURATION(
-        SimpleNamespace(env_file=env_file, profiles=())  # type: ignore[arg-type]
-    )
-    assert valid is False
-    assert "separately sealed" in evidence
 
 
 @pytest.mark.parametrize(
@@ -401,7 +388,6 @@ def test_preloaded_runtime_requires_every_rdagent_worker_to_share_canonical_imag
     env_file.write_text(
         f"RDAGENT_RUNTIME_IMAGE_DIGEST={runtime_id}\n"
         f"RDAGENT_QLIB_SANDBOX_IMAGE=registry/qlib@sha256:{'b' * 64}\n"
-        f"RDAGENT_DATA_SCIENCE_IMAGE=registry/data-science@sha256:{'c' * 64}\n"
         f"MODEL_SANDBOX_IMAGE=registry/model@sha256:{'d' * 64}\n",
         encoding="utf-8",
     )
@@ -435,7 +421,7 @@ def test_preloaded_runtime_requires_every_rdagent_worker_to_share_canonical_imag
                 "--format",
             )
             return "\n".join(
-                ("sha256:" + character * 64) for character in ("b", "c", "d")
+                ("sha256:" + character * 64) for character in ("b", "d")
             )
 
     valid, evidence = _REAL_PRELOADED_IMAGE_AVAILABILITY(

@@ -145,7 +145,6 @@ def test_prepare_sandbox_removes_loopback_tags_when_sealing_fails(
         "-f",
         f"{prefix}/worker-sandbox-base:20260829t120000z",
         f"{prefix}/qlib-sandbox:20260829t120000z",
-        f"{prefix}/data-science-sandbox:20260829t120000z",
         f"{prefix}/model-sandbox:20260829t120000z",
     ) in context.calls
 
@@ -1029,14 +1028,14 @@ def test_backup_reuse_restarts_old_writers_when_queue_race_is_detected(
     assert set(start_call[1:]) == {"api", "worker"}
 
 
-def test_release_build_targets_cover_data_science_and_optional_gpu() -> None:
+def test_release_build_targets_exclude_retired_scenario_workers() -> None:
     context = FakeContext()
     gpu_context = FakeContext()
     gpu_context.profiles = ("gpu",)
 
-    assert "rdagent-data-science-worker" in release_upgrade._built_services(context)  # type: ignore[arg-type]
+    assert "rdagent-data-science-worker" not in release_upgrade._built_services(context)  # type: ignore[arg-type]
     assert "rdagent-llm-finetune-worker" not in release_upgrade._built_services(context)  # type: ignore[arg-type]
-    assert "rdagent-llm-finetune-worker" in release_upgrade._built_services(gpu_context)  # type: ignore[arg-type]
+    assert "rdagent-llm-finetune-worker" not in release_upgrade._built_services(gpu_context)  # type: ignore[arg-type]
 
 
 def test_rollback_disables_a_service_absent_from_the_previous_release(
@@ -1056,7 +1055,7 @@ def test_rollback_disables_a_service_absent_from_the_previous_release(
     }
 
 
-def test_rollback_context_removes_gpu_profile_when_old_worker_is_absent(
+def test_rollback_context_keeps_profiles_without_profile_scoped_services(
     tmp_path: Path,
 ) -> None:
     env_file = tmp_path / ".env"
@@ -1080,7 +1079,7 @@ def test_rollback_context_removes_gpu_profile_when_old_worker_is_absent(
         disabled_services=frozenset({"rdagent-data-science-worker"}),
     )
 
-    assert rollback.profiles == ()
+    assert rollback.profiles == ("gpu",)
     assert rollback.compose_files[-1] == override_file.resolve()
     assert data_science_only.profiles == ("gpu",)
 
@@ -1235,7 +1234,6 @@ def test_governed_sandboxes_are_network_free_and_reuse_pinned_worker() -> None:
     )
     for directory in (
         "qlib-sandbox",
-        "data-science-sandbox",
         "model-sandbox",
     ):
         dockerfile = (root / "deploy" / directory / "Dockerfile").read_text(
@@ -1754,7 +1752,7 @@ def test_rollback_restore_refuses_to_continue_while_new_writer_runs() -> None:
     class RunningWriterContext(FakeContext):
         def docker(self, *args: str, **_kwargs) -> str:
             self.calls.append(("docker", *args))
-            return "rdagent-data-science-worker"
+            return "rdagent-quant-worker"
 
     context = RunningWriterContext()
 
@@ -1918,9 +1916,7 @@ def test_release_upgrade_restores_backup_and_old_images_on_failed_acceptance(
     def rollback(_context, old_context, backup_directory, rollback_tags, **kwargs):
         assert old_context == rollback_context
         assert rollback_tags == tags
-        assert kwargs["disabled_services"] == frozenset(
-            {"rdagent-data-science-worker"}
-        )
+        assert kwargs["disabled_services"] == frozenset()
         rollbacks.append(backup_directory)
         return {"schema_revision": "0019", "images": tags}
 

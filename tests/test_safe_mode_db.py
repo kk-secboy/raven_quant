@@ -282,14 +282,6 @@ def test_safe_mode_blocks_recommendations_and_simulation_orders(
             target_version="v1",
             actor="operator-a",
         )
-    with pytest.raises(SafeModeActiveError, match="safe_mode"):
-        simulations.create_pair_batch_from_backtest(
-            "missing",
-            backtest_id="missing",
-            trade_date=date(2026, 7, 21),
-            data_root=tmp_path,
-            actor="operator-a",
-        )
 
 
 def test_safe_mode_allows_read_and_recovery_paths(

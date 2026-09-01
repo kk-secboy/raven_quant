@@ -275,7 +275,7 @@ def test_non_idle_queue_blocks_before_any_mutation(tmp_path: Path) -> None:
     assert all(args[0] == "exec" for _source, args in context.calls)
 
 
-def test_enabled_profile_adds_its_shared_optional_runtime(tmp_path: Path) -> None:
+def test_enabled_profile_adds_no_optional_runtime(tmp_path: Path) -> None:
     context = FakeContext(tmp_path, profiles=("gpu",))
 
     result = canonical_baseline.converge_canonical_baseline(
@@ -284,9 +284,7 @@ def test_enabled_profile_adds_its_shared_optional_runtime(tmp_path: Path) -> Non
     )
 
     assert result["status"] == "dry_run"
-    assert set(result["required_services"]) == set(CORE_RUNTIME_SERVICES).union(
-        OPTIONAL_PROFILE_SERVICES["gpu"]
-    )
+    assert set(result["required_services"]) == set(CORE_RUNTIME_SERVICES)
 
 
 def test_confirmed_convergence_pins_images_and_writes_chained_receipt(

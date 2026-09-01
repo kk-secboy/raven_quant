@@ -118,7 +118,7 @@ def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
     assert "quantlab-upgrade-drill-api-runtime:deadbeef" in rendered
     assert "quantlab-upgrade-drill-scheduler-runtime:deadbeef" in rendered
     assert rendered.count("quantlab-upgrade-drill-worker-runtime:deadbeef") == 4
-    assert rendered.count("quantlab-upgrade-drill-rdagent-runtime:deadbeef") == 5
+    assert rendered.count("quantlab-upgrade-drill-rdagent-runtime:deadbeef") == 4
     assert not any(
         image.startswith("quantlab-platform-")
         or image in {"quantlab-worker-runtime:v2", "quantlab-rdagent-runtime:v2"}
@@ -228,10 +228,10 @@ def test_compose_bounds_every_service_log_file() -> None:
     assert "x-logging: &default-logging" in compose
     assert "max-size: ${LOG_MAX_SIZE:-20m}" in compose
     assert "max-file: ${LOG_MAX_FILES:-5}" in compose
-    assert compose.count("logging: *default-logging") == 15
+    assert compose.count("logging: *default-logging") == 13
     assert compose.count(
         "${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}"
-    ) == 11
+    ) == 9
 
 
 def test_paper_lifecycle_has_a_reserved_worker_lane() -> None:

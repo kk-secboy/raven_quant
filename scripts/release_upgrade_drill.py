@@ -86,7 +86,6 @@ def _write_candidate_runtime_override(
             "rdagent-model-worker",
             "rdagent-report-worker",
             "rdagent-quant-worker",
-            "rdagent-data-science-worker",
         ),
         "web": ("web",),
     }

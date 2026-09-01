@@ -81,7 +81,6 @@ def test_every_built_service_has_an_explicit_stable_image_alias() -> None:
         == aliases["rdagent-model-worker"]
         == aliases["rdagent-report-worker"]
         == aliases["rdagent-quant-worker"]
-        == aliases["rdagent-data-science-worker"]
     )
 
 
@@ -90,10 +89,10 @@ def test_compose_stamps_every_stateless_runtime_with_release_identity() -> None:
     text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
 
     assert "x-release-environment: &release-environment" in text
-    assert text.count("<<: *release-environment") == 12
+    assert text.count("<<: *release-environment") == 10
     assert text.count("environment: *release-environment") == 2
     assert "x-release-labels: &release-labels" in text
-    assert text.count("labels: *release-labels") == 14
+    assert text.count("labels: *release-labels") == 12
     for variable, label in RELEASE_IDENTITY_ENV_TO_LABEL.items():
         assert f"  {variable}: ${{{variable}:-}}" in text
         assert f"  {label}: ${{{variable}:-}}" in text

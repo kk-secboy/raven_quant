@@ -1798,14 +1798,6 @@ class SimulationOrderPlanGenerationRequest(BaseModel):
         return self
 
 
-class PairSimulationReplayRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    backtest_id: str = Field(min_length=1, max_length=200)
-    trade_date: date
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
 class SimulationNavReviewRequest(BaseModel):
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
     evidence_sha256: str = Field(min_length=64, max_length=64)
@@ -5794,19 +5786,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             )
             worker.notify()
         return batch
-
-    @app.post(
-        "/api/simulation-portfolios/{portfolio_id}/pair-replays",
-        status_code=202,
-    )
-    def create_pair_simulation_replay(
-        portfolio_id: str, payload: PairSimulationReplayRequest, request: Request
-    ) -> dict:
-        del portfolio_id, payload, request
-        raise HTTPException(
-            410,
-            "pair simulation writes are retired; Autopilot is long-only",
-        )
 
     @app.get("/api/simulation-portfolios/{portfolio_id}")
     def get_simulation_portfolio(portfolio_id: str) -> dict:

@@ -3,6 +3,28 @@
 This module does not introduce another promotion or simulation lifecycle.  It
 only proves that one exact historical replay is descriptive evidence and
 freezes the stricter criteria for the existing forward paper stage.
+
+Current status (2026-09, weight-reduction phase 3b): the standalone
+transparent-baseline line has been deleted and the admission entry point
+(``StrategyStore.admit_forward_only_rehabilitation``) is gone, so no new
+replay admissions can occur.  The module is still a *live* dependency and
+cannot be deleted yet:
+
+- ``worker`` and ``scripts/run_multifactor_backtest.py`` use
+  ``EVIDENCE_MODE_REPLAY``/``EVIDENCE_MODE_SEALED``, ``REPLAY_MARKERS``,
+  ``require_replay_config``/``require_replay_markers`` and the
+  incomplete-family eligibility helpers on the live formal-OOS backtest path.
+- ``strategy_store`` uses the ``EVIDENCE_MODE_*`` constants plus the
+  incomplete-family and consumed-vintage validators during approval and
+  backtest admission.
+- ``promotion`` and ``simulation_store`` use ``EVIDENCE_MODE_REPLAY`` and
+  ``require_qualification`` to handle historical replay versions read-only.
+- ``deployment_readiness`` uses the ``TERMINAL_CASH_ONLY_*`` constants and
+  ``require_terminal_cash_only_receipt`` for readiness checks.
+
+A future refactor should move the evidence-mode constants and the
+incomplete-family/replay validators into a small neutral module before this
+file can be removed.
 """
 
 from __future__ import annotations

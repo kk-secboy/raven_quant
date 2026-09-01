@@ -59,14 +59,11 @@ services:
       RUN_EMBEDDED_WORKER: "false"
       QLIB_WORKER_URL: http://evaluation-worker:8770
       RDAGENT_WORKER_URL: http://rdagent-worker:8770
-      RDAGENT_GPU_WORKER_URL: http://rdagent-llm-finetune-worker:8770
-      RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
       RDAGENT_EVALUATION_WORKER_URL: http://evaluation-worker:8770
       SCHEDULER_URL: http://scheduler:8780
       RDAGENT_ENABLED: "true"
       RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
       RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
-      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
       MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
       RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB: ${RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB:-16384}
       RDAGENT_FINETUNE_MIN_DISK_GB: ${RDAGENT_FINETUNE_MIN_DISK_GB:-50}
@@ -126,13 +123,10 @@ services:
       STALE_JOB_HOURS: ${STALE_JOB_HOURS:-6}
       QLIB_WORKER_URL: http://evaluation-worker:8770
       RDAGENT_WORKER_URL: http://rdagent-worker:8770
-      RDAGENT_GPU_WORKER_URL: http://rdagent-llm-finetune-worker:8770
-      RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
       RDAGENT_EVALUATION_WORKER_URL: http://evaluation-worker:8770
       RDAGENT_ENABLED: "true"
       RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
       RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
-      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
       MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
       RDAGENT_FINETUNE_IMAGE: ${RDAGENT_FINETUNE_IMAGE:-}
       RDAGENT_FINETUNE_BENCHMARK_IMAGE: ${RDAGENT_FINETUNE_BENCHMARK_IMAGE:-}
@@ -397,9 +391,7 @@ services:
       RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
       RDAGENT_DOCKER_SHARED_ROOT: /data
       RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
-      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
       RDAGENT_EVALUATION_WORKER_URL: http://evaluation-worker:8770
-      RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
       MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
       RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -408,7 +400,7 @@ services:
       FACTOR_COSTEER_PYTHON_BIN: python /app/scripts/run_factor_codegen_sandbox.py
       FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
-      WORKER_JOB_KINDS: rdagent_factor,rdagent_run
+      WORKER_JOB_KINDS: rdagent_run
       RESEARCH_CPU_BUDGET: "24"
       RESEARCH_MEMORY_BUDGET_GB: "40"
     volumes:
@@ -559,104 +551,6 @@ services:
       api:
         condition: service_healthy
       rdagent-docker:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 90s
-
-  rdagent-data-science-worker:
-    image: quantlab-rdagent-runtime:v2
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.rdagent
-      args:
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
-    restart: unless-stopped
-    cpus: "8.0"
-    mem_limit: 16g
-    logging: *default-logging
-    labels: *release-labels
-    environment:
-      <<: *release-environment
-      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
-      DATA_ROOT: /data
-      DOCKER_HOST: tcp://rdagent-docker:2375
-      RDAGENT_ENABLED: "true"
-      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
-      RDAGENT_DOCKER_SHARED_ROOT: /data
-      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
-      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
-      RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
-      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
-      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
-      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
-      WORKER_JOB_KINDS: rdagent_data_science
-      RESEARCH_CPU_BUDGET: "24"
-      RESEARCH_MEMORY_BUDGET_GB: "40"
-    volumes:
-      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
-    depends_on:
-      api:
-        condition: service_healthy
-      rdagent-docker:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 90s
-
-  rdagent-llm-finetune-worker:
-    profiles: ["gpu"]
-    image: quantlab-rdagent-finetune-runtime:v2
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.rdagent
-      args:
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
-    restart: unless-stopped
-    logging: *default-logging
-    labels: *release-labels
-    gpus: all
-    environment:
-      <<: *release-environment
-      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
-      DATA_ROOT: /data
-      # The GPU profile intentionally uses the host daemon. Unlike the regular
-      # isolated DinD service, it must have NVIDIA Toolkit/CDI configured.
-      DOCKER_HOST: unix:///var/run/docker.sock
-      RDAGENT_ENABLED: "true"
-      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
-      RDAGENT_DOCKER_SHARED_ROOT: ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}
-      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
-      RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB: ${RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB:-16384}
-      RDAGENT_FINETUNE_MIN_DISK_GB: ${RDAGENT_FINETUNE_MIN_DISK_GB:-50}
-      RDAGENT_FINETUNE_IMAGE: ${RDAGENT_FINETUNE_IMAGE:-}
-      RDAGENT_FINETUNE_BENCHMARK_IMAGE: ${RDAGENT_FINETUNE_BENCHMARK_IMAGE:-}
-      RDAGENT_FINETUNE_GPU_PROBE_IMAGE: ${RDAGENT_FINETUNE_GPU_PROBE_IMAGE:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
-      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
-      WORKER_JOB_KINDS: rdagent_llm_finetune
-    volumes:
-      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
-      # Mount the same source at its host-visible absolute path. RD-Agent sends
-      # absolute bind sources to the host Docker daemon for nested sandboxes.
-      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      api:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]

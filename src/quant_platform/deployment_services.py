@@ -17,15 +17,12 @@ CORE_RUNTIME_SERVICES = frozenset(
         "rdagent-model-worker",
         "rdagent-report-worker",
         "rdagent-quant-worker",
-        "rdagent-data-science-worker",
         "web",
         "gateway",
     }
 )
 
-OPTIONAL_PROFILE_SERVICES = {
-    "gpu": frozenset({"rdagent-llm-finetune-worker"}),
-}
+OPTIONAL_PROFILE_SERVICES: dict[str, frozenset[str]] = {}
 
 # Services whose images are built from this immutable release.  All aliases of
 # the shared worker/RD-Agent images are named so Compose recreates every
@@ -40,13 +37,10 @@ BUILT_APPLICATION_SERVICES = (
     "rdagent-model-worker",
     "rdagent-report-worker",
     "rdagent-quant-worker",
-    "rdagent-data-science-worker",
     "web",
 )
 
-PROFILE_BUILT_SERVICES = {
-    "gpu": ("rdagent-llm-finetune-worker",),
-}
+PROFILE_BUILT_SERVICES: dict[str, tuple[str, ...]] = {}
 
 # Stop every component capable of mutating PostgreSQL, governed data, research
 # artifacts, or the nested execution daemon before a coordinated backup.  The
@@ -61,8 +55,6 @@ WRITER_SERVICES = (
     "rdagent-model-worker",
     "rdagent-report-worker",
     "rdagent-quant-worker",
-    "rdagent-data-science-worker",
-    "rdagent-llm-finetune-worker",
     "rdagent-docker",
     "api",
 )

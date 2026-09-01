@@ -37,7 +37,6 @@ _IMMUTABLE_IMAGE_REFERENCE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 _CORE_IMAGE_SETTINGS = {
     "RDAGENT_RUNTIME_IMAGE_DIGEST": _RUNTIME_IMAGE_DIGEST,
     "RDAGENT_QLIB_SANDBOX_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
-    "RDAGENT_DATA_SCIENCE_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
     "MODEL_SANDBOX_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
 }
 _GPU_IMAGE_SETTINGS = {
@@ -50,7 +49,6 @@ _SHARED_RDAGENT_RUNTIME_SERVICES = (
     "rdagent-model-worker",
     "rdagent-report-worker",
     "rdagent-quant-worker",
-    "rdagent-data-science-worker",
 )
 
 
@@ -128,11 +126,6 @@ def _immutable_image_configuration(context: ComposeContext) -> tuple[bool, str]:
             invalid.append(name)
     if invalid:
         return False, "missing or mutable image identity: " + ", ".join(sorted(invalid))
-    if (
-        configured["RDAGENT_QLIB_SANDBOX_IMAGE"].lower()
-        == configured["RDAGENT_DATA_SCIENCE_IMAGE"].lower()
-    ):
-        return False, "Qlib and Data Science must use separately sealed sandbox images"
     return True, "all required runtime and sandbox images use immutable digests"
 
 
@@ -141,8 +134,6 @@ def _preloaded_image_availability(context: ComposeContext) -> tuple[bool, str]:
         configured = _deployment_environment(context)
         expected_runtime = configured["RDAGENT_RUNTIME_IMAGE_DIGEST"].lower()
         runtime_services = list(_SHARED_RDAGENT_RUNTIME_SERVICES)
-        if "gpu" in set(getattr(context, "profiles", ())):
-            runtime_services.append("rdagent-llm-finetune-worker")
         mismatched_runtime: list[str] = []
         for service in runtime_services:
             container_id = context.container_id(service)
@@ -164,7 +155,6 @@ def _preloaded_image_availability(context: ComposeContext) -> tuple[bool, str]:
                 configured[name]
                 for name in (
                     "RDAGENT_QLIB_SANDBOX_IMAGE",
-                    "RDAGENT_DATA_SCIENCE_IMAGE",
                     "MODEL_SANDBOX_IMAGE",
                 )
             )

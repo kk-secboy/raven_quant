@@ -129,43 +129,6 @@ def test_unified_simulation_has_only_governed_sources_and_two_adapters() -> None
         assert marker not in SIMULATION_SOURCE
 
 
-def test_pair_replay_write_api_is_retired_and_cannot_restart_shorting() -> None:
-    block = _class_block(API_SOURCE, "PairSimulationReplayRequest")
-    assert 'ConfigDict(extra="forbid")' in block
-    assert "backtest_id:" in block
-    assert "trade_date:" in block
-    assert "actor:" in block
-    for forbidden in (
-        "target_payload",
-        "source_snapshot_id",
-        "execution_contract_hash",
-        "annual_borrow_rate",
-        "target_quantity",
-    ):
-        assert forbidden not in block
-    assert (
-        '"/api/simulation-portfolios/{portfolio_id}/pair-replays"' in API_SOURCE
-    )
-    endpoint = API_SOURCE.split("def create_pair_simulation_replay", 1)[1].split(
-        '@app.get("/api/simulation-portfolios/{portfolio_id}")', 1
-    )[0]
-    assert "HTTPException(" in endpoint
-    assert "410" in endpoint
-    assert "Autopilot is long-only" in endpoint
-    assert "create_pair_batch_from_backtest" not in endpoint
-    assert (
-        "pair simulation batches must be derived from an approved immutable "
-        in SIMULATION_SOURCE
-    )
-    for marker in (
-        "resolve_snapshot_dataset(",
-        "--shortability-path",
-        "--shortability-source-sha256",
-        "--shortability-manifest-sha256",
-    ):
-        assert marker in WORKER_SOURCE
-
-
 def test_pair_shadow_is_not_part_of_the_automatic_capital_line() -> None:
     tick = SCHEDULER_SOURCE.split("def tick", 1)[1].split(
         "def _enqueue_due_factor_library_materialization", 1

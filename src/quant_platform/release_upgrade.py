@@ -43,14 +43,11 @@ from .release_preflight import (
 )
 
 BUILT_SERVICES = BUILT_APPLICATION_SERVICES
-INTRODUCED_SERVICES = {
-    "rdagent-data-science-worker",
-    "rdagent-llm-finetune-worker",
-}
+INTRODUCED_SERVICES: set[str] = set()
 _ROLLBACK_SERVICES = tuple(
     sorted(
         LEGACY_EXPECTED_SERVICES.union(BUILT_SERVICES).union(
-            PROFILE_BUILT_SERVICES["gpu"]
+            PROFILE_BUILT_SERVICES.get("gpu", ())
         )
     )
 )
@@ -64,7 +61,6 @@ _REGISTRY_PORT = 55000
 _QLIB_COMMIT = "d5379c520f66a39953bad76234a7019a72796fd0"
 _GOVERNED_SANDBOX_CONTEXTS = {
     "qlib": "qlib-sandbox",
-    "data_science": "data-science-sandbox",
     "model": "model-sandbox",
 }
 
@@ -909,20 +905,16 @@ def _prepare_sandbox_images(
     host_base_repository = f"{host_registry}/quantlab/worker-sandbox-base"
     host_base_tag = f"{host_base_repository}:{release_tag}"
     host_qlib_repository = f"{host_registry}/quantlab/qlib-sandbox"
-    host_data_science_repository = f"{host_registry}/quantlab/data-science-sandbox"
     host_model_repository = f"{host_registry}/quantlab/model-sandbox"
     host_qlib_tag = f"{host_qlib_repository}:{release_tag}"
-    host_data_science_tag = f"{host_data_science_repository}:{release_tag}"
     host_model_tag = f"{host_model_repository}:{release_tag}"
     host_published_tags = (
         host_base_tag,
         host_qlib_tag,
-        host_data_science_tag,
         host_model_tag,
     )
     dind_base_repository = f"{dind_registry}/quantlab/worker-sandbox-base"
     dind_qlib_repository = f"{dind_registry}/quantlab/qlib-sandbox"
-    dind_data_science_repository = f"{dind_registry}/quantlab/data-science-sandbox"
     dind_model_repository = f"{dind_registry}/quantlab/model-sandbox"
     image_timeout = max(wait_timeout, 3600)
 
@@ -977,15 +969,6 @@ def _prepare_sandbox_images(
             dind_repository=dind_qlib_repository,
             timeout=image_timeout,
             build_args=(f"QLIB_SANDBOX_BASE_IMAGE={host_base_image}",),
-        )
-        data_science_image = _build_and_publish_host_image(
-            context,
-            context_root=project_root.resolve() / "deploy" / "data-science-sandbox",
-            host_image_tag=host_data_science_tag,
-            host_repository=host_data_science_repository,
-            dind_repository=dind_data_science_repository,
-            timeout=image_timeout,
-            build_args=(f"DATA_SCIENCE_SANDBOX_BASE_IMAGE={host_base_image}",),
         )
         model_image = _build_and_publish_host_image(
             context,
@@ -1051,17 +1034,6 @@ def _prepare_sandbox_images(
         )
         _dind_smoke(
             context,
-            data_science_image,
-            (
-                "python",
-                "-c",
-                "import matplotlib, numpy, pandas, seaborn, sklearn, xgboost; "
-                "assert matplotlib and numpy and pandas and seaborn and sklearn and xgboost",
-            ),
-            timeout=image_timeout,
-        )
-        _dind_smoke(
-            context,
             model_image,
             (
                 "python",
@@ -1077,7 +1049,6 @@ def _prepare_sandbox_images(
             "RDAGENT_RUNTIME_IMAGE_DIGEST": runtime_image_id,
             "QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST": sandbox_base_image_id,
             "RDAGENT_QLIB_SANDBOX_IMAGE": qlib_image,
-            "RDAGENT_DATA_SCIENCE_IMAGE": data_science_image,
             "MODEL_SANDBOX_IMAGE": model_image,
         }
         _update_environment(context.env_file, sealed)

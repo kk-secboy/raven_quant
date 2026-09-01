@@ -6,6 +6,28 @@ backtest happens to start first prevent the other two from ever running.  This
 module instead freezes the complete three-member family before any final OOS
 is opened.  Every member still has a one-shot vintage; the joint binding only
 allows the three predeclared, different-horizon windows to coexist.
+
+Current status (2026-09, weight-reduction phase 3b): the standalone
+transparent-baseline line (bootstrap scheduler, repair registrars, interruption
+recovery runner) has been deleted; the public baselines survive only as
+control groups inside the managed ``fin_strategy`` competition.  This module
+is nevertheless still a *live* dependency and cannot be deleted yet:
+
+- ``forward_only_rehabilitation`` imports ``BOOTSTRAP_CONFIG_KEY``,
+  ``LOCKBOX_CONFIG_KEY``, ``lockbox_member_link``, ``validate_joint_lockbox``,
+  ``validate_unopened_history_selection`` and ``canonical_sha256``.
+- ``strategy_store`` imports ``baseline_oos_sealed_member_set``,
+  ``validate_lockbox_link`` and ``validate_repair_registry_binding`` for the
+  sealed member-set / pre-result repair evidence paths.
+- ``strategy_trial_lineage`` lazily imports
+  ``validate_pre_result_repair_audit_event``.
+- ``deployment_readiness`` imports the ``ALL_UNAVAILABLE_CASH_ONLY_*``
+  constants, ``LOCKBOX_CONFIG_KEY``, ``LOCKBOX_CONTRACT_VERSION_V3``,
+  ``validate_all_unavailable_cash_only_audit_event`` and
+  ``validate_joint_lockbox`` for readiness checks over historical records.
+
+A future refactor should lift the symbols the live paths actually need into a
+small neutral module before this file can be removed.
 """
 
 from __future__ import annotations

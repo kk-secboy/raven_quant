@@ -5623,51 +5623,6 @@ class LocalJobWorker:
                 manifest,
                 minute_dataset,
             )
-            pair_plan = manifest.get("governed_pair_plan")
-            shortability_dataset = None
-            if manifest.get("execution_adapter") == "pair":
-                if not isinstance(pair_plan, dict):
-                    raise ValueError("pair simulation replay has no governed artifact plan")
-                minute_binding = pair_plan.get("minute_dataset")
-                shortability_binding = pair_plan.get("shortability_dataset")
-                if not isinstance(minute_binding, dict) or not isinstance(
-                    shortability_binding, dict
-                ):
-                    raise ValueError("pair replay artifact has incomplete Tushare bindings")
-                snapshot_name = str(pair_plan.get("execution_snapshot") or "")
-                resolved_minute = resolve_snapshot_dataset(
-                    self.settings.data_root,
-                    snapshot_name=snapshot_name,
-                    dataset_name=str(minute_binding.get("dataset_name") or ""),
-                )
-                shortability_dataset = resolve_snapshot_dataset(
-                    self.settings.data_root,
-                    snapshot_name=snapshot_name,
-                    dataset_name=str(shortability_binding.get("dataset_name") or ""),
-                )
-                for resolved, binding, label in (
-                    (resolved_minute, minute_binding, "minute"),
-                    (shortability_dataset, shortability_binding, "shortability"),
-                ):
-                    if resolved["manifest_sha256"] != binding.get("manifest_sha256") or resolved[
-                        "source_sha256"
-                    ] != binding.get("source_sha256"):
-                        raise ValueError(
-                            f"pair replay {label} snapshot no longer matches "
-                            "the approved backtest artifact"
-                        )
-                minute_provenance = dict(minute_dataset.get("provenance") or {})
-                if (
-                    minute_provenance.get("snapshot_name") != snapshot_name
-                    or minute_provenance.get("snapshot_manifest_sha256")
-                    != resolved_minute["manifest_sha256"]
-                    or str(minute_binding.get("dataset_name") or "")
-                    not in set(minute_provenance.get("source_datasets") or [])
-                ):
-                    raise ValueError(
-                        "pair simulation Qlib minute dataset is not derived from "
-                        "the approved Tushare execution snapshot"
-                    )
             output = (
                 self.settings.data_root
                 / "artifacts"
@@ -5708,44 +5663,31 @@ class LocalJobWorker:
                 ]
             )
             dividend_dataset = None
-            if manifest.get("execution_adapter") != "pair":
-                daily_dataset = datasets.get(manifest["daily_dataset"])
-                daily_provenance = (
-                    dict(daily_dataset.get("provenance") or {}) if daily_dataset else {}
-                )
-                dividend_snapshot_name = str(daily_provenance.get("snapshot_name") or "")
-                if dividend_snapshot_name:
-                    try:
-                        resolved_dividend = resolve_snapshot_dataset(
-                            self.settings.data_root,
-                            snapshot_name=dividend_snapshot_name,
-                            dataset_name="dividend",
+            daily_dataset = datasets.get(manifest["daily_dataset"])
+            daily_provenance = (
+                dict(daily_dataset.get("provenance") or {}) if daily_dataset else {}
+            )
+            dividend_snapshot_name = str(daily_provenance.get("snapshot_name") or "")
+            if dividend_snapshot_name:
+                try:
+                    resolved_dividend = resolve_snapshot_dataset(
+                        self.settings.data_root,
+                        snapshot_name=dividend_snapshot_name,
+                        dataset_name="dividend",
+                    )
+                except (FileNotFoundError, ValueError, KeyError):
+                    resolved_dividend = None
+                if resolved_dividend is not None:
+                    expected_manifest = str(
+                        daily_provenance.get("snapshot_manifest_sha256") or ""
+                    )
+                    if expected_manifest and expected_manifest != str(
+                        resolved_dividend["manifest_sha256"]
+                    ):
+                        raise ValueError(
+                            "dividend snapshot no longer matches the bound daily dataset"
                         )
-                    except (FileNotFoundError, ValueError, KeyError):
-                        resolved_dividend = None
-                    if resolved_dividend is not None:
-                        expected_manifest = str(
-                            daily_provenance.get("snapshot_manifest_sha256") or ""
-                        )
-                        if expected_manifest and expected_manifest != str(
-                            resolved_dividend["manifest_sha256"]
-                        ):
-                            raise ValueError(
-                                "dividend snapshot no longer matches the bound daily dataset"
-                            )
-                        dividend_dataset = resolved_dividend
-            if shortability_dataset is not None:
-                shortability_path = Path(shortability_dataset["dataset_path"])
-                command.extend(
-                    [
-                        "--shortability-path",
-                        _to_wsl_path(shortability_path) if is_wsl else str(shortability_path),
-                        "--shortability-source-sha256",
-                        str(shortability_dataset["source_sha256"]),
-                        "--shortability-manifest-sha256",
-                        str(shortability_dataset["manifest_sha256"]),
-                    ]
-                )
+                    dividend_dataset = resolved_dividend
             if dividend_dataset is not None:
                 dividend_path = Path(dividend_dataset["dataset_path"])
                 command.extend(
