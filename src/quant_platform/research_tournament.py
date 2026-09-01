@@ -9,14 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
+    autopilot_branches,
+    jobs,
     model_candidates,
     model_ensemble_candidates,
     model_ensemble_evaluations,
     open_database,
+    research_runs,
     research_tournament_trials,
     research_tournaments,
     row_dict,
@@ -26,6 +29,7 @@ from .feature_set_registry import get_feature_set
 from .model_ensemble import (
     MODEL_ENSEMBLE_EVALUATION_CONTRACT_VERSION,
     prediction_grid_from_admission,
+    validate_model_ensemble_label_contract,
 )
 from .model_research_governance import (
     REQUIRED_MODEL_SEEDS,
@@ -34,8 +38,21 @@ from .model_research_governance import (
     require_model_metric_gate,
     validate_run_multiple_testing_evidence,
 )
+from .research_execution_cadence import (
+    build_research_execution_cadence_contract,
+    validate_research_execution_cadence_contract,
+)
 
 FEATURE_SCREEN_IDS = ("qlib-alpha158", "qlib-alpha360", "platform-seed-v1")
+FEATURE_SET_COMMON_WINDOW_POLICY_VERSION = "feature-set-common-window-policy-v1"
+FEATURE_SET_COMMON_WINDOW_POLICY: dict[str, Any] = {
+    "contract_version": FEATURE_SET_COMMON_WINDOW_POLICY_VERSION,
+    "candidate_scope": "all_preregistered_feature_sets",
+    "field_scope": "union",
+    "calendar_policy": "latest_common_continuous_field_coverage",
+    "identical_periods_within_horizon": True,
+    "missing_history_policy": "exclude_sessions_fail_closed_never_zero_backfill",
+}
 MODEL_FAMILIES: dict[str, dict[str, Any]] = {
     "ridge": {
         "engine": "ridge_baseline",
@@ -78,6 +95,12 @@ RESEARCH_SCREENING_MARKERS: dict[str, bool] = {
     "cross_cycle_fwer_claimed": False,
     "final_oos_opened": False,
 }
+_REMEDIABLE_TOURNAMENT_STATUSES = frozenset({"planned", "running", "failed", "blocked"})
+_TERMINAL_BRANCH_STATUSES = frozenset({"succeeded", "failed", "blocked", "skipped"})
+_TERMINAL_RESEARCH_RUN_STATUSES = frozenset(
+    {"succeeded", "failed", "blocked", "cancelled"}
+)
+_TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 QUANT_SCREENING_ABLATIONS = ("factor_only", "model_only", "joint")
 
 
@@ -204,6 +227,7 @@ def build_preregistered_manifest(
                 "seeds": list(FULL_SEEDS),
             },
         },
+        "feature_set_window_policy": dict(FEATURE_SET_COMMON_WINDOW_POLICY),
         "ensemble": {
             "combiner": "equal_rank",
             "candidate_limit": ENSEMBLE_MAX_CANDIDATES,
@@ -596,6 +620,172 @@ class ResearchTournamentStore:
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
 
+    @staticmethod
+    def _settle_operational_source(
+        connection: Any,
+        *,
+        source_tournament_id: str,
+        operational_trial_ids: Sequence[str],
+    ) -> None:
+        """Lock every owner and freeze a quiescent operational source.
+
+        The source ledger is not immutable merely because one trial failed.
+        Other source branches may still be executing and may legitimately
+        append their terminal evidence.  Lock the tournament first, then each
+        bound branch, ResearchRun, and job so a concurrent retry cannot reopen
+        old work between this check and successor preregistration.  A live
+        ``planned``/``running`` tournament whose owners are all terminal is
+        atomically settled as ``blocked``; this is the normal recovery shape
+        after an evaluator returned an operational result.
+        """
+
+        source = connection.execute(
+            select(research_tournaments)
+            .where(research_tournaments.c.id == source_tournament_id)
+            .with_for_update()
+        ).first()
+        if source is None:
+            raise KeyError(source_tournament_id)
+        source_status = str(source.status)
+        if source_status not in _REMEDIABLE_TOURNAMENT_STATUSES:
+            raise ValueError(
+                "operational remediation source tournament is not remediable"
+            )
+        normalized_operational_ids = sorted(
+            {str(item) for item in operational_trial_ids if str(item)}
+        )
+        if not normalized_operational_ids:
+            raise ValueError(
+                "operational remediation source has no frozen operational trials"
+            )
+        frozen_operational_rows = connection.execute(
+            select(
+                research_tournament_trials.c.id,
+                research_tournament_trials.c.status,
+            )
+            .where(
+                research_tournament_trials.c.tournament_id
+                == source_tournament_id,
+                research_tournament_trials.c.id.in_(normalized_operational_ids),
+            )
+            .order_by(research_tournament_trials.c.id)
+            .with_for_update()
+        ).all()
+        if (
+            [str(item.id) for item in frozen_operational_rows]
+            != normalized_operational_ids
+            or any(str(item.status) != "failed" for item in frozen_operational_rows)
+        ):
+            raise ValueError(
+                "operational remediation source trial settlement changed"
+            )
+
+        cycle_branches = connection.execute(
+            select(autopilot_branches)
+            .where(autopilot_branches.c.cycle_id == str(source.cycle_id))
+            .order_by(autopilot_branches.c.id)
+            .with_for_update()
+        ).all()
+        bound_branches = []
+        for branch in cycle_branches:
+            details = dict(branch.details_json or {})
+            bound_tournament_ids = {
+                str(details.get("tournament_id") or ""),
+                str(details.get("research_tournament_id") or ""),
+            }
+            if source_tournament_id in bound_tournament_ids:
+                bound_branches.append(branch)
+        if not bound_branches:
+            raise ValueError(
+                "operational remediation source tournament has no bound branches"
+            )
+
+        for branch in bound_branches:
+            if str(branch.status) not in _TERMINAL_BRANCH_STATUSES:
+                raise ValueError(
+                    "operational remediation source branch is not terminal"
+                )
+            run_id = str(branch.research_run_id or "")
+            branch_job_id = str(branch.job_id or "")
+            if not run_id or not branch_job_id:
+                raise ValueError(
+                    "operational remediation source branch ownership is incomplete"
+                )
+            run = connection.execute(
+                select(research_runs)
+                .where(research_runs.c.id == run_id)
+                .with_for_update()
+            ).first()
+            if run is None:
+                raise ValueError(
+                    "operational remediation source research run is missing"
+                )
+            if str(run.status) not in _TERMINAL_RESEARCH_RUN_STATUSES:
+                raise ValueError(
+                    "operational remediation source research run is not terminal"
+                )
+            current_job_id = str(run.job_id or "")
+            if not current_job_id:
+                raise ValueError(
+                    "operational remediation source research run has no bound job"
+                )
+            required_job_ids = {branch_job_id, current_job_id}
+            related_jobs = connection.execute(
+                select(jobs)
+                .where(
+                    or_(
+                        jobs.c.id.in_(sorted(required_job_ids)),
+                        jobs.c.payload_json["research_run_id"].as_string() == run_id,
+                    )
+                )
+                .order_by(jobs.c.id)
+                .with_for_update()
+            ).all()
+            observed_job_ids = {str(item.id) for item in related_jobs}
+            if not required_job_ids.issubset(observed_job_ids):
+                raise ValueError("operational remediation source job is missing")
+            if any(
+                str(item.status) not in _TERMINAL_JOB_STATUSES
+                for item in related_jobs
+            ):
+                raise ValueError(
+                    "operational remediation source job is not terminal"
+                )
+
+        if source_status in {"planned", "running"}:
+            prior_evidence = dict(source.multiple_testing_json or {})
+            prior_evidence_sha256 = str(source.multiple_testing_sha256 or "") or None
+            if prior_evidence and (
+                prior_evidence_sha256 != canonical_sha256(prior_evidence)
+            ):
+                raise ValueError(
+                    "operational remediation source tournament evidence changed"
+                )
+            settlement = {
+                "contract_version": "model-tournament-operational-settlement-v1",
+                "reason_code": "operational_execution_failure",
+                "source_status": source_status,
+                "operational_trial_ids": normalized_operational_ids,
+                "all_bound_branches_runs_and_jobs_terminal": True,
+                "performance_triggered": False,
+                "prior_tournament_evidence": prior_evidence or None,
+                "prior_tournament_evidence_sha256": prior_evidence_sha256,
+            }
+            connection.execute(
+                update(research_tournaments)
+                .where(
+                    research_tournaments.c.id == source_tournament_id,
+                    research_tournaments.c.status == source_status,
+                )
+                .values(
+                    status="blocked",
+                    multiple_testing_json=settlement,
+                    multiple_testing_sha256=canonical_sha256(settlement),
+                    updated_at=_utcnow(),
+                    finished_at=_utcnow(),
+                )
+            )
+
     def ensure_preregistered(
         self,
         *,
@@ -655,6 +845,145 @@ class ResearchTournamentStore:
         except IntegrityError:
             pass
         return self.get_for_cycle(cycle_id)
+
+    def ensure_operational_remediation_preregistered(
+        self,
+        *,
+        source_tournament_id: str,
+        source_executor_version: str,
+        target_executor_version: str,
+    ) -> dict[str, Any]:
+        """Create one immutable, current-contract successor experiment family.
+
+        An execution or resource failure is not an investment result.  The old
+        tournament and all of its evidence remain immutable, while every static
+        hypothesis is preregistered again with a new trial ID.  No old candidate,
+        metric, or selection is inherited because the successor uses the current
+        common-window contract and is a new multiple-testing family.
+        """
+
+        source_executor = str(source_executor_version).strip()
+        target_executor = str(target_executor_version).strip()
+        if not source_executor or not target_executor or source_executor == target_executor:
+            raise ValueError("operational remediation requires a changed executor version")
+        source = self.get_tournament(source_tournament_id)
+        if str(source.get("stage") or "") != "feature_screen":
+            raise ValueError("only the primary model tournament may open remediation")
+        operational_trials = [
+            item
+            for item in source["trials"]
+            if str(item.get("status") or "") == "failed"
+            and (
+                str((item.get("metrics") or {}).get("reason_code") or "")
+                in {
+                    "resource_blocked",
+                    "operational_failure",
+                    "screen_execution_failed",
+                    "execution_failed_after_retry",
+                }
+                or (item.get("evidence") or {}).get("investment_hypothesis_rejected")
+                is False
+            )
+        ]
+        if not operational_trials:
+            raise ValueError("tournament has no operational trial eligible for remediation")
+        operational_ids = sorted(str(item["id"]) for item in operational_trials)
+        source_manifest = dict(source.get("manifest") or {})
+        frozen_trial_names = {
+            str(item.get("name") or "") for item in source_manifest.get("trials") or []
+        }
+        source_trials = [
+            item for item in source["trials"] if str(item.get("name") or "") in frozen_trial_names
+        ]
+        if not source_trials or len(source_trials) != len(frozen_trial_names):
+            raise ValueError("source tournament preregistered family is incomplete")
+        remediation = {
+            "contract_version": "model-operational-remediation-v1",
+            "source_tournament_id": str(source["id"]),
+            "source_tournament_manifest_sha256": str(source["manifest_sha256"]),
+            "source_executor_version": source_executor,
+            "target_executor_version": target_executor,
+            "operational_source_trial_ids": operational_ids,
+            "performance_triggered": False,
+            "same_hypotheses_and_frozen_specs": True,
+            "contract_upgrade": True,
+            "same_frozen_evaluation_contract": False,
+            "all_trials_re_preregistered": True,
+            "new_multiple_testing_family": True,
+            "final_oos_opened": False,
+        }
+        manifest = {
+            **source_manifest,
+            "contract_version": "model-tournament-operational-remediation-v1",
+            "feature_set_window_policy": dict(FEATURE_SET_COMMON_WINDOW_POLICY),
+            "operational_remediation": remediation,
+        }
+        manifest_sha = canonical_sha256(manifest)
+        now = _utcnow()
+        tournament_id = uuid.uuid4().hex
+        try:
+            with self.engine.begin() as connection:
+                self._settle_operational_source(
+                    connection,
+                    source_tournament_id=str(source["id"]),
+                    operational_trial_ids=operational_ids,
+                )
+                connection.execute(
+                    insert(research_tournaments).values(
+                        id=tournament_id,
+                        cycle_id=str(source["cycle_id"]),
+                        # The primary tournament owns ``feature_screen`` and
+                        # champion revalidation owns ``model_screen``.  The
+                        # complete operational successor therefore uses the
+                        # otherwise-unused ``model_full`` ledger stage.
+                        stage="model_full",
+                        dataset_identity_sha256=str(source["dataset_identity_sha256"]),
+                        status="planned",
+                        manifest_json=manifest,
+                        manifest_sha256=manifest_sha,
+                        max_trials=int(source["max_trials"]),
+                        selected_trial_ids_json=[],
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                for source_trial in source_trials:
+                    connection.execute(
+                        insert(research_tournament_trials).values(
+                            id=uuid.uuid4().hex,
+                            tournament_id=tournament_id,
+                            branch_id=None,
+                            trial_kind=str(source_trial["trial_kind"]),
+                            name=str(source_trial["name"]),
+                            feature_set_id=source_trial.get("feature_set_id"),
+                            feature_set_definition_sha256=source_trial.get(
+                                "feature_set_definition_sha256"
+                            ),
+                            model_family=source_trial.get("model_family"),
+                            candidate_id=None,
+                            status="preregistered",
+                            spec_json=dict(source_trial.get("spec") or {}),
+                            spec_sha256=str(source_trial["spec_sha256"]),
+                            metrics_json=None,
+                            evidence_json=None,
+                            evidence_sha256=None,
+                            resource_json=dict(source_trial.get("resource") or {}),
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+        except IntegrityError:
+            pass
+        existing = self.get_for_cycle_stage(str(source["cycle_id"]), "model_full")
+        if (
+            str(existing.get("manifest_sha256") or "") != manifest_sha
+            or str(existing.get("dataset_identity_sha256") or "")
+            != str(source["dataset_identity_sha256"])
+        ):
+            raise ValueError(
+                "another operational model remediation is already frozen for this cycle"
+            )
+        return existing
 
     def ensure_champion_revalidation_preregistered(
         self,
@@ -1625,6 +1954,7 @@ class ResearchTournamentStore:
             ):
                 raise ValueError("ensemble execution environment evidence changed")
             component_grids: dict[str, dict[str, Any]] = {}
+            component_label_bindings: dict[str, dict[str, Any]] = {}
             for component in row.components_json or []:
                 model = connection.execute(
                     select(model_candidates).where(
@@ -1644,7 +1974,46 @@ class ResearchTournamentStore:
                     != str(component.get("prediction_grid_sha256") or "")
                 ):
                     raise ValueError("ensemble component evidence drifted")
-                component_grids[str(model.id)] = grid
+                model_manifest = dict(model.manifest_json or {})
+                label_binding = model_manifest.get("research_label_binding")
+                if (
+                    not isinstance(label_binding, Mapping)
+                    or model_manifest.get("research_label_binding_sha256")
+                    != label_binding.get("binding_sha256")
+                ):
+                    raise ValueError("ensemble component has no frozen label binding")
+                member_id = str(model.id)
+                component_grids[member_id] = grid
+                component_label_bindings[member_id] = dict(label_binding)
+            label_contract = validate_model_ensemble_label_contract(
+                evidence_value.get("ensemble_label_contract") or {},
+                member_bindings=component_label_bindings,
+            )
+            label_identity = dict(label_contract["label_identity"])
+            expected_cadence = build_research_execution_cadence_contract(
+                str(label_identity["horizon_profile"])
+            )
+            observed_cadence = validate_research_execution_cadence_contract(
+                evidence_value.get("research_execution_cadence") or {},
+                expected_horizon_profile=str(label_identity["horizon_profile"]),
+            )
+            reference_grid = next(iter(component_grids.values()), None)
+            if (
+                evidence_value.get("ensemble_label_contract_sha256")
+                != label_contract["evidence_sha256"]
+                or reference_grid is None
+                or label_identity["dataset_name"] != str(row.dataset)
+                or label_identity["dataset_identity_sha256"]
+                != str(row.dataset_identity_sha256)
+                or dict(label_identity["periods"])
+                != dict(
+                    reference_grid["profiles"]["recent_3y"]["periods"]
+                )
+                or observed_cadence != expected_cadence
+                or evidence_value.get("research_execution_cadence_sha256")
+                != expected_cadence["evidence_sha256"]
+            ):
+                raise ValueError("ensemble independent label evidence is invalid")
             profiles = evidence_value.get("profiles")
             if not isinstance(profiles, Mapping) or set(profiles) != set(
                 REQUIRED_RESEARCH_PROFILES

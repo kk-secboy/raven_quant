@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,10 @@ from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
 from .report_rc_factors import default_factors_dir as report_rc_factors_dir
+from .research_execution_cadence import (
+    build_research_execution_cadence_contract,
+    validate_research_execution_cadence_contract,
+)
 from .research_horizon import (
     primary_label_policy_contract,
     research_cadence_bucket,
@@ -420,6 +425,103 @@ def _qlib_workflow_environment(settings: Settings, *, is_wsl: bool) -> dict[str,
             _to_wsl_path(artifact_root) if is_wsl else str(artifact_root)
         )
     }
+
+
+def _model_evaluation_attempt_result_path(
+    evaluation_root: Path,
+    job: dict[str, Any],
+) -> Path:
+    """Allocate a producer-only result path for one model evaluation attempt.
+
+    A durable job can be resubmitted with the same job id, and administrative
+    retries may reset its numerical attempt counter.  The random execution
+    token therefore forms part of the directory identity.  Nothing below this
+    attempts directory is ever registered as immutable evidence.
+    """
+
+    try:
+        attempt = max(1, int(job.get("attempts") or 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model evaluation attempt counter is invalid") from exc
+    attempt_root = (
+        evaluation_root
+        / "attempts"
+        / f"attempt-{attempt:04d}-{uuid.uuid4().hex}"
+    )
+    attempt_root.mkdir(parents=True, exist_ok=False)
+    return attempt_root / "result.json"
+
+
+def _materialize_immutable_model_evaluation_result(
+    result_path: Path,
+    *,
+    evaluation_root: Path,
+    expected_result: dict[str, Any],
+) -> Path:
+    """Publish evaluator JSON to a content-addressed path without overwrite.
+
+    The evaluator writes into a unique attempt workspace.  Registration must
+    point at a different, content-addressed file so a later retry can freely
+    clean its own workspace without changing previously recorded evidence.
+    Publication uses an exclusive hard-link from a verified temporary file;
+    an existing destination is accepted only when its bytes match exactly.
+    """
+
+    root = evaluation_root.resolve()
+    try:
+        source = result_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("model evaluation result artifact is missing") from exc
+    try:
+        relative = source.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("model evaluation result escaped its job artifact root") from exc
+    if (
+        result_path.is_symlink()
+        or not source.is_file()
+        or len(relative.parts) != 3
+        or relative.parts[0] != "attempts"
+        or not re.fullmatch(r"attempt-[0-9]{4,}-[0-9a-f]{32}", relative.parts[1])
+        or relative.parts[2] != "result.json"
+    ):
+        raise ValueError("model evaluation result is not an attempt artifact")
+
+    content = source.read_bytes()
+    try:
+        archived_result = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("model evaluation result artifact is not valid JSON") from exc
+    if archived_result != expected_result:
+        raise ValueError("model evaluation result changed before archival")
+
+    content_sha256 = hashlib.sha256(content).hexdigest()
+    target = root / "immutable" / "sha256" / content_sha256 / "result.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("xb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if _sha256_path(temporary) != content_sha256:
+            raise ValueError("model evaluation result changed while being archived")
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    if (
+        target.is_symlink()
+        or not target.is_file()
+        or target.stat().st_size != len(content)
+        or _sha256_path(target) != content_sha256
+    ):
+        raise ValueError("immutable model evaluation artifact collision")
+    return target
 
 
 def _frozen_model_engine(model_signal: dict) -> str:
@@ -1818,18 +1920,31 @@ class LocalJobWorker:
                                 runtime={**runtime, **lab_archive},
                             )
                     elif job["kind"] == "model_evaluate":
-                        self._import_model_evaluations(job, result or {})
+                        self._import_model_evaluations(
+                            job,
+                            result or {},
+                            result_path,
+                        )
                         resource_blocks = [
                             item
                             for item in (result or {}).get("evaluations") or []
                             if item.get("status") == "resource_blocked"
                         ]
-                        if resource_blocks:
+                        operational_failures = [
+                            item
+                            for item in (result or {}).get("evaluations") or []
+                            if item.get("status") == "failed"
+                        ]
+                        if resource_blocks or operational_failures:
                             self.research.mark_run(
                                 research_run_id,
                                 "blocked",
                                 runtime={
-                                    "reason_code": "model_resource_limit",
+                                    "reason_code": (
+                                        "model_resource_limit"
+                                        if resource_blocks and not operational_failures
+                                        else "model_operational_failure"
+                                    ),
                                     "resource_blocked_candidates": [
                                         {
                                             "candidate_id": item.get("candidate_id"),
@@ -1838,17 +1953,28 @@ class LocalJobWorker:
                                         }
                                         for item in resource_blocks
                                     ],
+                                    "operational_failed_candidates": [
+                                        {
+                                            "candidate_id": item.get("candidate_id"),
+                                            "reason_code": "operational_failure",
+                                            "error": item.get("error"),
+                                        }
+                                        for item in operational_failures
+                                    ],
                                 },
                                 error=(
-                                    "one or more models exceeded the governed research budget; "
-                                    "no investment-performance rejection was recorded"
+                                    "one or more model evaluations ended before governed "
+                                    "performance evidence was produced; no investment-performance "
+                                    "rejection was recorded"
                                 ),
                             )
                         else:
                             self.research.mark_run(research_run_id, "succeeded")
                     elif job["kind"] == "quant_bundle_evaluate":
                         resource_blocks = self._import_quant_bundle_evaluation_artifact(
-                            job, result or {}
+                            job,
+                            result or {},
+                            result_path,
                         )
                         if resource_blocks:
                             blocked_codes = {
@@ -3379,6 +3505,10 @@ class LocalJobWorker:
                 "dataset": payload["dataset"],
                 "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
+                "ensemble_label_contract": payload["ensemble_label_contract"],
+                "research_execution_cadence": payload[
+                    "research_execution_cadence"
+                ],
                 "candidates": candidates,
                 "universe": payload.get("universe", "cn_all"),
                 "benchmark": payload.get("benchmark", "SH000300"),
@@ -3434,7 +3564,7 @@ class LocalJobWorker:
             )
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
-            result_path = output / "result.json"
+            result_path = _model_evaluation_attempt_result_path(output, job)
             is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
 
             def runtime_path(value: str | Path) -> str:
@@ -3523,8 +3653,21 @@ class LocalJobWorker:
                     item["baseline_prediction_runtime"] = runtime_baseline
                 candidates.append(item)
             feature_set = _frozen_evaluation_feature_set(payload)
+            evaluation_label_binding = validate_research_label_binding(
+                payload.get("research_label_binding") or {}
+            )
+            if (
+                payload.get("research_label_binding_sha256")
+                != evaluation_label_binding["binding_sha256"]
+            ):
+                raise ValueError("active model evaluation label binding is invalid")
+            research_execution_cadence = (
+                build_research_execution_cadence_contract(
+                    str(evaluation_label_binding["horizon_profile"])
+                )
+            )
             quant_label_binding = (
-                resolve_research_label_binding(payload)
+                evaluation_label_binding
                 if job["kind"] == "quant_bundle_evaluate"
                 else None
             )
@@ -3548,6 +3691,11 @@ class LocalJobWorker:
                 # same feature set instead of falling back to its static
                 # registry.
                 "feature_set": feature_set,
+                "research_label_binding": evaluation_label_binding,
+                "research_label_binding_sha256": evaluation_label_binding[
+                    "binding_sha256"
+                ],
+                "research_execution_cadence": research_execution_cadence,
                 **(
                     {
                         "evaluation_stage": str(
@@ -7608,18 +7756,50 @@ class LocalJobWorker:
         )
         self.research.attach_job(payload["research_run_id"], evaluation_job["id"])
 
-    def _import_model_evaluations(self, job: dict, result: dict) -> None:
+    def _import_model_evaluations(
+        self,
+        job: dict,
+        result: dict,
+        result_path: Path | None,
+    ) -> None:
         payload = job["payload"]
+        label_binding = validate_research_label_binding(
+            payload.get("research_label_binding") or {}
+        )
+        if (
+            payload.get("research_label_binding_sha256")
+            != label_binding["binding_sha256"]
+        ):
+            raise ValueError("model evaluator has no frozen active label binding")
+        expected_cadence = build_research_execution_cadence_contract(
+            str(label_binding["horizon_profile"])
+        )
+        observed_cadence = validate_research_execution_cadence_contract(
+            result.get("research_execution_cadence") or {},
+            expected_horizon_profile=str(label_binding["horizon_profile"]),
+        )
+        if (
+            observed_cadence != expected_cadence
+            or result.get("research_execution_cadence_sha256")
+            != expected_cadence["evidence_sha256"]
+        ):
+            raise ValueError("model evaluator changed its frozen decision cadence")
         by_id = _indexed_independent_evaluations(job, result)
-        artifact_path = (
+        evaluation_root = (
             self.settings.data_root
             / "artifacts"
             / "model-evaluations"
             / payload["research_run_id"]
             / job["id"]
-            / "result.json"
         )
-        artifact = self.rdagent_candidates.register_run_artifact(
+        if result_path is None:
+            raise ValueError("model evaluation result artifact is missing")
+        artifact_path = _materialize_immutable_model_evaluation_result(
+            result_path,
+            evaluation_root=evaluation_root,
+            expected_result=result,
+        )
+        artifact = self.rdagent_candidates.register_or_reuse_run_artifact(
             research_run_id=str(payload["research_run_id"]),
             artifact_type="model_independent_evaluation",
             storage_path=artifact_path,
@@ -7689,6 +7869,10 @@ class LocalJobWorker:
                         != payload["feature_set_definition_sha256"]
                         or evidence.get("selection_profile") != "recent_3y"
                         or evidence.get("selection_seed") != 11
+                        or evidence.get("research_execution_cadence")
+                        != expected_cadence
+                        or evidence.get("research_execution_cadence_sha256")
+                        != expected_cadence["evidence_sha256"]
                         or evidence.get("final_oos_opened") is not False
                         or evidence.get("evidence_sha256") != expected_sha
                         or item.get("evidence_sha256") != expected_sha
@@ -7696,6 +7880,11 @@ class LocalJobWorker:
                     ):
                         raise ValueError("feature-screen evidence identity is invalid")
                     cell = dict(cells[0])
+                    if (
+                        cell.get("research_execution_cadence_sha256")
+                        != expected_cadence["evidence_sha256"]
+                    ):
+                        raise ValueError("feature-screen cell changed decision cadence")
                     for path_key, hash_key in (
                         ("predictions_path", "predictions_sha256"),
                         ("checkpoint_path", "checkpoint_sha256"),
@@ -7740,19 +7929,14 @@ class LocalJobWorker:
                         trial_id,
                         "failed",
                         candidate_id=candidate_id,
-                        metrics={"reason_code": "screen_execution_failed"},
+                        metrics={"reason_code": "operational_failure"},
                         evidence={
                             "contract_version": "model-feature-screen-failure-v1",
                             "error": str(item.get("error") or "screen failed"),
-                            "investment_hypothesis_rejected": True,
+                            "failure_class": "operational_failure",
+                            "performance_metrics_produced": False,
+                            "investment_hypothesis_rejected": False,
                         },
-                    )
-                    self.rdagent_candidates.transition_candidate(
-                        "model",
-                        candidate_id,
-                        status="rejected",
-                        reason=str(item.get("error") or "feature screen failed"),
-                        actor="autopilot",
                     )
             return
         for candidate in payload["candidates"]:
@@ -7762,6 +7946,11 @@ class LocalJobWorker:
                 # Resource feasibility is an operational outcome. Keep the
                 # candidate non-terminal so it can be retried under a reviewed
                 # budget; never mislabel it as a failed investment hypothesis.
+                continue
+            if item and item.get("status") == "failed":
+                # A subprocess/PortAna failure has no computed gate metrics.
+                # Keep the immutable research hypothesis non-terminal so a new
+                # preregistered tournament can retry it after an executor fix.
                 continue
             if not item or item.get("status") != "passed":
                 self.rdagent_candidates.transition_candidate(
@@ -7786,6 +7975,15 @@ class LocalJobWorker:
     ) -> None:
         if result_path is None or not result_path.is_file():
             raise ValueError("model ensemble result artifact is missing")
+        expected_cadence = validate_research_execution_cadence_contract(
+            job["payload"].get("research_execution_cadence") or {}
+        )
+        if (
+            result.get("research_execution_cadence") != expected_cadence
+            or result.get("research_execution_cadence_sha256")
+            != expected_cadence["evidence_sha256"]
+        ):
+            raise ValueError("model ensemble evaluator changed its decision cadence")
         by_id = {
             str(item.get("ensemble_id") or ""): item
             for item in result.get("evaluations") or []
@@ -8247,15 +8445,35 @@ class LocalJobWorker:
         return len(eligible)
 
     def _import_quant_bundle_evaluation_artifact(
-        self, job: dict, result: dict
+        self,
+        job: dict,
+        result: dict,
+        result_path: Path | None,
     ) -> list[dict]:
         payload = job["payload"]
-        label_binding = resolve_research_label_binding(payload)
+        raw_label_binding = payload.get("research_label_binding")
+        label_binding = (
+            validate_research_label_binding(raw_label_binding)
+            if raw_label_binding is not None
+            else None
+        )
         if label_binding is not None:
+            if (
+                payload.get("research_label_binding_sha256")
+                != label_binding["binding_sha256"]
+            ):
+                raise ValueError("quant evaluator label binding changed after enqueue")
+            expected_cadence = build_research_execution_cadence_contract(
+                str(label_binding["horizon_profile"])
+            )
             if (
                 result.get("research_label_binding") != label_binding
                 or result.get("research_label_binding_sha256")
                 != label_binding["binding_sha256"]
+                or result.get("research_execution_cadence")
+                != expected_cadence
+                or result.get("research_execution_cadence_sha256")
+                != expected_cadence["evidence_sha256"]
                 or any(
                     candidate.get("research_label_binding") != label_binding
                     or candidate.get("research_label_binding_sha256")
@@ -8310,6 +8528,11 @@ class LocalJobWorker:
                 label_binding is not None
                 and receipt.get("research_label_binding_sha256")
                 != label_binding["binding_sha256"]
+            )
+            or (
+                label_binding is not None
+                and receipt.get("research_execution_cadence_sha256")
+                != expected_cadence["evidence_sha256"]
             )
         ):
             raise ValueError("quant evaluator research-ledger receipt is invalid")
@@ -8367,15 +8590,21 @@ class LocalJobWorker:
                 raise ValueError("quant Holm/PBO family changed after evaluation")
         elif any(item.get("status") == "passed" for item in by_id.values()):
             raise ValueError("a quant candidate passed without batch-level statistics")
-        artifact_path = (
+        evaluation_root = (
             self.settings.data_root
             / "artifacts"
             / "quant-bundle-evaluations"
             / payload["research_run_id"]
             / job["id"]
-            / "result.json"
         )
-        artifact = self.rdagent_candidates.register_run_artifact(
+        if result_path is None:
+            raise ValueError("quant bundle evaluation result artifact is missing")
+        artifact_path = _materialize_immutable_model_evaluation_result(
+            result_path,
+            evaluation_root=evaluation_root,
+            expected_result=result,
+        )
+        artifact = self.rdagent_candidates.register_or_reuse_run_artifact(
             research_run_id=str(payload["research_run_id"]),
             artifact_type="quant_bundle_independent_evaluation",
             storage_path=artifact_path,

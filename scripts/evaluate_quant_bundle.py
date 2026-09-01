@@ -43,11 +43,17 @@ from quant_platform.model_research_governance import (
     validate_quant_bundle_evidence,
     verify_model_prediction_artifact,
 )
+from quant_platform.qlib_portfolio_calendar import (
+    resolve_qlib_portfolio_calendar_boundary,
+)
 from quant_platform.qlib_workflow import (
     qlib_workflow_run,
     qlib_workflow_tracking_uri,
 )
 from quant_platform.rdagent_dataset_view import prepare_rdagent_dataset_view
+from quant_platform.research_execution_cadence import (
+    validate_research_execution_cadence_contract,
+)
 from quant_platform.research_label_binding import validate_research_label_binding
 
 
@@ -844,6 +850,9 @@ def _execute_single_model_cell(
         "research_window_contract_sha256": manifest.get(
             "research_window_contract_sha256"
         ),
+        "research_execution_cadence": manifest[
+            "research_execution_cadence"
+        ],
         "label_horizon_sessions": manifest.get("label_horizon_sessions"),
         "universe": manifest.get("universe", "cn_all"),
         "benchmark": manifest.get("benchmark", "SH000300"),
@@ -915,6 +924,9 @@ def _execute_single_model_cell(
         "model_engine": config["model_engine"],
         "resource_stage": resource_stage,
         "resource_policy": model_result["resource_policy"],
+        "research_execution_cadence_sha256": model_result[
+            "research_execution_cadence_sha256"
+        ],
     }
     return cell, str(execution["execution_environment_sha256"])
 
@@ -957,7 +969,7 @@ def _evaluate_equal_rank_portfolio(
     workspace: Path,
     manifest: dict[str, Any],
     experiment_name: str,
-) -> tuple[dict[str, Any], Path]:
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     global _QLIB_PROVIDER
 
     import qlib
@@ -966,6 +978,10 @@ def _evaluate_equal_rank_portfolio(
     from qlib.workflow.record_temp import PortAnaRecord
 
     provider_value = str(view.resolve())
+    portfolio_calendar_boundary = resolve_qlib_portfolio_calendar_boundary(
+        provider_value,
+        backtest_end=periods["valid_end"],
+    )
     if _QLIB_PROVIDER != provider_value:
         qlib.init(provider_uri=provider_value, region="cn")
         _QLIB_PROVIDER = provider_value
@@ -1011,12 +1027,15 @@ def _evaluate_equal_rank_portfolio(
             recorder,
             config={
                 "strategy": {
-                    "class": "TopkDropoutStrategy",
-                    "module_path": "qlib.contrib.strategy",
+                    "class": "GovernedDPlusOneTopkDropoutStrategy",
+                    "module_path": "quant_platform.qlib_research_strategy",
                     "kwargs": {
                         "signal": "<PRED>",
                         "topk": int(manifest.get("topk", 50)),
                         "n_drop": int(manifest.get("n_drop", 5)),
+                        "research_execution_cadence": manifest[
+                            "research_execution_cadence"
+                        ],
                     },
                 },
                 "backtest": {
@@ -1061,7 +1080,7 @@ def _evaluate_equal_rank_portfolio(
     report_path = output / "portfolio_report.parquet"
     report.to_parquet(report_path)
     aligned.to_parquet(output / "signals_and_labels.parquet")
-    return metrics, report_path
+    return metrics, report_path, portfolio_calendar_boundary
 
 
 def _execute_ensemble_factor_only_cell(
@@ -1158,7 +1177,7 @@ def _execute_ensemble_factor_only_cell(
     if len(environments) != 1:
         raise ValueError("ensemble factor-only members used different environments")
     combined, combination = equal_rank_predictions(members)
-    metrics, report_path = _evaluate_equal_rank_portfolio(
+    metrics, report_path, portfolio_calendar_boundary = _evaluate_equal_rank_portfolio(
         predictions=combined,
         view=view,
         periods=periods,
@@ -1192,6 +1211,13 @@ def _execute_ensemble_factor_only_cell(
         "combiner": "equal_rank",
         "stacking": False,
         "execution": "sequential_cpu_only",
+        "portfolio_calendar_boundary": portfolio_calendar_boundary,
+        "research_execution_cadence": manifest[
+            "research_execution_cadence"
+        ],
+        "research_execution_cadence_sha256": manifest[
+            "research_execution_cadence"
+        ]["evidence_sha256"],
         "final_oos_opened": False,
     }
     execution["evidence_sha256"] = canonical_sha256(execution)
@@ -1325,6 +1351,12 @@ def _run_ablation(
         "source": "independent_qlib_recompute",
         "experiment_family_id": bundle["experiment_family_id"],
         "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+        "research_execution_cadence": manifest[
+            "research_execution_cadence"
+        ],
+        "research_execution_cadence_sha256": manifest[
+            "research_execution_cadence"
+        ]["evidence_sha256"],
         "final_oos_opened": False,
         "profiles": {},
     }
@@ -1389,6 +1421,12 @@ def main() -> None:
         validate_research_label_binding(raw_label_binding)
         if raw_label_binding is not None
         else None
+    )
+    if label_binding is None:
+        raise ValueError("active quant evaluation has no frozen label binding")
+    execution_cadence = validate_research_execution_cadence_contract(
+        manifest.get("research_execution_cadence") or {},
+        expected_horizon_profile=str(label_binding["horizon_profile"]),
     )
     if label_binding is not None:
         if (
@@ -1570,6 +1608,10 @@ def main() -> None:
                 "contract_version": QUANT_BUNDLE_CONTRACT_VERSION,
                 "id": candidate["id"],
                 "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+                "research_execution_cadence": execution_cadence,
+                "research_execution_cadence_sha256": execution_cadence[
+                    "evidence_sha256"
+                ],
                 **(
                     {
                         "horizon_profile": label_binding["horizon_profile"],
@@ -1901,6 +1943,9 @@ def main() -> None:
         "research_label_binding_sha256": (
             label_binding["binding_sha256"] if label_binding is not None else None
         ),
+        "research_execution_cadence_sha256": execution_cadence[
+            "evidence_sha256"
+        ],
     }
     receipt["evidence_sha256"] = canonical_sha256(receipt)
     result = {
@@ -1912,6 +1957,10 @@ def main() -> None:
         "not_capital_confirmation": True,
         "cross_cycle_fwer_claimed": False,
         "final_oos_opened": False,
+        "research_execution_cadence": execution_cadence,
+        "research_execution_cadence_sha256": execution_cadence[
+            "evidence_sha256"
+        ],
         "resource_blocked_count": sum(
             item.get("status") == "resource_blocked" for item in evaluations
         ),

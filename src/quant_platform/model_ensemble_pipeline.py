@@ -17,10 +17,14 @@ from .job_store import JobStore
 from .model_ensemble import (
     EnsemblePredictionsPending,
     bounded_ensemble_combinations,
+    build_model_ensemble_label_contract,
     pairwise_grid_correlation,
     prediction_grid_from_admission,
 )
 from .rdagent_candidate_store import RDAGentCandidateStore
+from .research_execution_cadence import (
+    build_research_execution_cadence_contract,
+)
 from .research_tournament import ResearchTournamentStore, canonical_sha256
 
 
@@ -165,6 +169,7 @@ class ModelEnsemblePipelineService:
         if not rows:
             return None
         candidates: list[dict[str, Any]] = []
+        member_label_bindings: dict[str, dict[str, Any]] = {}
         for row in rows:
             if str(row.dataset_identity_sha256) != identity:
                 raise ValueError("ensemble evaluation candidate dataset identity changed")
@@ -183,7 +188,26 @@ class ModelEnsemblePipelineService:
                     != str(component["prediction_grid_sha256"])
                 ):
                     raise ValueError("ensemble component evidence changed after preregistration")
-                components.append({**dict(component), "prediction_grid": grid})
+                model_manifest = dict(model.get("manifest_json") or {})
+                label_binding = model_manifest.get("research_label_binding")
+                if (
+                    not isinstance(label_binding, Mapping)
+                    or model_manifest.get("research_label_binding_sha256")
+                    != label_binding.get("binding_sha256")
+                ):
+                    raise ValueError("ensemble component has no frozen label binding")
+                model_id = str(model["id"])
+                existing_binding = member_label_bindings.get(model_id)
+                if existing_binding is not None and existing_binding != dict(label_binding):
+                    raise ValueError("ensemble component label binding changed between candidates")
+                member_label_bindings[model_id] = dict(label_binding)
+                components.append(
+                    {
+                        **dict(component),
+                        "prediction_grid": grid,
+                        "research_label_binding": dict(label_binding),
+                    }
+                )
             candidates.append(
                 {
                     "id": str(row.id),
@@ -193,12 +217,18 @@ class ModelEnsemblePipelineService:
                 }
             )
         candidates.sort(key=lambda item: str(item["id"]))
+        label_contract = build_model_ensemble_label_contract(member_label_bindings)
+        execution_cadence = build_research_execution_cadence_contract(
+            str(label_contract["label_identity"]["horizon_profile"])
+        )
         payload = {
             "tournament_id": tournament_id,
             "dataset": str(dataset["name"]),
             "dataset_path": str(dataset["path"]),
             "dataset_identity_sha256": identity,
             "evaluation_profiles": [dict(item) for item in evaluation_profiles],
+            "ensemble_label_contract": label_contract,
+            "research_execution_cadence": execution_cadence,
             "candidates": candidates,
             "universe": str(universe),
             "benchmark": str(benchmark),
@@ -210,13 +240,20 @@ class ModelEnsemblePipelineService:
             "min_cost": 5.0,
         }
         candidate_set_sha = canonical_sha256(
-            [
-                {
-                    "id": item["id"],
-                    "manifest_sha256": item["manifest_sha256"],
-                }
-                for item in candidates
-            ]
+            {
+                "contract_version": "model-ensemble-evaluation-request-v3-cadence",
+                "ensemble_label_contract_sha256": label_contract["evidence_sha256"],
+                "research_execution_cadence_sha256": execution_cadence[
+                    "evidence_sha256"
+                ],
+                "candidates": [
+                    {
+                        "id": item["id"],
+                        "manifest_sha256": item["manifest_sha256"],
+                    }
+                    for item in candidates
+                ],
+            }
         )
         job = self.jobs.create(
             "model_ensemble_evaluate",

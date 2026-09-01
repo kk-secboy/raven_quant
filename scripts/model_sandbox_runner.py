@@ -15,9 +15,15 @@ import pandas as pd
 
 sys.path.insert(0, "/work")
 
+from quant_platform.qlib_portfolio_calendar import (  # noqa: E402
+    resolve_qlib_portfolio_calendar_boundary,
+)
 from quant_platform.qlib_workflow import (  # noqa: E402
     qlib_workflow_run,
     qlib_workflow_tracking_uri,
+)
+from quant_platform.research_execution_cadence import (  # noqa: E402
+    validate_research_execution_cadence_contract,
 )
 
 MODEL_LABEL_HORIZON_TRADING_DAYS = 2
@@ -26,6 +32,8 @@ LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
 MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
 MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
+MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
+MODEL_MEMORY_STAGE_PREFIX = "QUANTLAB_MODEL_MEMORY_STAGE="
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 GOVERNED_MODEL_ENGINES = {
@@ -71,6 +79,110 @@ def canonical_sha256(value: Any) -> str:
             "utf-8"
         )
     ).hexdigest()
+
+
+def _read_memory_counter(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if value == "max":
+        return None
+    try:
+        counter = int(value)
+    except ValueError:
+        return None
+    return counter if counter >= 0 else None
+
+
+def model_memory_snapshot(
+    stage: str,
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_status_path: Path = Path("/proc/self/status"),
+    governed_limit_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Capture process RSS and the container cgroup high-water mark.
+
+    ``VmHWM`` covers the trusted runner process. Qlib may evaluate expressions
+    in child processes, so the cgroup counters are the authoritative aggregate
+    for the isolated Docker sandbox when they are available.
+    """
+
+    process_rss_bytes: int | None = None
+    process_peak_rss_bytes: int | None = None
+    try:
+        status_lines = proc_status_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        status_lines = []
+    for line in status_lines:
+        key, separator, raw_value = line.partition(":")
+        if not separator or key not in {"VmRSS", "VmHWM"}:
+            continue
+        fields = raw_value.split()
+        try:
+            value_bytes = int(fields[0]) * 1024
+        except (IndexError, ValueError):
+            continue
+        if key == "VmRSS":
+            process_rss_bytes = value_bytes
+        else:
+            process_peak_rss_bytes = value_bytes
+
+    cgroup_version: int | None = None
+    cgroup_current_bytes = _read_memory_counter(cgroup_root / "memory.current")
+    cgroup_peak_bytes = _read_memory_counter(cgroup_root / "memory.peak")
+    cgroup_limit_bytes = _read_memory_counter(cgroup_root / "memory.max")
+    if any(
+        value is not None
+        for value in (cgroup_current_bytes, cgroup_peak_bytes, cgroup_limit_bytes)
+    ):
+        cgroup_version = 2
+    else:
+        memory_root = cgroup_root / "memory"
+        cgroup_current_bytes = _read_memory_counter(
+            memory_root / "memory.usage_in_bytes"
+        )
+        cgroup_peak_bytes = _read_memory_counter(
+            memory_root / "memory.max_usage_in_bytes"
+        )
+        cgroup_limit_bytes = _read_memory_counter(
+            memory_root / "memory.limit_in_bytes"
+        )
+        if any(
+            value is not None
+            for value in (cgroup_current_bytes, cgroup_peak_bytes, cgroup_limit_bytes)
+        ):
+            cgroup_version = 1
+
+    return {
+        "contract_version": MODEL_MEMORY_AUDIT_CONTRACT_VERSION,
+        "stage": stage,
+        "process_rss_bytes": process_rss_bytes,
+        "process_peak_rss_bytes": process_peak_rss_bytes,
+        "cgroup_version": cgroup_version,
+        "cgroup_current_bytes": cgroup_current_bytes,
+        "cgroup_peak_bytes": cgroup_peak_bytes,
+        "cgroup_limit_bytes": cgroup_limit_bytes,
+        "governed_limit_bytes": governed_limit_bytes,
+    }
+
+
+def record_model_memory_stage(
+    audit_path: Path,
+    stage: str,
+    *,
+    governed_limit_bytes: int | None,
+) -> dict[str, Any]:
+    snapshot = model_memory_snapshot(
+        stage,
+        governed_limit_bytes=governed_limit_bytes,
+    )
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    with audit_path.open("a", encoding="utf-8") as stream:
+        stream.write(encoded + "\n")
+    print(MODEL_MEMORY_STAGE_PREFIX + encoded, flush=True)
+    return snapshot
 
 
 def legacy_model_label_contract() -> dict[str, Any]:
@@ -214,6 +326,14 @@ def main() -> None:
     if model_engine in {"platform_gru", "platform_transformer"} and model_type != "TimeSeries":
         raise ValueError("GRU and Transformer are restricted to the sequence lane")
     label_contract = resolve_manifest_label_contract(manifest)
+    execution_cadence = None
+    if manifest.get("inference_only") is not True and manifest.get("live_retrain") is not True:
+        if label_contract["legacy"] is True:
+            raise ValueError("legacy model research has no governed decision cadence")
+        execution_cadence = validate_research_execution_cadence_contract(
+            manifest.get("research_execution_cadence") or {},
+            expected_horizon_profile=str(label_contract["horizon_profile"]),
+        )
     label_expression = str(label_contract["label_expression"])
     label_purge_sessions = int(label_contract["purge_sessions"])
     label_embargo_sessions = int(label_contract["embargo_sessions"])
@@ -282,6 +402,12 @@ def main() -> None:
         raise ValueError("formal model prediction requires an opened final OOS ledger")
     prediction_start = periods[f"{prediction_segment}_start"]
     prediction_end = periods[f"{prediction_segment}_end"]
+    portfolio_calendar_boundary = None
+    if not inference_only and not live_retrain:
+        portfolio_calendar_boundary = resolve_qlib_portfolio_calendar_boundary(
+            manifest["provider_uri"],
+            backtest_end=prediction_end,
+        )
 
     import lightgbm as lgb
     import mlflow
@@ -327,10 +453,29 @@ def main() -> None:
         TEMPLATE_CONTRACT_VERSION,
     )
 
+    output = Path("/work/output")
+    output.mkdir(parents=True, exist_ok=True)
+    memory_audit_path = output / "memory_stages.jsonl"
+    governed_limit_bytes = int(limits.get("memory_gb") or 0) * 1024**3 or None
+    memory_stages = [
+        record_model_memory_stage(
+            memory_audit_path,
+            "runner_initialized",
+            governed_limit_bytes=governed_limit_bytes,
+        )
+    ]
+
     qlib.init(
         provider_uri=manifest["provider_uri"],
         region="cn",
         kernels=int(limits["qlib_kernels"]),
+    )
+    memory_stages.append(
+        record_model_memory_stage(
+            memory_audit_path,
+            "qlib_initialized",
+            governed_limit_bytes=governed_limit_bytes,
+        )
     )
     names = list(features)
     expressions = [features[name] for name in names]
@@ -364,11 +509,20 @@ def main() -> None:
         }
     else:
         data_loader = qlib_loader
+    memory_stages.append(
+        record_model_memory_stage(
+            memory_audit_path,
+            "handler_loading",
+            governed_limit_bytes=governed_limit_bytes,
+        )
+    )
     handler = DataHandlerLP(
         instruments=manifest.get("universe", "cn_all"),
         start_time=periods["train_start"],
         end_time=prediction_end,
         data_loader=data_loader,
+        process_type=DataHandlerLP.PTYPE_A,
+        drop_raw=True,
         infer_processors=[
             {
                 "class": "RobustZScoreNorm",
@@ -385,6 +539,13 @@ def main() -> None:
             {"class": "DropnaLabel"},
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
         ],
+    )
+    memory_stages.append(
+        record_model_memory_stage(
+            memory_audit_path,
+            "handler_ready",
+            governed_limit_bytes=governed_limit_bytes,
+        )
     )
     segments = {
         "train": (periods["train_start"], periods["train_end"]),
@@ -562,8 +723,6 @@ def main() -> None:
         }
     else:  # pragma: no cover - guarded before Qlib initialization
         raise ValueError("model engine is not governed")
-    output = Path("/work/output")
-    output.mkdir(parents=True, exist_ok=True)
     workflow_root = output / "qlib-workflow"
     workflow_artifact_root = workflow_root / "artifacts"
     workflow_artifact_root.mkdir(parents=True, exist_ok=True)
@@ -658,12 +817,26 @@ def main() -> None:
         R.end_exp()
     if mlflow.active_run() is not None:
         raise RuntimeError("Qlib training recorder remained active after model fit")
+    memory_stages.append(
+        record_model_memory_stage(
+            memory_audit_path,
+            "model_fit_complete",
+            governed_limit_bytes=governed_limit_bytes,
+        )
+    )
     if pytorch_engine:
         predictions = model.predict(dataset).rename("score").sort_index()
     else:
         predictions = model.predict(dataset, segment="test").rename("score").sort_index()
     if predictions.empty:
         raise ValueError("independent model validation produced no predictions")
+    memory_stages.append(
+        record_model_memory_stage(
+            memory_audit_path,
+            "prediction_complete",
+            governed_limit_bytes=governed_limit_bytes,
+        )
+    )
     prediction_path = output / "predictions.parquet"
     predictions.to_frame().to_parquet(prediction_path)
     if inference_only or live_retrain:
@@ -713,12 +886,13 @@ def main() -> None:
                 recorder,
                 config={
                     "strategy": {
-                        "class": "TopkDropoutStrategy",
-                        "module_path": "qlib.contrib.strategy",
+                        "class": "GovernedDPlusOneTopkDropoutStrategy",
+                        "module_path": "quant_platform.qlib_research_strategy",
                         "kwargs": {
                             "signal": "<PRED>",
                             "topk": int(manifest.get("topk", 50)),
                             "n_drop": int(manifest.get("n_drop", 5)),
+                            "research_execution_cadence": execution_cadence,
                         },
                     },
                     "backtest": {
@@ -754,6 +928,13 @@ def main() -> None:
         }
         aligned.to_parquet(output / "signals_and_labels.parquet")
         report.to_parquet(output / "portfolio_report.parquet")
+    memory_stages.append(
+        record_model_memory_stage(
+            memory_audit_path,
+            "evaluation_complete",
+            governed_limit_bytes=governed_limit_bytes,
+        )
+    )
     result = {
         "status": "passed",
         "candidate_id": manifest["candidate_id"],
@@ -767,6 +948,16 @@ def main() -> None:
         "model_data_contract_sha256": model_data_contract_sha256,
         "model_label_contract": label_contract,
         "model_label_contract_sha256": canonical_sha256(label_contract),
+        **(
+            {
+                "research_execution_cadence": execution_cadence,
+                "research_execution_cadence_sha256": execution_cadence[
+                    "evidence_sha256"
+                ],
+            }
+            if execution_cadence is not None
+            else {}
+        ),
         "metrics": metrics,
         "periods": periods,
         "prediction_segment": prediction_segment,
@@ -789,6 +980,13 @@ def main() -> None:
             else {}
         ),
         "final_oos_opened": bool(manifest.get("final_oos_opened")),
+        "portfolio_calendar_boundary": portfolio_calendar_boundary,
+        "memory_audit": {
+            "contract_version": MODEL_MEMORY_AUDIT_CONTRACT_VERSION,
+            "path": str(memory_audit_path),
+            "sha256": sha256_file(memory_audit_path),
+            "stages": memory_stages,
+        },
     }
     if not inference_only and not live_retrain:
         portfolio_report = output / "portfolio_report.parquet"

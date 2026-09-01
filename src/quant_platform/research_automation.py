@@ -23,6 +23,7 @@ from .research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
     SWING_1_6M,
+    canonical_sha256,
     primary_label_policy_contract,
     research_horizon_contract,
 )
@@ -69,6 +70,9 @@ MINIMUM_PROFILE_TRAINING_DAYS = 252
 MULTI_PROFILE_CONSENSUS_VERSION = "multi-profile-consensus-v1"
 ROLLING_PERIOD_RESOLUTION_VERSION = "rolling_multi_profile_qlib_calendar_v2"
 HORIZON_PERIOD_RESOLUTION_VERSION = "rolling_three_horizon_qlib_calendar_v1"
+COMMON_FEATURE_SET_CALENDAR_CONTRACT_VERSION = (
+    "feature-set-tournament-common-calendar-v1"
+)
 HORIZON_RESEARCH_SCENARIOS = frozenset(
     {"fin_factor", "fin_model", "fin_quant", "fin_strategy"}
 )
@@ -862,6 +866,91 @@ def resolve_research_window_contract(
         "research_window_contract_sha256": contract.sha256,
     }
     return resolved, evidence
+
+
+def resolve_common_feature_set_calendar(
+    dataset: dict[str, Any],
+    calendar_days: list[str],
+    feature_sets: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, Any]]:
+    """Freeze one honest calendar for a feature-set tournament.
+
+    A fixed-model feature screen is only attributable to its feature set when
+    every candidate sees the same train/validation/OOS dates.  Resolve the
+    continuously usable range of the union of all preregistered fields, then
+    exclude every earlier/later session for every candidate.  Missing history
+    is never represented by fabricated zero-valued rows.
+    """
+
+    ordered = sorted(
+        dict.fromkeys(str(day).strip() for day in calendar_days if str(day).strip())
+    )
+    if not ordered:
+        raise ValueError("Qlib trading calendar is empty")
+    if not feature_sets:
+        raise ValueError("feature-set tournament has no candidates")
+    provenance = dataset.get("provenance") or {}
+    if not isinstance(provenance, dict):
+        raise ValueError("dataset provenance must be an object")
+
+    requirements: list[dict[str, Any]] = []
+    all_fields: set[str] = set()
+    seen_ids: set[str] = set()
+    for raw_feature_set in feature_sets:
+        feature_set = dict(raw_feature_set)
+        feature_set_id = str(feature_set.get("id") or "")
+        definition_sha256 = str(feature_set.get("definition_sha256") or "")
+        features = feature_set.get("features")
+        if (
+            not feature_set_id
+            or feature_set_id in seen_ids
+            or len(definition_sha256) != 64
+            or not isinstance(features, dict)
+            or not features
+        ):
+            raise ValueError("feature-set tournament candidate is invalid")
+        required_fields = sorted(
+            {
+                field
+                for expression in features.values()
+                for field in compile_qlib_expression(str(expression)).required_fields
+            }
+        )
+        if not required_fields:
+            raise ValueError("feature-set tournament candidate uses no dataset fields")
+        seen_ids.add(feature_set_id)
+        all_fields.update(required_fields)
+        requirements.append(
+            {
+                "feature_set_id": feature_set_id,
+                "feature_set_definition_sha256": definition_sha256,
+                "required_fields": required_fields,
+            }
+        )
+
+    field_evidence = resolve_required_field_coverage(
+        provenance,
+        sorted(all_fields),
+        data_cutoff_session=ordered[-1],
+    )
+    common_start = str(field_evidence["effective_field_start_session"])
+    common_end = str(field_evidence["effective_field_available_to"])
+    common_calendar = [day for day in ordered if common_start <= day <= common_end]
+    if not common_calendar:
+        raise ValueError("feature-set tournament fields have no common Qlib sessions")
+
+    evidence = {
+        "contract_version": COMMON_FEATURE_SET_CALENDAR_CONTRACT_VERSION,
+        "feature_sets": sorted(requirements, key=lambda item: item["feature_set_id"]),
+        "required_field_union": sorted(all_fields),
+        "required_field_coverage": field_evidence,
+        "calendar_start": common_calendar[0],
+        "calendar_end": common_calendar[-1],
+        "calendar_trading_days": len(common_calendar),
+        "missing_history_policy": "exclude_sessions_fail_closed_never_zero_backfill",
+    }
+    evidence["evidence_sha256"] = canonical_sha256(evidence)
+    return common_calendar, evidence
 
 
 def build_multi_profile_consensus(candidate: dict[str, Any]) -> dict[str, Any] | None:

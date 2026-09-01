@@ -7,10 +7,15 @@ import pytest
 
 from quant_platform.model_recompute import (
     MODEL_DATA_CONTRACT_VERSION,
+    MODEL_MEMORY_AUDIT_CONTRACT_VERSION,
     MODEL_QLIB_KERNELS,
+    MODEL_RECOMPUTE_EXECUTOR_VERSION,
     MODEL_RESOURCE_POLICY_VERSION,
     MODEL_SANDBOX_MEMORY_GB,
     MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE,
+    _memory_limit_failure_details,
+    _model_memory_peak_bytes,
+    _read_model_memory_audit,
     execute_model_candidate,
     governed_checkpoint_filename,
     governed_model_resource_policy,
@@ -78,6 +83,11 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
     assert module.MODEL_RESOURCE_POLICY_VERSION == MODEL_RESOURCE_POLICY_VERSION
     assert module.MODEL_DATA_CONTRACT_VERSION == MODEL_DATA_CONTRACT_VERSION
     assert (
+        module.MODEL_MEMORY_AUDIT_CONTRACT_VERSION
+        == MODEL_MEMORY_AUDIT_CONTRACT_VERSION
+    )
+    assert MODEL_RECOMPUTE_EXECUTOR_VERSION.endswith("drop-raw-memory-audit")
+    assert (
         module.MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
         == MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
         == "true"
@@ -100,6 +110,141 @@ def test_model_sandbox_explicitly_opts_into_ephemeral_qlib_file_tracking() -> No
     assert '"mlflow_allow_file_store": MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE' in source
 
 
+def test_model_sandbox_seals_d_plus_one_runtime_modules_and_hashes() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "quant_platform"
+        / "model_recompute.py"
+    ).read_text(encoding="utf-8")
+
+    for module_name in ("qlib_portfolio_calendar", "qlib_research_strategy"):
+        assert f'"{module_name}.py"' in source
+        assert f'"{module_name}_sha256"' in source
+        assert f'sandbox_package / "{module_name}.py"' in source
+        assert f'"quant_platform/{module_name}.py"' in source
+
+
+def test_model_sandbox_drops_raw_after_append_semantics_are_frozen() -> None:
+    runner_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
+    )
+    source = runner_path.read_text(encoding="utf-8")
+    handler_call = source.split("    handler = DataHandlerLP(", 1)[1].split(
+        "    segments = {", 1
+    )[0]
+    assert "process_type=DataHandlerLP.PTYPE_A" in handler_call
+    assert "drop_raw=True" in handler_call
+    assert handler_call.index("process_type=DataHandlerLP.PTYPE_A") < handler_call.index(
+        "infer_processors=["
+    )
+
+
+def test_model_memory_snapshot_reads_process_and_cgroup_v2_peaks(
+    tmp_path: Path,
+) -> None:
+    runner_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
+    )
+    spec = importlib.util.spec_from_file_location("model_sandbox_memory_contract", runner_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    proc_status = tmp_path / "status"
+    proc_status.write_text("VmRSS:\t1024 kB\nVmHWM:\t2048 kB\n", encoding="utf-8")
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text("3145728\n", encoding="utf-8")
+    (cgroup / "memory.peak").write_text("4194304\n", encoding="utf-8")
+    (cgroup / "memory.max").write_text(str(40 * 1024**3), encoding="utf-8")
+
+    snapshot = module.model_memory_snapshot(
+        "handler_ready",
+        cgroup_root=cgroup,
+        proc_status_path=proc_status,
+        governed_limit_bytes=40 * 1024**3,
+    )
+
+    assert snapshot == {
+        "contract_version": "model-memory-audit-v1-cgroup-peak",
+        "stage": "handler_ready",
+        "process_rss_bytes": 1024 * 1024,
+        "process_peak_rss_bytes": 2 * 1024 * 1024,
+        "cgroup_version": 2,
+        "cgroup_current_bytes": 3 * 1024 * 1024,
+        "cgroup_peak_bytes": 4 * 1024 * 1024,
+        "cgroup_limit_bytes": 40 * 1024**3,
+        "governed_limit_bytes": 40 * 1024**3,
+    }
+
+
+def test_model_memory_snapshot_falls_back_to_cgroup_v1(tmp_path: Path) -> None:
+    runner_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
+    )
+    spec = importlib.util.spec_from_file_location("model_sandbox_memory_v1", runner_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cgroup = tmp_path / "cgroup"
+    memory = cgroup / "memory"
+    memory.mkdir(parents=True)
+    (memory / "memory.usage_in_bytes").write_text("100\n", encoding="utf-8")
+    (memory / "memory.max_usage_in_bytes").write_text("200\n", encoding="utf-8")
+    (memory / "memory.limit_in_bytes").write_text("300\n", encoding="utf-8")
+
+    snapshot = module.model_memory_snapshot(
+        "model_fit_complete",
+        cgroup_root=cgroup,
+        proc_status_path=tmp_path / "missing-status",
+    )
+
+    assert snapshot["cgroup_version"] == 1
+    assert snapshot["cgroup_current_bytes"] == 100
+    assert snapshot["cgroup_peak_bytes"] == 200
+    assert snapshot["cgroup_limit_bytes"] == 300
+    assert snapshot["process_rss_bytes"] is None
+    assert snapshot["process_peak_rss_bytes"] is None
+
+
+def test_parent_verifies_flushed_memory_stages_and_ignores_truncated_tail(
+    tmp_path: Path,
+) -> None:
+    audit_path = tmp_path / "memory_stages.jsonl"
+    records = [
+        {
+            "contract_version": MODEL_MEMORY_AUDIT_CONTRACT_VERSION,
+            "stage": "handler_loading",
+            "cgroup_peak_bytes": 100,
+            "process_peak_rss_bytes": 80,
+        },
+        {
+            "contract_version": MODEL_MEMORY_AUDIT_CONTRACT_VERSION,
+            "stage": "handler_ready",
+            "cgroup_peak_bytes": 200,
+            "process_peak_rss_bytes": 150,
+        },
+    ]
+    audit_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records) + '{"partial":',
+        encoding="utf-8",
+    )
+
+    loaded = _read_model_memory_audit(audit_path)
+
+    assert loaded == records
+    assert _model_memory_peak_bytes(loaded) == 200
+    assert _memory_limit_failure_details(
+        loaded,
+        governed_limit_bytes=40 * 1024**3,
+    ) == (
+        "cgroup_limit_hit=true, governed_limit_bytes=42949672960, "
+        "last_flushed_peak_bytes=200"
+    )
+
+
 def test_model_sandbox_closes_implicit_training_run_before_governed_workflow() -> None:
     source = (
         Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
@@ -116,11 +261,16 @@ def test_model_sandbox_materializes_qlib_signal_record_dependencies() -> None:
         Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
     ).read_text(encoding="utf-8")
     save_index = source.index('"pred.pkl": predictions.to_frame("score")')
+    boundary_index = source.index("resolve_qlib_portfolio_calendar_boundary(")
     portfolio_index = source.index("record = PortAnaRecord(")
     generate_index = source.index("record.generate()")
     assert '"label.pkl": labels' in source
     assert '"signal": "<PRED>"' in source
-    assert save_index < portfolio_index < generate_index
+    assert boundary_index < save_index < portfolio_index < generate_index
+    assert '"class": "GovernedDPlusOneTopkDropoutStrategy"' in source
+    assert '"module_path": "quant_platform.qlib_research_strategy"' in source
+    assert '"research_execution_cadence": execution_cadence' in source
+    assert '"end_time": prediction_end' in source
     assert "Qlib portfolio record generation was skipped" in source
     assert "record.check(include_self=True, parents=False)" in source
 

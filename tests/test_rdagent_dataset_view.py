@@ -115,9 +115,21 @@ def test_dataset_view_seals_the_governed_cn_all_universe(tmp_path: Path) -> None
             encoding="utf-8"
         )
     )
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["market"] == "cn_all"
     assert manifest["default_market_alias"] == "cn_all"
+    assert manifest["calendar_rows"] == 2
+    assert manifest["future_calendar_rows"] == 3
+    assert manifest["future_calendar_boundary"] == "2024-01-04"
+    assert manifest["future_calendar_contains_market_data"] is False
+    assert (destination / "calendars" / "day.txt").read_text(
+        encoding="utf-8"
+    ) == "2024-01-02\n2024-01-03\n"
+    assert (destination / "calendars" / "day_future.txt").read_text(
+        encoding="utf-8"
+    ) == "2024-01-02\n2024-01-03\n2024-01-04\n"
+    feature = destination / "features" / "sh600000" / "close.day.bin"
+    assert struct.unpack("<3f", feature.read_bytes()) == (0.0, 10.0, 11.0)
 
     assert (
         prepare_rdagent_dataset_view(
@@ -137,6 +149,19 @@ def test_dataset_view_seals_the_governed_cn_all_universe(tmp_path: Path) -> None
             cutoff="2024-01-03",
         )
     default_instruments.write_bytes(canonical)
+
+    future_calendar = destination / "calendars" / "day_future.txt"
+    future_calendar.write_text(
+        "2024-01-02\n2024-01-03\n2024-01-04\n2024-01-05\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid calendar"):
+        prepare_rdagent_dataset_view(
+            source,
+            destination,
+            cutoff="2024-01-03",
+        )
+    future_calendar.write_bytes(b"2024-01-02\n2024-01-03\n2024-01-04\n")
 
     instruments.write_text("", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid cn_all universe"):
@@ -168,3 +193,18 @@ def test_dataset_view_normalizes_qlib_timestamp_instrument_intervals(
     assert (destination / "instruments" / "cn_all.txt").read_text(
         encoding="utf-8"
     ) == "SH600000\t2024-01-02\t2024-01-03\n"
+
+
+def test_dataset_view_requires_a_later_interval_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_dataset(
+        source,
+        cn_all="SH600000\t2024-01-02\t2024-01-04\n",
+    )
+
+    with pytest.raises(ValueError, match="no next trading-session interval boundary"):
+        prepare_rdagent_dataset_view(
+            source,
+            tmp_path / "view",
+            cutoff="2024-01-04",
+        )

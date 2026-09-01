@@ -60,7 +60,14 @@ def prepare_rdagent_dataset_view(
     *,
     cutoff: str,
 ) -> Path:
-    """Create a day-frequency Qlib provider with no bytes after ``cutoff``."""
+    """Create a day-frequency Qlib provider with no market data after ``cutoff``.
+
+    Qlib represents the final closed daily execution interval with the next
+    calendar timestamp.  The view therefore carries exactly one later session
+    in ``day_future.txt`` while ``day.txt``, instruments, and every feature
+    binary remain hard-truncated at ``cutoff``.  The extra timestamp is an
+    interval boundary, not future price or feature data.
+    """
 
     source_path = Path(source).resolve()
     destination_path = Path(destination).resolve()
@@ -81,6 +88,8 @@ def prepare_rdagent_dataset_view(
         for line in calendar_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    if not full_calendar or full_calendar != sorted(set(full_calendar)):
+        raise ValueError("RD-Agent source calendar must contain ordered unique sessions")
     selected_calendar = [
         value for value in full_calendar if date.fromisoformat(value) <= cutoff_date
     ]
@@ -88,6 +97,15 @@ def prepare_rdagent_dataset_view(
         raise ValueError("RD-Agent dataset cutoff precedes the Qlib trading calendar")
     cutoff_index = len(selected_calendar) - 1
     effective_cutoff = selected_calendar[-1]
+    try:
+        interval_boundary = full_calendar[cutoff_index + 1]
+    except IndexError as exc:
+        raise ValueError(
+            "RD-Agent dataset cutoff has no next trading-session interval boundary"
+        ) from exc
+    future_calendar = [*selected_calendar, interval_boundary]
+    market_calendar_output = ("\n".join(selected_calendar) + "\n").encode("utf-8")
+    future_calendar_output = ("\n".join(future_calendar) + "\n").encode("utf-8")
     governed_lines = _truncate_instruments(
         governed_instruments_path,
         effective_cutoff,
@@ -96,7 +114,7 @@ def prepare_rdagent_dataset_view(
         raise ValueError("RD-Agent cn_all universe is empty at the governed cutoff")
     governed_output = ("\n".join(governed_lines) + "\n").encode("utf-8")
     expected_manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source": str(source_path),
         "market": "cn_all",
         "default_market_alias": "cn_all",
@@ -107,6 +125,11 @@ def prepare_rdagent_dataset_view(
         "requested_cutoff": cutoff_date.isoformat(),
         "effective_cutoff": effective_cutoff,
         "calendar_rows": len(selected_calendar),
+        "calendar_sha256": hashlib.sha256(market_calendar_output).hexdigest(),
+        "future_calendar_rows": len(future_calendar),
+        "future_calendar_boundary": interval_boundary,
+        "future_calendar_sha256": hashlib.sha256(future_calendar_output).hexdigest(),
+        "future_calendar_contains_market_data": False,
     }
 
     manifest_path = destination_path / _MANIFEST
@@ -117,6 +140,14 @@ def prepare_rdagent_dataset_view(
             raise ValueError("existing RD-Agent dataset view is incomplete") from exc
         if existing != expected_manifest:
             raise ValueError("existing RD-Agent dataset view has a different cutoff or source")
+        expected_calendars = {
+            "day.txt": market_calendar_output,
+            "day_future.txt": future_calendar_output,
+        }
+        for name, expected in expected_calendars.items():
+            cached_calendar = destination_path / "calendars" / name
+            if not cached_calendar.is_file() or cached_calendar.read_bytes() != expected:
+                raise ValueError("existing RD-Agent dataset view has an invalid calendar")
         for name in ("cn_all.txt", "all.txt"):
             cached_instruments = destination_path / "instruments" / name
             if (
@@ -136,8 +167,9 @@ def prepare_rdagent_dataset_view(
         (temporary / "calendars").mkdir(parents=True)
         (temporary / "instruments").mkdir()
         (temporary / "features").mkdir()
-        (temporary / "calendars" / "day.txt").write_text(
-            "\n".join(selected_calendar) + "\n", encoding="utf-8"
+        (temporary / "calendars" / "day.txt").write_bytes(market_calendar_output)
+        (temporary / "calendars" / "day_future.txt").write_bytes(
+            future_calendar_output
         )
         for path in instruments_path.glob("*.txt"):
             lines = (

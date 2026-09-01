@@ -22,11 +22,13 @@ from quant_data.database import (
 from .baseline_model_stub_resource import resolve_governed_baseline_model_stub
 from .feature_set_registry import get_feature_set
 from .job_store import JobStore
+from .model_recompute import MODEL_RECOMPUTE_EXECUTOR_VERSION
 from .rdagent_candidate_store import RDAGentCandidateStore
+from .research_automation import COMMON_FEATURE_SET_CALENDAR_CONTRACT_VERSION
 from .research_horizon import primary_label_policy_contract
 from .research_label_binding import resolve_research_label_binding
 from .research_store import ResearchStore
-from .research_tournament import MODEL_FAMILIES
+from .research_tournament import MODEL_FAMILIES, canonical_sha256
 
 
 def _safe_scope_token(value: str) -> str:
@@ -129,6 +131,7 @@ class PlatformModelTournamentService:
         feature_set_id: str,
         horizon_profile: str,
         error: str,
+        operational_remediation: Mapping[str, Any] | None = None,
     ) -> bool:
         """Terminalize a lane setup failure only before a job exists.
 
@@ -139,9 +142,18 @@ class PlatformModelTournamentService:
         created or attached concurrently.
         """
 
+        remediation = dict(operational_remediation or {})
+        remediation_token = (
+            _safe_scope_token(canonical_sha256(remediation)) if remediation else ""
+        )
         run_kind = (
             f"platform_model_{stage}_{_safe_scope_token(feature_set_id)}_"
             f"{horizon_profile}"
+            + (
+                f"_remediation_{remediation_token}"
+                if remediation
+                else ""
+            )
         )
         requested_by = f"autopilot:{cycle_id}"
         now = datetime.now(UTC)
@@ -247,7 +259,9 @@ class PlatformModelTournamentService:
         primary_label_policy: Mapping[str, Any],
         research_window_contract: Mapping[str, Any],
         research_window_contract_sha256: str,
+        feature_set_common_window: Mapping[str, Any] | None,
         trials: Sequence[Mapping[str, Any]],
+        operational_remediation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if stage not in {"feature_screen", "model_full"}:
             raise ValueError("platform model tournament stage is invalid")
@@ -262,6 +276,36 @@ class PlatformModelTournamentService:
         expected_profile_count = 1 if stage == "feature_screen" else 3
         if len(stage_profiles) != expected_profile_count:
             raise ValueError("platform model tournament profile contract is incomplete")
+        common_window = dict(feature_set_common_window or {})
+        remediation = dict(operational_remediation or {})
+        remediation_token = (
+            _safe_scope_token(canonical_sha256(remediation)) if remediation else ""
+        )
+        if remediation and (
+            remediation.get("contract_version") != "model-operational-remediation-v1"
+            or remediation.get("target_executor_version")
+            != MODEL_RECOMPUTE_EXECUTOR_VERSION
+            or remediation.get("performance_triggered") is not False
+            or remediation.get("same_hypotheses_and_frozen_specs") is not True
+            or remediation.get("contract_upgrade") is not True
+            or remediation.get("same_frozen_evaluation_contract") is not False
+            or remediation.get("all_trials_re_preregistered") is not True
+            or remediation.get("new_multiple_testing_family") is not True
+        ):
+            raise ValueError("platform model operational remediation is invalid")
+        if common_window and (
+            common_window.get("contract_version")
+            != COMMON_FEATURE_SET_CALENDAR_CONTRACT_VERSION
+            or common_window.get("evidence_sha256")
+            != canonical_sha256(
+                {
+                    key: value
+                    for key, value in common_window.items()
+                    if key != "evidence_sha256"
+                }
+            )
+        ):
+            raise ValueError("platform model tournament common window is invalid")
         identity = str((dataset.get("provenance") or {}).get("dataset_identity_sha256") or "")
         lineage_id = str(dataset.get("lineage_id") or "")
         if len(identity) != 64 or len(lineage_id) != 64:
@@ -287,6 +331,11 @@ class PlatformModelTournamentService:
         run_kind = (
             f"platform_model_{stage}_{_safe_scope_token(feature_set_id)}_"
             f"{horizon_profile}"
+            + (
+                f"_remediation_{remediation_token}"
+                if remediation
+                else ""
+            )
         )
         with self.engine.connect() as connection:
             existing_run = connection.execute(
@@ -323,6 +372,17 @@ class PlatformModelTournamentService:
                     "label_horizon_sessions": label_horizon_sessions,
                     "research_window_contract": dict(research_window_contract),
                     "research_window_contract_sha256": research_window_contract_sha256,
+                    "model_recompute_executor_version": MODEL_RECOMPUTE_EXECUTOR_VERSION,
+                    **(
+                        {"operational_remediation": remediation}
+                        if remediation
+                        else {}
+                    ),
+                    **(
+                        {"feature_set_common_window": common_window}
+                        if common_window
+                        else {}
+                    ),
                     "research_label_binding": label_binding,
                     "research_label_binding_sha256": label_binding["binding_sha256"],
                     "primary_label_policy": policy,
@@ -343,8 +403,14 @@ class PlatformModelTournamentService:
                 or config.get("dataset_identity_sha256") != identity
                 or config.get("periods") != dict(periods)
                 or config.get("evaluation_profiles") != stage_profiles
+                or config.get("feature_set_common_window") != (common_window or None)
                 or config.get("research_label_binding") != label_binding
                 or config.get("primary_label_policy") != policy
+                or (
+                    config.get("model_recompute_executor_version")
+                    not in {None, MODEL_RECOMPUTE_EXECUTOR_VERSION}
+                )
+                or config.get("operational_remediation") != (remediation or None)
             ):
                 raise ValueError("existing platform model tournament run changed contract")
             if str(existing_run.status) in {"failed", "cancelled"}:
@@ -489,10 +555,21 @@ class PlatformModelTournamentService:
                 "label_horizon_sessions": label_horizon_sessions,
                 "research_window_contract": dict(research_window_contract),
                 "research_window_contract_sha256": research_window_contract_sha256,
+                **(
+                    {"feature_set_common_window": common_window}
+                    if common_window
+                    else {}
+                ),
                 "research_label_binding": label_binding,
                 "research_label_binding_sha256": label_binding["binding_sha256"],
                 "primary_label_policy": policy,
                 "primary_label_policy_sha256": policy["policy_sha256"],
+                "model_recompute_executor_version": MODEL_RECOMPUTE_EXECUTOR_VERSION,
+                **(
+                    {"operational_remediation": remediation}
+                    if remediation
+                    else {}
+                ),
             }
             job = self._adopt_exact_unattached_job(
                 cycle_id=cycle_id,
@@ -509,11 +586,14 @@ class PlatformModelTournamentService:
                     / "logs"
                     / (
                         f"platform-model-{stage}-{cycle_id}-"
-                        f"{_safe_scope_token(feature_set_id)}.log"
+                        f"{_safe_scope_token(feature_set_id)}"
+                        f"{'-remediation-' + remediation_token if remediation else ''}.log"
                     ),
                     dedupe_active_kind=False,
                     idempotency_key=(
-                        f"platform-model:{cycle_id}:{stage}:{feature_set_id}"
+                        f"platform-model:{cycle_id}:{stage}:{feature_set_id}:"
+                        f"{MODEL_RECOMPUTE_EXECUTOR_VERSION}:"
+                        f"{canonical_sha256(remediation) if remediation else 'primary'}"
                     ),
                 )
                 if not self._attach_job_if_active_owner(

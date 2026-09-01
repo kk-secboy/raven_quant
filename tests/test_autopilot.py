@@ -28,6 +28,7 @@ from quant_platform.data_automation import (
 )
 from quant_platform.job_store import research_asset_acquisition_idempotency_key
 from quant_platform.research_tournament import (
+    FEATURE_SET_COMMON_WINDOW_POLICY,
     FULL_PROFILES,
     FULL_SEEDS,
     MODEL_FAMILIES,
@@ -167,6 +168,7 @@ def test_model_tournament_first_compares_feature_sets_with_one_fixed_model() -> 
     }
     assert {item["model_family"] for item in screens} == {"lightgbm"}
     assert all(item["spec"]["selection_seeds"] == [11] for item in screens)
+    assert manifest["feature_set_window_policy"] == FEATURE_SET_COMMON_WINDOW_POLICY
 
 
 def test_full_model_trials_are_conditionally_preregistered_before_screening() -> None:

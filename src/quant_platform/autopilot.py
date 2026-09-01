@@ -43,6 +43,7 @@ from .model_ensemble import (
     prediction_grid_from_admission,
 )
 from .model_ensemble_pipeline import ModelEnsemblePipelineService
+from .model_recompute import MODEL_RECOMPUTE_EXECUTOR_VERSION
 from .model_research_governance import (
     REQUIRED_MODEL_SEEDS,
     REQUIRED_RESEARCH_PROFILES,
@@ -58,7 +59,11 @@ from .rdagent_scenarios import (
     resolve_rdagent_assets,
 )
 from .research_asset_store import ResearchAssetStore
-from .research_automation import resolve_research_periods, resolve_research_window_contract
+from .research_automation import (
+    resolve_common_feature_set_calendar,
+    resolve_research_periods,
+    resolve_research_window_contract,
+)
 from .research_horizon import (
     LEGACY_AMBIGUOUS,
     LONG_1_3Y,
@@ -75,6 +80,7 @@ from .research_label_binding import resolve_research_label_binding
 from .research_store import ResearchStore
 from .research_tournament import (
     FEATURE_SCREEN_IDS,
+    FEATURE_SET_COMMON_WINDOW_POLICY,
     FULL_PROFILES,
     FULL_SEEDS,
     MODEL_FAMILIES,
@@ -1276,6 +1282,7 @@ class AutopilotController:
             # The row is historical evidence only.  Managed fin_strategy owns
             # all new strategy/capital work, including cold-start research.
             return {"cycles": 1, "branches": created, "failed": failed}
+        cycle = self._resume_operationally_blocked_model_cycle(cycle)
         if cycle.get("status") != "active":
             return {
                 "cycles": 1,
@@ -1354,7 +1361,7 @@ class AutopilotController:
                 if revalidation_pending
                 and not model_due
                 and existing_model_tournament is None
-                else self.tournaments.get_for_cycle(str(cycle["id"]))
+                else self._active_model_tournament(cycle)
             )
         except KeyError:
             tournament = None
@@ -1384,7 +1391,7 @@ class AutopilotController:
                 full_created, full_failed = self._ensure_platform_model_branches(
                     self.store.get_cycle(str(cycle["id"])),
                     dataset,
-                    self.tournaments.get_for_cycle(str(cycle["id"])),
+                    self._active_model_tournament(cycle),
                     stage="model_full",
                     eligible_feature_set_ids=set(selected_feature_set_ids),
                 )
@@ -1392,7 +1399,7 @@ class AutopilotController:
                 failed += full_failed
                 self._reconcile_model_tournament(
                     self.store.get_cycle(str(cycle["id"])),
-                    self.tournaments.get_for_cycle(str(cycle["id"])),
+                    self._active_model_tournament(cycle),
                 )
                 created += self._enqueue_next_rdagent_model_challenger(
                     self.store.get_cycle(str(cycle["id"])),
@@ -1402,17 +1409,17 @@ class AutopilotController:
                 )
                 self._reconcile_dynamic_model_trials(
                     self.store.get_cycle(str(cycle["id"])),
-                    self.tournaments.get_for_cycle(str(cycle["id"])),
+                    self._active_model_tournament(cycle),
                 )
                 champions = self._model_champions(
                     self.store.get_cycle(str(cycle["id"])),
-                    self.tournaments.get_for_cycle(str(cycle["id"])),
+                    self._active_model_tournament(cycle),
                     selected_feature_set_ids,
                 )
                 ensemble_created, ensemble_failed = self._reconcile_model_ensembles(
                     self.store.get_cycle(str(cycle["id"])),
                     dataset,
-                    self.tournaments.get_for_cycle(str(cycle["id"])),
+                    self._active_model_tournament(cycle),
                     champions,
                 )
                 created += ensemble_created
@@ -1593,7 +1600,7 @@ class AutopilotController:
             None,
         )
         try:
-            terminal_tournament = self.tournaments.get_for_cycle(str(cycle["id"]))
+            terminal_tournament = self._active_model_tournament(cycle)
         except KeyError:
             revalidation = dict(
                 (current_cycle.get("state") or {}).get(
@@ -1619,10 +1626,24 @@ class AutopilotController:
             and tournament_is_terminal
             and created == 0
         ):
+            active_tournament_id = str(
+                (current_cycle.get("state") or {}).get(
+                    "active_research_tournament_id"
+                )
+                or (terminal_tournament or {}).get("id")
+                or ""
+            )
             branch_failures = [
                 item
                 for item in current_branches
                 if item.get("status") in {"failed", "blocked"}
+                and not (
+                    str((item.get("details") or {}).get("branch_kind") or "").startswith(
+                        "platform_model_"
+                    )
+                    and str((item.get("details") or {}).get("tournament_id") or "")
+                    != active_tournament_id
+                )
             ]
             tournament_blocked = bool(
                 terminal_tournament is not None
@@ -1690,6 +1711,227 @@ class AutopilotController:
         # exception rolls every restoration back; it must never be "handled"
         # by unconditionally rewriting the ResearchRun as failed afterward.
         return self.store.retry_failed_branch(branch_id, actor="autopilot")
+
+    def _active_model_tournament(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        tournament_id = str(
+            (cycle.get("state") or {}).get("active_research_tournament_id") or ""
+        )
+        if tournament_id:
+            return self.tournaments.get_tournament(tournament_id)
+        return self.tournaments.get_for_cycle(str(cycle["id"]))
+
+    @staticmethod
+    def _operational_trial_ids(tournament: dict[str, Any]) -> set[str]:
+        return {
+            str(item["id"])
+            for item in tournament.get("trials") or []
+            if str(item.get("status") or "") == "failed"
+            and (
+                str((item.get("metrics") or {}).get("reason_code") or "")
+                in {
+                    "resource_blocked",
+                    "operational_failure",
+                    "screen_execution_failed",
+                    "execution_failed_after_retry",
+                }
+                or (item.get("evidence") or {}).get(
+                    "investment_hypothesis_rejected"
+                )
+                is False
+            )
+        }
+
+    @staticmethod
+    def _without_model_tournament_results(state: dict[str, Any]) -> dict[str, Any]:
+        """Drop only derived model-contest state before a full successor run."""
+
+        exact_keys = {
+            "screen_selected_feature_set_ids",
+            "feature_screen_evidence",
+            "model_champions",
+            "model_champion_evidence",
+            "prediction_champion",
+            "prediction_champion_evidence",
+            "prediction_champion_status",
+            "prediction_champion_roll_forward",
+            "prediction_finalist_multiple_testing",
+            "fin_quant_status",
+            "fin_quant_blocker",
+            "research_tournament_status",
+            "current_identity_revalidation",
+        }
+        prefixes = ("model_ensemble_",)
+        return {
+            key: value
+            for key, value in state.items()
+            if key not in exact_keys and not key.startswith(prefixes)
+        }
+
+    def _operational_source_owners_terminal(
+        self,
+        cycle: dict[str, Any],
+        source: dict[str, Any],
+    ) -> bool:
+        """Return whether no durable owner can still append source evidence."""
+
+        if str(source.get("status") or "") not in {
+            "planned",
+            "running",
+            "failed",
+            "blocked",
+        }:
+            return False
+        source_id = str(source.get("id") or "")
+        bound_branches = []
+        for branch in cycle.get("branches") or []:
+            details = dict(branch.get("details") or {})
+            if source_id in {
+                str(details.get("tournament_id") or ""),
+                str(details.get("research_tournament_id") or ""),
+            }:
+                bound_branches.append(branch)
+        if not bound_branches:
+            return False
+        for branch in bound_branches:
+            if str(branch.get("status") or "") not in _TERMINAL_BRANCH_STATUSES:
+                return False
+            run_id = str(branch.get("research_run_id") or "")
+            branch_job_id = str(branch.get("job_id") or "")
+            if not run_id or not branch_job_id:
+                return False
+            try:
+                run = self.research.get_run(run_id)
+            except KeyError:
+                return False
+            if str(run.get("status") or "") not in {
+                "succeeded",
+                "failed",
+                "blocked",
+                "cancelled",
+            }:
+                return False
+            current_job_id = str(run.get("job_id") or "")
+            if not current_job_id:
+                return False
+            for job_id in {branch_job_id, current_job_id}:
+                try:
+                    job = self.jobs.get(job_id)
+                except KeyError:
+                    return False
+                if str(job.get("status") or "") not in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    return False
+        return True
+
+    def _resume_operationally_blocked_model_cycle(
+        self, cycle: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Open a successor tournament only after an executor repair.
+
+        Ordinary failed gates never enter this path.  The source tournament,
+        trials, candidate, run, job and resource artifact remain immutable.
+        """
+
+        if str(cycle.get("status") or "") not in {"active", "blocked"}:
+            return cycle
+        model_branches = [
+            item
+            for item in cycle.get("branches") or []
+            if str((item.get("details") or {}).get("branch_kind") or "").startswith(
+                "platform_model_"
+            )
+        ]
+        if not model_branches:
+            return cycle
+        try:
+            source = self._active_model_tournament(cycle)
+        except KeyError:
+            return cycle
+        if (source.get("manifest") or {}).get("operational_remediation"):
+            return cycle
+        operational_trial_ids = self._operational_trial_ids(source)
+        if not operational_trial_ids:
+            return cycle
+        failures = [
+            item
+            for item in cycle.get("branches") or []
+            if item.get("status") in {"failed", "blocked"}
+        ]
+        operational_branches = [
+            item
+            for item in model_branches
+            if str((item.get("details") or {}).get("tournament_id") or "")
+            == str(source["id"])
+            and {
+                str(binding.get("trial_id") or "")
+                for binding in (item.get("details") or {}).get(
+                    "candidate_bindings", []
+                )
+            }
+            & operational_trial_ids
+        ]
+        # A factor/strategy failure or a real model gate failure must not be
+        # laundered through an operational remediation tournament.
+        operational_branch_ids = {str(item["id"]) for item in operational_branches}
+        if not operational_branches or any(
+            str(item["id"]) not in operational_branch_ids for item in failures
+        ):
+            return cycle
+        source_versions = {
+            str(
+                (item.get("details") or {}).get(
+                    "model_recompute_executor_version"
+                )
+                or "legacy-unrecorded-executor"
+            )
+            for item in operational_branches
+        }
+        if len(source_versions) != 1:
+            raise ValueError("operationally failed model branches used mixed executors")
+        source_executor = next(iter(source_versions))
+        if source_executor == MODEL_RECOMPUTE_EXECUTOR_VERSION:
+            return cycle
+        if not self._operational_source_owners_terminal(cycle, source):
+            return cycle
+        try:
+            successor = self.tournaments.ensure_operational_remediation_preregistered(
+                source_tournament_id=str(source["id"]),
+                source_executor_version=source_executor,
+                target_executor_version=MODEL_RECOMPUTE_EXECUTOR_VERSION,
+            )
+        except ValueError as exc:
+            # The store repeats the terminal-owner check while holding row
+            # locks. A concurrent retry may reopen a source job after the
+            # optimistic read above; in that race this tick simply waits.
+            if str(exc).startswith("operational remediation source "):
+                return cycle
+            raise
+        remediation = dict(
+            (successor.get("manifest") or {}).get("operational_remediation") or {}
+        )
+        clean_state = self._without_model_tournament_results(
+            dict(cycle.get("state") or {})
+        )
+        return self.store.set_cycle_state(
+            str(cycle["id"]),
+            state={
+                **clean_state,
+                "research_tournament_id": str(successor["id"]),
+                "active_research_tournament_id": str(successor["id"]),
+                "operational_remediation": remediation,
+                "operational_remediation_source_trial_ids": sorted(
+                    operational_trial_ids
+                ),
+                "result": "model_operational_remediation_running",
+            },
+            stage="model_operational_remediation",
+            status="active",
+            error=None,
+            finished=False,
+        )
 
     def _latest_dataset(self) -> dict[str, Any] | None:
         candidates = [
@@ -1773,6 +2015,7 @@ class AutopilotController:
             item
             for item in tournament["trials"]
             if (item.get("spec") or {}).get("round") == stage
+            and item.get("status") in {"preregistered", "queued", "running"}
             and (
                 eligible_feature_set_ids is None
                 or str(item.get("feature_set_id")) in eligible_feature_set_ids
@@ -1786,11 +2029,41 @@ class AutopilotController:
             .read_text(encoding="utf-8")
             .splitlines()
         )
+        tournament_manifest = dict(tournament.get("manifest") or {})
+        remediation = dict(tournament_manifest.get("operational_remediation") or {})
+        window_policy = tournament_manifest.get("feature_set_window_policy")
+        common_window: dict[str, Any] | None = None
+        if window_policy is not None:
+            if window_policy != FEATURE_SET_COMMON_WINDOW_POLICY:
+                raise ValueError("feature-set tournament common-window policy changed")
+            manifest_feature_sets = tournament_manifest.get("feature_sets")
+            if not isinstance(manifest_feature_sets, list) or not manifest_feature_sets:
+                raise ValueError("feature-set tournament manifest has no candidates")
+            frozen_feature_sets: list[dict[str, Any]] = []
+            for reference in manifest_feature_sets:
+                if not isinstance(reference, dict):
+                    raise ValueError("feature-set tournament manifest candidate is invalid")
+                definition = get_feature_set(str(reference.get("id") or ""))
+                if (
+                    definition.get("definition_sha256")
+                    != reference.get("definition_sha256")
+                    or len(definition.get("features") or {})
+                    != int(reference.get("feature_count") or 0)
+                ):
+                    raise ValueError("feature-set tournament candidate definition changed")
+                frozen_feature_sets.append(definition)
+            calendar, common_window = resolve_common_feature_set_calendar(
+                dataset,
+                calendar,
+                frozen_feature_sets,
+            )
         horizon_profile = str(cycle.get("horizon_profile") or "")
         primary_label = primary_label_horizon_sessions(horizon_profile)
         policy = primary_label_policy_contract()
         created = 0
         failed = 0
+        common_periods: dict[str, str] | None = None
+        common_profile_periods: dict[str, dict[str, str]] | None = None
         for feature_set_id, trials in by_feature.items():
             feature_set = get_feature_set(feature_set_id)
             periods, resolution = resolve_research_window_contract(
@@ -1799,7 +2072,24 @@ class AutopilotController:
                 horizon_profile=horizon_profile,
                 feature_set=feature_set,
             )
+            if common_window is not None:
+                profile_periods = {
+                    str(item["id"]): dict(item["periods"])
+                    for item in resolution["evaluation_profiles"]
+                }
+                if common_periods is None:
+                    common_periods = dict(periods)
+                    common_profile_periods = profile_periods
+                elif (
+                    periods != common_periods
+                    or profile_periods != common_profile_periods
+                ):
+                    raise ValueError(
+                        "feature-set tournament candidates resolved different periods"
+                    )
             scope = f"platform:{stage}:{feature_set_id}"
+            if remediation:
+                scope += f":remediation:{str(tournament['id'])[:16]}"
             branch = self.store.branch_for_scope(str(cycle["id"]), "fin_model", scope)
             if branch is not None:
                 if branch.get("status") == "failed":
@@ -1823,7 +2113,9 @@ class AutopilotController:
                     research_window_contract_sha256=resolution[
                         "research_window_contract_sha256"
                     ],
+                    feature_set_common_window=common_window,
                     trials=trials,
+                    operational_remediation=remediation or None,
                 )
                 bindings: list[dict[str, str]] = []
                 for binding in lane["bindings"]:
@@ -1845,11 +2137,28 @@ class AutopilotController:
                         "tournament_stage": stage,
                         "feature_set_id": feature_set_id,
                         "tournament_id": str(tournament["id"]),
+                        "model_recompute_executor_version": (
+                            MODEL_RECOMPUTE_EXECUTOR_VERSION
+                        ),
+                        **(
+                            {"operational_remediation": remediation}
+                            if remediation
+                            else {}
+                        ),
                         "horizon_profile": horizon_profile,
                         "label_horizon_sessions": primary_label,
                         "primary_label_policy_sha256": policy[
                             "policy_sha256"
                         ],
+                        **(
+                            {
+                                "feature_set_common_window_sha256": common_window[
+                                    "evidence_sha256"
+                                ]
+                            }
+                            if common_window is not None
+                            else {}
+                        ),
                         "candidate_bindings": bindings,
                         "final_oos_opened": False,
                     },
@@ -1863,6 +2172,7 @@ class AutopilotController:
                     feature_set_id=feature_set_id,
                     horizon_profile=horizon_profile,
                     error=f"platform model lane setup failed: {exc}",
+                    operational_remediation=remediation or None,
                 )
                 failed += 1
         return created, failed
@@ -2657,7 +2967,18 @@ class AutopilotController:
                 "platform_model_model_full",
             }:
                 continue
+            if str(details.get("tournament_id") or "") != str(tournament["id"]):
+                continue
             run = self.research.get_run(str(branch["research_run_id"]))
+            run_runtime = dict(run.get("runtime") or {})
+            resource_candidate_ids = {
+                str(item.get("candidate_id") or "")
+                for item in run_runtime.get("resource_blocked_candidates") or []
+            }
+            operational_candidate_ids = {
+                str(item.get("candidate_id") or "")
+                for item in run_runtime.get("operational_failed_candidates") or []
+            }
             for binding in details.get("candidate_bindings") or []:
                 candidate_id = str(binding["candidate_id"])
                 evidence = self._candidate_tournament_evidence(candidate_id)
@@ -2683,12 +3004,19 @@ class AutopilotController:
                             evidence=evidence,
                         )
                 elif str(run["status"]) == "blocked":
+                    reason_code = (
+                        "operational_failure"
+                        if candidate_id in operational_candidate_ids
+                        else "resource_blocked"
+                        if candidate_id in resource_candidate_ids
+                        else str(run_runtime.get("reason_code") or "operational_failure")
+                    )
                     for trial_id in trial_ids:
                         self._advance_tournament_trial(
                             trial_id,
                             "failed",
                             candidate_id=candidate_id,
-                            metrics={"reason_code": "resource_blocked"},
+                            metrics={"reason_code": reason_code},
                             evidence=evidence,
                         )
                 elif str(run["status"]) in {"running", "evaluating"}:
@@ -2712,7 +3040,7 @@ class AutopilotController:
         self, cycle: dict[str, Any], tournament: dict[str, Any]
     ) -> None:
         del cycle
-        refreshed = self.tournaments.get_for_cycle(str(tournament["cycle_id"]))
+        refreshed = self.tournaments.get_tournament(str(tournament["id"]))
         for trial in refreshed["trials"]:
             if (
                 (trial.get("spec") or {}).get("source") != "rdagent_fin_model"
@@ -2822,7 +3150,7 @@ class AutopilotController:
                 )
                 return []
             return [str(item) for item in frozen]
-        refreshed = self.tournaments.get_for_cycle(str(cycle["id"]))
+        refreshed = self._active_model_tournament(cycle)
         screen_trials = [
             item
             for item in refreshed["trials"]
@@ -3093,6 +3421,10 @@ class AutopilotController:
     ) -> int:
         if not feature_set_ids:
             return 0
+        tournament = self._active_model_tournament(cycle)
+        remediation = dict(
+            (tournament.get("manifest") or {}).get("operational_remediation") or {}
+        )
         branches = self.store.get_cycle(str(cycle["id"]))["branches"]
         rdagent_branches = [
             item
@@ -3100,6 +3432,14 @@ class AutopilotController:
             if item["scenario"] == "fin_model"
             and not str((item.get("details") or {}).get("branch_kind") or "").startswith(
                 "platform_model_"
+            )
+            and (
+                not remediation
+                or str(
+                    (item.get("details") or {}).get("research_tournament_id")
+                    or ""
+                )
+                == str(tournament["id"])
             )
         ]
         active = next(
@@ -3118,6 +3458,8 @@ class AutopilotController:
         existing_scopes = {str(item["scope_key"]) for item in rdagent_branches}
         for feature_set_id in feature_set_ids:
             scope = f"monthly:{feature_set_id}"
+            if remediation:
+                scope += f":remediation:{str(tournament['id'])[:16]}"
             if scope in existing_scopes:
                 continue
             self._enqueue(
@@ -3127,9 +3469,7 @@ class AutopilotController:
                 scope,
                 config=config,
                 feature_set_id=feature_set_id,
-                tournament_id=str(
-                    self.tournaments.get_for_cycle(str(cycle["id"]))["id"]
-                ),
+                tournament_id=str(tournament["id"]),
             )
             return 1
         return 0
@@ -3225,12 +3565,46 @@ class AutopilotController:
                 == "platform_model_model_full"
                 or str(item.get("scope_key") or "").startswith("monthly:")
             )
+            and (
+                (
+                    str((item.get("details") or {}).get("branch_kind") or "").startswith(
+                        "platform_model_"
+                    )
+                    and str((item.get("details") or {}).get("tournament_id") or "")
+                    == str(tournament["id"])
+                )
+                or (
+                    not str(
+                        (item.get("details") or {}).get("branch_kind") or ""
+                    ).startswith("platform_model_")
+                    and (
+                        not (tournament.get("manifest") or {}).get(
+                            "operational_remediation"
+                        )
+                        or str(
+                            (item.get("details") or {}).get(
+                                "research_tournament_id"
+                            )
+                            or ""
+                        )
+                        == str(tournament["id"])
+                    )
+                )
+            )
             and str((item.get("details") or {}).get("feature_set_id") or "")
             in selected_set
         ]
+        remediation_suffix = (
+            f":remediation:{str(tournament['id'])[:16]}"
+            if (tournament.get("manifest") or {}).get("operational_remediation")
+            else ""
+        )
         expected_scopes = {
-            *(f"platform:model_full:{item}" for item in selected_set),
-            *(f"monthly:{item}" for item in selected_set),
+            *(
+                f"platform:model_full:{item}{remediation_suffix}"
+                for item in selected_set
+            ),
+            *(f"monthly:{item}{remediation_suffix}" for item in selected_set),
         }
         if {str(item["scope_key"]) for item in relevant} != expected_scopes:
             return []
@@ -3244,7 +3618,7 @@ class AutopilotController:
         ):
             return []
 
-        refreshed = self.tournaments.get_for_cycle(str(cycle["id"]))
+        refreshed = self._active_model_tournament(cycle)
         candidates: list[dict[str, Any]] = []
         trial_series_by_profile: dict[
             str, list[tuple[dict[str, str], pd.Series]]
@@ -3532,7 +3906,7 @@ class AutopilotController:
 
         ensemble_trial_ids = {
             str(item["candidate_id"]): str(item["id"])
-            for item in self.tournaments.get_for_cycle(str(cycle["id"]))["trials"]
+            for item in self._active_model_tournament(cycle)["trials"]
             if item.get("trial_kind") == "model_ensemble" and item.get("candidate_id")
         }
         try:
@@ -3868,7 +4242,7 @@ class AutopilotController:
         )
         if winner["kind"] == "ensemble":
             self._advance_tournament_trial(str(winner["trial_id"]), "selected")
-        refreshed = self.tournaments.get_for_cycle(str(cycle["id"]))
+        refreshed = self._active_model_tournament(cycle)
         selected_trial_ids = sorted(
             str(item["id"])
             for item in refreshed["trials"]

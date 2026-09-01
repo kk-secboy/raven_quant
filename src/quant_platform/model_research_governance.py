@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 
 from .horizon_factor_bundle import validate_horizon_factor_bundle
+from .research_execution_cadence import (
+    validate_research_execution_cadence_contract,
+)
 from .research_horizon import (
     LEGACY_AMBIGUOUS,
     primary_label_horizon_sessions,
@@ -575,6 +578,17 @@ def validate_independent_model_evidence(
         raise ValueError("model evidence dataset identity is invalid")
     if evidence.get("final_oos_opened") is not False:
         raise ValueError("research-stage model evidence must not open the final OOS")
+    cadence_value = evidence.get("research_execution_cadence")
+    if cadence_value is not None:
+        cadence = validate_research_execution_cadence_contract(
+            cadence_value,
+            expected_horizon_profile=str(evidence.get("horizon_profile") or ""),
+        )
+        if (
+            evidence.get("research_execution_cadence_sha256")
+            != cadence["evidence_sha256"]
+        ):
+            raise ValueError("model evidence decision cadence digest is invalid")
     execution_environment_sha256 = evidence.get("execution_environment_sha256")
     if not is_sha256(execution_environment_sha256):
         raise ValueError("model evidence has no immutable execution environment")
@@ -733,6 +747,15 @@ def validate_quant_bundle_evidence(
     horizon_profile = str(bundle.get("horizon_profile") or "").strip()
     horizon_factor_bundle = bundle.get("horizon_factor_bundle")
     if horizon_profile:
+        execution_cadence = validate_research_execution_cadence_contract(
+            bundle.get("research_execution_cadence") or {},
+            expected_horizon_profile=horizon_profile,
+        )
+        if (
+            bundle.get("research_execution_cadence_sha256")
+            != execution_cadence["evidence_sha256"]
+        ):
+            raise ValueError("quant bundle decision cadence digest is invalid")
         factor_bundle = validate_horizon_factor_bundle(
             horizon_factor_bundle if isinstance(horizon_factor_bundle, Mapping) else {}
         )
@@ -793,6 +816,12 @@ def validate_quant_bundle_evidence(
             raise ValueError(f"quant bundle ablation {name} used another dataset")
         if result.get("execution_environment_sha256") != execution_environment_sha256:
             raise ValueError(f"quant bundle ablation {name} used another environment")
+        if horizon_profile and (
+            result.get("research_execution_cadence") != execution_cadence
+            or result.get("research_execution_cadence_sha256")
+            != execution_cadence["evidence_sha256"]
+        ):
+            raise ValueError(f"quant bundle ablation {name} changed decision cadence")
         profiles = result.get("profiles")
         if not isinstance(profiles, Mapping) or set(profiles) != set(REQUIRED_RESEARCH_PROFILES):
             raise ValueError(f"quant bundle ablation {name} misses governed profiles")

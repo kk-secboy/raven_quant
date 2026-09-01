@@ -17,9 +17,13 @@ from .model_research_governance import (
     is_sha256,
     resolve_model_label_contract,
 )
+from .research_execution_cadence import (
+    validate_research_execution_cadence_contract,
+)
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v6-qlib-signal-record"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v7-drop-raw-memory-audit"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
+MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 MODEL_TEMPLATE_FILENAME = "platform_model_templates.py"
@@ -87,6 +91,63 @@ _FORBIDDEN_ATTRIBUTES = {
 
 class ModelResourceLimitError(RuntimeError):
     """The candidate exceeded a governed compute budget, not an investment gate."""
+
+
+def _read_model_memory_audit(path: Path) -> list[dict[str, Any]]:
+    """Read the append-only sandbox memory audit without trusting partial lines."""
+
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            # A cgroup kill can interrupt the final append. Earlier flushed
+            # stages remain useful evidence and the truncated tail is ignored.
+            continue
+        if (
+            not isinstance(record, dict)
+            or record.get("contract_version") != MODEL_MEMORY_AUDIT_CONTRACT_VERSION
+            or not isinstance(record.get("stage"), str)
+        ):
+            continue
+        records.append(record)
+    return records
+
+
+def _model_memory_peak_bytes(records: list[dict[str, Any]]) -> int | None:
+    peaks = [
+        value
+        for record in records
+        for value in (
+            record.get("cgroup_peak_bytes"),
+            record.get("process_peak_rss_bytes"),
+        )
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    ]
+    return max(peaks, default=None)
+
+
+def _memory_limit_failure_details(
+    records: list[dict[str, Any]],
+    *,
+    governed_limit_bytes: int,
+) -> str:
+    """Describe an OOM without presenting a pre-kill sample as the true peak."""
+
+    last_flushed_peak = _model_memory_peak_bytes(records)
+    suffix = (
+        f", last_flushed_peak_bytes={last_flushed_peak}"
+        if last_flushed_peak is not None
+        else ""
+    )
+    return (
+        "cgroup_limit_hit=true, "
+        f"governed_limit_bytes={governed_limit_bytes}{suffix}"
+    )
 
 
 def governed_checkpoint_format(model_engine: str) -> str:
@@ -410,6 +471,14 @@ def execute_model_candidate(
         label_horizon_sessions=manifest.get("label_horizon_sessions"),
     )
     label_contract_sha256 = canonical_sha256(label_contract)
+    execution_cadence = None
+    if not allow_inference and not allow_live_retrain:
+        if label_contract["legacy"] is True:
+            raise ValueError("legacy model research has no governed decision cadence")
+        execution_cadence = validate_research_execution_cadence_contract(
+            manifest.get("research_execution_cadence") or {},
+            expected_horizon_profile=str(label_contract["horizon_profile"]),
+        )
     data_contract_version = (
         MODEL_DATA_CONTRACT_VERSION
         if label_contract["legacy"] is True
@@ -483,18 +552,38 @@ def execute_model_candidate(
     runner_sha256 = file_sha256(runner_path)
     executor_source_sha256 = file_sha256(Path(__file__).resolve())
     template_source = Path(__file__).resolve().with_name("model_templates.py")
+    portfolio_calendar_source = Path(__file__).resolve().with_name(
+        "qlib_portfolio_calendar.py"
+    )
+    research_strategy_source = Path(__file__).resolve().with_name(
+        "qlib_research_strategy.py"
+    )
+    research_cadence_source = Path(__file__).resolve().with_name(
+        "research_execution_cadence.py"
+    )
+    research_horizon_source = Path(__file__).resolve().with_name(
+        "research_horizon.py"
+    )
     workflow_adapter_source = Path(__file__).resolve().with_name("qlib_workflow.py")
     upstream_versions_source = Path(__file__).resolve().with_name("upstream_versions.py")
     if not all(
         path.is_file()
         for path in (
             template_source,
+            portfolio_calendar_source,
+            research_strategy_source,
+            research_cadence_source,
+            research_horizon_source,
             workflow_adapter_source,
             upstream_versions_source,
         )
     ):
         raise ValueError("governed model runtime dependencies are unavailable")
     template_sha256 = file_sha256(template_source)
+    portfolio_calendar_sha256 = file_sha256(portfolio_calendar_source)
+    research_strategy_sha256 = file_sha256(research_strategy_source)
+    research_cadence_sha256 = file_sha256(research_cadence_source)
+    research_horizon_sha256 = file_sha256(research_horizon_source)
     workflow_adapter_sha256 = file_sha256(workflow_adapter_source)
     upstream_versions_sha256 = file_sha256(upstream_versions_source)
     resource_policy = governed_model_resource_policy(
@@ -514,6 +603,10 @@ def execute_model_candidate(
         "executor_source_sha256": executor_source_sha256,
         "runner_sha256": runner_sha256,
         "model_template_sha256": template_sha256,
+        "qlib_portfolio_calendar_sha256": portfolio_calendar_sha256,
+        "qlib_research_strategy_sha256": research_strategy_sha256,
+        "research_execution_cadence_source_sha256": research_cadence_sha256,
+        "research_horizon_source_sha256": research_horizon_sha256,
         "qlib_workflow_adapter_sha256": workflow_adapter_sha256,
         "upstream_versions_sha256": upstream_versions_sha256,
         "sandbox_image": image,
@@ -528,6 +621,22 @@ def execute_model_candidate(
     sandbox_package = workspace / "quant_platform"
     sandbox_package.mkdir()
     (sandbox_package / "__init__.py").touch()
+    shutil.copy2(
+        portfolio_calendar_source,
+        sandbox_package / "qlib_portfolio_calendar.py",
+    )
+    shutil.copy2(
+        research_strategy_source,
+        sandbox_package / "qlib_research_strategy.py",
+    )
+    shutil.copy2(
+        research_cadence_source,
+        sandbox_package / "research_execution_cadence.py",
+    )
+    shutil.copy2(
+        research_horizon_source,
+        sandbox_package / "research_horizon.py",
+    )
     shutil.copy2(workflow_adapter_source, sandbox_package / "qlib_workflow.py")
     shutil.copy2(upstream_versions_source, sandbox_package / "upstream_versions.py")
     runtime_checkpoint: Path | None = None
@@ -564,9 +673,16 @@ def execute_model_candidate(
         "resource_policy": resource_policy,
         "model_label_contract": label_contract,
         "model_label_contract_sha256": label_contract_sha256,
+        **(
+            {"research_execution_cadence": execution_cadence}
+            if execution_cadence is not None
+            else {}
+        ),
         "execution_environment": execution_environment,
         "execution_environment_sha256": execution_environment_sha256,
     }
+    if execution_cadence is None:
+        runtime_manifest.pop("research_execution_cadence", None)
     (workspace / "manifest.json").write_text(
         json.dumps(runtime_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -577,6 +693,10 @@ def execute_model_candidate(
         MODEL_TEMPLATE_FILENAME,
         "manifest.json",
         "quant_platform/__init__.py",
+        "quant_platform/qlib_portfolio_calendar.py",
+        "quant_platform/qlib_research_strategy.py",
+        "quant_platform/research_execution_cadence.py",
+        "quant_platform/research_horizon.py",
         "quant_platform/qlib_workflow.py",
         "quant_platform/upstream_versions.py",
     ]
@@ -647,12 +767,23 @@ def execute_model_candidate(
             "model execution exceeded the governed wall-clock budget "
             f"({effective_timeout_seconds}s, stage={resource_policy['stage']})"
         ) from exc
+    memory_audit_path = workspace / "output" / "memory_stages.jsonl"
+    memory_audit_records = _read_model_memory_audit(memory_audit_path)
+    observed_memory_peak_bytes = _model_memory_peak_bytes(memory_audit_records)
     if completed.returncode != 0:
         message = (completed.stderr or completed.stdout or "model execution failed").strip()
         if completed.returncode in {137, 143, -9, -15} or "out of memory" in message.lower():
+            governed_limit_bytes = (
+                int(resource_policy["limits"]["memory_gb"]) * 1024**3
+            )
+            memory_failure = _memory_limit_failure_details(
+                memory_audit_records,
+                governed_limit_bytes=governed_limit_bytes,
+            )
             raise ModelResourceLimitError(
                 "model execution exceeded the governed CPU/memory budget "
-                f"(exit={completed.returncode}, stage={resource_policy['stage']})"
+                f"(exit={completed.returncode}, stage={resource_policy['stage']}"
+                f", {memory_failure})"
             )
         raise ValueError(f"independent model recomputation failed: {message[-4000:]}")
     result_path = workspace / "output" / "result.json"
@@ -663,6 +794,16 @@ def execute_model_candidate(
         raise ValueError("independent model recomputation result is invalid")
     if result.get("resource_policy") != resource_policy:
         raise ValueError("independent model recomputation changed its resource policy")
+    result_memory_audit = result.get("memory_audit") or {}
+    if (
+        result_memory_audit.get("contract_version")
+        != MODEL_MEMORY_AUDIT_CONTRACT_VERSION
+        or result_memory_audit.get("path") != "/work/output/memory_stages.jsonl"
+        or not memory_audit_path.is_file()
+        or result_memory_audit.get("sha256") != file_sha256(memory_audit_path)
+        or result_memory_audit.get("stages") != memory_audit_records
+    ):
+        raise ValueError("independent model memory audit failed immutable verification")
     data_contract = result.get("model_data_contract") or {}
     if (
         data_contract.get("contract_version") != data_contract_version
@@ -674,6 +815,18 @@ def execute_model_candidate(
         or result.get("model_label_contract_sha256") != label_contract_sha256
     ):
         raise ValueError("independent model recomputation changed its label contract")
+    if execution_cadence is not None:
+        if (
+            result.get("research_execution_cadence") != execution_cadence
+            or result.get("research_execution_cadence_sha256")
+            != execution_cadence["evidence_sha256"]
+        ):
+            raise ValueError("independent model recomputation changed its decision cadence")
+    elif (
+        result.get("research_execution_cadence") is not None
+        or result.get("research_execution_cadence_sha256") is not None
+    ):
+        raise ValueError("non-portfolio model execution claimed a decision cadence")
     model_spec = result.get("model_spec") or {}
     if result.get("model_spec_sha256") != canonical_sha256(model_spec):
         raise ValueError("independent model recomputation model specification is invalid")
@@ -737,10 +890,18 @@ def execute_model_candidate(
         "model_template_sha256": template_sha256,
         "model_data_contract_sha256": result["model_data_contract_sha256"],
         "model_label_contract_sha256": label_contract_sha256,
+        "research_execution_cadence_sha256": (
+            execution_cadence["evidence_sha256"]
+            if execution_cadence is not None
+            else None
+        ),
         "research_window_contract_sha256": label_contract[
             "research_window_contract_sha256"
         ],
         "model_spec_sha256": result["model_spec_sha256"],
+        "memory_audit_contract_version": MODEL_MEMORY_AUDIT_CONTRACT_VERSION,
+        "memory_audit_sha256": file_sha256(memory_audit_path),
+        "observed_memory_peak_bytes": observed_memory_peak_bytes,
         "execution_environment": execution_environment,
         "execution_environment_sha256": execution_environment_sha256,
         "network_mode": "none",

@@ -16,6 +16,7 @@ from quant_platform.model_ensemble import (
     daily_rank_correlation,
     equal_rank_predictions,
     load_sealed_predictions,
+    validate_model_ensemble_label_contract,
 )
 from quant_platform.model_research_governance import (
     REQUIRED_MODEL_SEEDS,
@@ -26,9 +27,15 @@ from quant_platform.model_research_governance import (
     require_model_metric_gate,
     verify_model_prediction_artifact,
 )
+from quant_platform.qlib_portfolio_calendar import (
+    resolve_qlib_portfolio_calendar_boundary,
+)
 from quant_platform.qlib_workflow import (
     qlib_workflow_run,
     qlib_workflow_tracking_uri,
+)
+from quant_platform.research_execution_cadence import (
+    validate_research_execution_cadence_contract,
 )
 
 
@@ -115,6 +122,38 @@ def main() -> None:
     }
     if len(valid_ends) != 1 or len(final_windows) != 1:
         raise ValueError("ensemble profiles do not share the pre-final/OOS boundary")
+    member_bindings: dict[str, dict[str, Any]] = {}
+    for raw_candidate in manifest.get("candidates") or []:
+        if not isinstance(raw_candidate, dict):
+            raise ValueError("ensemble evaluation candidate is invalid")
+        for raw_component in raw_candidate.get("components") or []:
+            if not isinstance(raw_component, dict):
+                raise ValueError("ensemble evaluation component is invalid")
+            member_id = str(raw_component.get("model_candidate_id") or "")
+            binding = raw_component.get("research_label_binding")
+            if not member_id or not isinstance(binding, dict):
+                raise ValueError("ensemble component has no frozen label binding")
+            existing = member_bindings.get(member_id)
+            if existing is not None and existing != binding:
+                raise ValueError("ensemble component label binding changed between candidates")
+            member_bindings[member_id] = dict(binding)
+    label_contract = validate_model_ensemble_label_contract(
+        manifest.get("ensemble_label_contract") or {},
+        member_bindings=member_bindings,
+    )
+    label_identity = dict(label_contract["label_identity"])
+    execution_cadence = validate_research_execution_cadence_contract(
+        manifest.get("research_execution_cadence") or {},
+        expected_horizon_profile=str(label_identity["horizon_profile"]),
+    )
+    if (
+        label_identity.get("dataset_name") != manifest.get("dataset")
+        or label_identity.get("dataset_identity_sha256") != identity
+        or dict(label_identity.get("periods") or {})
+        != dict(by_profile["recent_3y"].get("periods") or {})
+    ):
+        raise ValueError("ensemble label target differs from its evaluation manifest")
+    label_expression = str(label_identity["label_expression"])
 
     import qlib
     from qlib.contrib.evaluate import risk_analysis
@@ -163,7 +202,11 @@ def main() -> None:
             components = [dict(item) for item in candidate.get("components") or []]
             frozen_components = [dict(item) for item in frozen.get("components") or []]
             if [
-                {key: value for key, value in item.items() if key != "prediction_grid"}
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"prediction_grid", "research_label_binding"}
+                }
                 for item in components
             ] != frozen_components:
                 raise ValueError("ensemble components changed after preregistration")
@@ -185,6 +228,12 @@ def main() -> None:
                 "ensemble_id": ensemble_id,
                 "ensemble_manifest_sha256": str(candidate["manifest_sha256"]),
                 "dataset_identity_sha256": identity,
+                "ensemble_label_contract": label_contract,
+                "ensemble_label_contract_sha256": label_contract["evidence_sha256"],
+                "research_execution_cadence": execution_cadence,
+                "research_execution_cadence_sha256": execution_cadence[
+                    "evidence_sha256"
+                ],
                 "combiner": "equal_rank",
                 "stacking": False,
                 "final_oos_opened": False,
@@ -199,13 +248,19 @@ def main() -> None:
             for profile_id in REQUIRED_RESEARCH_PROFILES:
                 profile = by_profile[profile_id]
                 periods = dict(profile["periods"])
+                portfolio_calendar_boundary = (
+                    resolve_qlib_portfolio_calendar_boundary(
+                        provider,
+                        backtest_end=periods["valid_end"],
+                    )
+                )
                 trading_days = _calendar_between(
                     provider, periods["valid_start"], periods["valid_end"]
                 )
                 labels = _normalized_labels(
                     D.features(
                         instruments=str(manifest.get("universe") or "cn_all"),
-                        fields=["Ref($close, -2)/Ref($close, -1)-1"],
+                        fields=[label_expression],
                         start_time=periods["valid_start"],
                         end_time=periods["valid_end"],
                         freq="day",
@@ -276,12 +331,13 @@ def main() -> None:
                             recorder,
                             config={
                                 "strategy": {
-                                    "class": "TopkDropoutStrategy",
-                                    "module_path": "qlib.contrib.strategy",
+                                    "class": "GovernedDPlusOneTopkDropoutStrategy",
+                                    "module_path": "quant_platform.qlib_research_strategy",
                                     "kwargs": {
                                         "signal": "<PRED>",
                                         "topk": int(manifest.get("topk", 50)),
                                         "n_drop": int(manifest.get("n_drop", 5)),
+                                        "research_execution_cadence": execution_cadence,
                                     },
                                 },
                                 "backtest": {
@@ -395,6 +451,7 @@ def main() -> None:
                         "pairwise_prediction_correlations": current_pairwise,
                         "execution_environment_sha256": environment_sha,
                         "qlib_workflow": workflow_identity,
+                        "portfolio_calendar_boundary": portfolio_calendar_boundary,
                         "final_oos_opened": False,
                     }
                     if profile_id == "recent_3y":
@@ -486,7 +543,14 @@ def main() -> None:
                 }
                 for item in evaluations
             ]
-    result = {"status": "ok", "evaluations": evaluations}
+    result = {
+        "status": "ok",
+        "research_execution_cadence": execution_cadence,
+        "research_execution_cadence_sha256": execution_cadence[
+            "evidence_sha256"
+        ],
+        "evaluations": evaluations,
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False))

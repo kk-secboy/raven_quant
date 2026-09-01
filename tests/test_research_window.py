@@ -11,6 +11,7 @@ from quant_platform.research_automation import (
     ResearchWindowUnavailableError,
     normalize_research_period_policy,
     normalize_research_schedule_payload,
+    resolve_common_feature_set_calendar,
     resolve_research_periods,
     resolve_research_window_contract,
 )
@@ -387,6 +388,90 @@ def test_research_window_starts_only_after_all_selected_fields_are_usable() -> N
             horizon_profile=SWING_1_6M,
             feature_set=feature_set,
         )
+
+
+@pytest.mark.no_database
+def test_feature_set_tournament_uses_one_common_honest_calendar() -> None:
+    calendar = _calendar()
+    feature_sets = [
+        get_feature_set(feature_set_id)
+        for feature_set_id in (
+            "qlib-alpha158",
+            "qlib-alpha360",
+            "platform-seed-v1",
+        )
+    ]
+    union_feature_set = {
+        "features": {
+            name: expression
+            for feature_set in feature_sets
+            for name, expression in feature_set["features"].items()
+        }
+    }
+    dataset = _dataset(union_feature_set)
+    alpha_fields = {
+        field
+        for feature_set in feature_sets[:2]
+        for expression in feature_set["features"].values()
+        for field in compile_qlib_expression(str(expression)).required_fields
+    }
+    seed_fields = {
+        field
+        for expression in feature_sets[2]["features"].values()
+        for field in compile_qlib_expression(str(expression)).required_fields
+    }
+    late_fields = seed_fields - alpha_fields
+    assert "fund_roe" in late_fields
+    field_cutoff = calendar[-3]
+    field_entries = dataset["provenance"]["field_year_coverage"]["fields"]
+    for field in late_fields:
+        field_entries[field].update(
+            {
+                "available_from": "2016-01-04",
+                "continuous_from": "2016-01-04",
+                "research_available_from": "2016-01-04",
+                "available_to": field_cutoff,
+            }
+        )
+    _reseal_field_coverage(dataset)
+
+    common_calendar, common = resolve_common_feature_set_calendar(
+        dataset,
+        calendar,
+        feature_sets,
+    )
+    resolved = [
+        resolve_research_window_contract(
+            dataset,
+            common_calendar,
+            horizon_profile=SHORT_1_5D,
+            feature_set=feature_set,
+        )
+        for feature_set in feature_sets
+    ]
+
+    assert common_calendar[0] == "2016-01-04"
+    assert common_calendar[-1] == field_cutoff
+    assert common["missing_history_policy"] == (
+        "exclude_sessions_fail_closed_never_zero_backfill"
+    )
+    assert "fund_roe" in common["required_field_union"]
+    assert len({tuple(periods.items()) for periods, _ in resolved}) == 1
+    assert {
+        evidence["research_window_contract"]["calendar_start"]
+        for _, evidence in resolved
+    } == {"2016-01-04"}
+    assert {
+        evidence["research_window_contract"]["calendar_end"]
+        for _, evidence in resolved
+    } == {field_cutoff}
+
+    # Removing a preregistered field must fail closed.  The tournament cannot
+    # recreate its pre-coverage history by silently filling it with zeroes.
+    field_entries.pop("fund_roe")
+    _reseal_field_coverage(dataset)
+    with pytest.raises(ValueError, match="no field-year coverage for fund_roe"):
+        resolve_common_feature_set_calendar(dataset, calendar, feature_sets)
 
 
 @pytest.mark.no_database

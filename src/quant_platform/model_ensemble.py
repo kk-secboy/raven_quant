@@ -16,11 +16,13 @@ from .model_research_governance import (
     file_sha256,
     normalize_model_predictions,
 )
+from .research_label_binding import validate_research_label_binding
 
 MODEL_ENSEMBLE_CONTRACT_VERSION = "quantlab-model-ensemble-v2"
 MODEL_ENSEMBLE_EVALUATION_CONTRACT_VERSION = (
     "model-ensemble-independent-evaluation-v1"
 )
+MODEL_ENSEMBLE_LABEL_CONTRACT_VERSION = "model-ensemble-label-contract-v1"
 MODEL_ENSEMBLE_CORRELATION_POLICY_VERSION = "daily-cross-sectional-rank-correlation-v1"
 MODEL_ENSEMBLE_CORRELATION_LIMIT = 0.90
 MODEL_ENSEMBLE_MAX_CANDIDATES = 4
@@ -32,6 +34,75 @@ MODEL_ENSEMBLE_MIN_GOOD_DAY_RATE = 0.95
 
 class EnsemblePredictionsPending(ValueError):
     """A model has no complete immutable pre-final prediction grid yet."""
+
+
+_MODEL_ENSEMBLE_LABEL_IDENTITY_FIELDS = (
+    "horizon_profile",
+    "legacy",
+    "allowed_label_horizons_sessions",
+    "label_horizon_sessions",
+    "label_reference_offset_sessions",
+    "label_expression",
+    "purge_sessions",
+    "embargo_sessions",
+    "dataset_name",
+    "dataset_identity_sha256",
+    "periods",
+)
+
+
+def model_ensemble_label_identity(binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a feature-specific binding onto its shared prediction target."""
+
+    validated = validate_research_label_binding(binding)
+    return {key: validated[key] for key in _MODEL_ENSEMBLE_LABEL_IDENTITY_FIELDS}
+
+
+def build_model_ensemble_label_contract(
+    member_bindings: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze one label target shared by every immutable ensemble member."""
+
+    if len(member_bindings) < 2:
+        raise ValueError("model ensemble label contract requires at least two members")
+    normalized: dict[str, dict[str, Any]] = {}
+    identities: dict[str, dict[str, Any]] = {}
+    for raw_member_id, raw_binding in member_bindings.items():
+        member_id = str(raw_member_id or "").strip()
+        if not member_id or member_id in normalized:
+            raise ValueError("model ensemble label contract has invalid member identities")
+        binding = validate_research_label_binding(raw_binding)
+        normalized[member_id] = binding
+        identities[member_id] = model_ensemble_label_identity(binding)
+    ordered_ids = sorted(normalized)
+    shared_identity = identities[ordered_ids[0]]
+    if any(identities[member_id] != shared_identity for member_id in ordered_ids[1:]):
+        raise ValueError("model ensemble members use different frozen label targets")
+    contract: dict[str, Any] = {
+        "contract_version": MODEL_ENSEMBLE_LABEL_CONTRACT_VERSION,
+        "label_identity": shared_identity,
+        "member_binding_sha256": {
+            member_id: str(normalized[member_id]["binding_sha256"])
+            for member_id in ordered_ids
+        },
+    }
+    contract["evidence_sha256"] = canonical_sha256(contract)
+    return contract
+
+
+def validate_model_ensemble_label_contract(
+    value: Mapping[str, Any],
+    *,
+    member_bindings: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Rebuild an ensemble label contract from its frozen member manifests."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("model ensemble label contract must be an object")
+    expected = build_model_ensemble_label_contract(member_bindings)
+    if dict(value) != expected:
+        raise ValueError("model ensemble label contract changed after preregistration")
+    return expected
 
 
 def _is_sha256(value: Any) -> bool:

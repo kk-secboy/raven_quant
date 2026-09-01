@@ -21,6 +21,7 @@ from quant_platform.research_horizon import (
     primary_label_horizon_sessions,
     research_horizon_contract,
 )
+from quant_platform.research_label_binding import resolve_research_label_binding
 from quant_platform.worker import LocalJobWorker
 
 pytestmark = pytest.mark.no_database
@@ -155,6 +156,37 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
         "definition_sha256": "f" * 64,
         "features": {"alpha": {"expression": "$close"}},
     }
+    periods = {
+        "train_start": "2018-01-02",
+        "train_end": "2022-12-30",
+        "valid_start": "2023-01-03",
+        "valid_end": "2023-12-29",
+        "test_start": "2024-07-02",
+        "test_end": "2026-08-20",
+    }
+    window.update(
+        {
+            "dataset_name": "cn-governed-day",
+            "dataset_identity_sha256": "d" * 64,
+            "feature_set_id": feature_set["id"],
+            "feature_set_sha256": feature_set["definition_sha256"],
+            "periods": periods,
+        }
+    )
+    window_sha256 = canonical_sha256(window)
+    label_binding = resolve_research_label_binding(
+        {
+            "horizon_profile": SWING_1_6M,
+            "dataset": "cn-governed-day",
+            "dataset_identity_sha256": "d" * 64,
+            "periods": periods,
+            "feature_set": feature_set,
+            "research_window_contract": window,
+            "research_window_contract_sha256": window_sha256,
+            "label_horizon_sessions": 63,
+        }
+    )
+    assert label_binding is not None
     monkeypatch.setenv("MODEL_SANDBOX_IMAGE", "model-sandbox:test")
     worker = object.__new__(LocalJobWorker)
     worker.project_root = tmp_path
@@ -169,6 +201,7 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
         "kind": "model_evaluate",
         "payload": {
             "research_run_id": "run-1",
+            "dataset": "cn-governed-day",
             "dataset_path": str(tmp_path / "qlib" / "daily"),
             "dataset_identity_sha256": "d" * 64,
             "feature_set_id": feature_set["id"],
@@ -194,6 +227,10 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
             "research_window_contract": window,
             "research_window_contract_sha256": window_sha256,
             "label_horizon_sessions": 63,
+            "horizon_profile": SWING_1_6M,
+            "periods": periods,
+            "research_label_binding": label_binding,
+            "research_label_binding_sha256": label_binding["binding_sha256"],
         },
     }
 
@@ -212,6 +249,9 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
     assert manifest["research_window_contract"] == window
     assert manifest["research_window_contract_sha256"] == window_sha256
     assert manifest["label_horizon_sessions"] == 63
+    assert manifest["research_execution_cadence"][
+        "decision_interval_sessions"
+    ] == 5
     assert manifest["evaluation_stage"] == "feature_screen"
     assert manifest["evaluation_profiles"] == [{"id": "recent_3y"}]
     assert manifest["research_tournament_id"] == "tournament-1"

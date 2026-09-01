@@ -253,6 +253,15 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
         "2022-08-12",
         "2022-12-30",
     ]
+    assert (research_dataset / "calendars" / "day_future.txt").read_text(
+        encoding="utf-8"
+    ).splitlines() == [
+        "2020-01-02",
+        "2021-12-31",
+        "2022-08-12",
+        "2022-12-30",
+        "2023-01-03",
+    ]
     assert (research_dataset / "instruments" / "all.txt").read_text(
         encoding="utf-8"
     ).strip().endswith("2022-12-30")
@@ -264,9 +273,11 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
             encoding="utf-8"
         )
     )
-    assert view_manifest["schema_version"] == 2
+    assert view_manifest["schema_version"] == 3
     assert view_manifest["market"] == "cn_all"
     assert view_manifest["default_market_alias"] == "cn_all"
+    assert view_manifest["future_calendar_boundary"] == "2023-01-03"
+    assert view_manifest["future_calendar_contains_market_data"] is False
     assert (research_dataset / "instruments" / "all.txt").read_bytes() == (
         research_dataset / "instruments" / "cn_all.txt"
     ).read_bytes()

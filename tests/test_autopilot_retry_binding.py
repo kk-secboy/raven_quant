@@ -24,6 +24,7 @@ from quant_platform.autopilot import (
 from quant_platform.job_store import JobStore
 from quant_platform.platform_model_tournament import PlatformModelTournamentService
 from quant_platform.research_store import ResearchStore
+from quant_platform.research_tournament import ResearchTournamentStore
 
 
 @pytest.mark.no_database
@@ -84,6 +85,89 @@ def test_controller_does_not_rewrite_run_when_atomic_retry_raises() -> None:
         controller._retry_failed_branch(
             {"id": "branch", "status": "failed", "details": {}}
         )
+
+
+@pytest.mark.no_database
+def test_active_model_tournament_falls_back_for_legacy_cycle_without_pointer() -> None:
+    calls: list[str] = []
+    expected = {"id": "legacy-primary-tournament"}
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.tournaments = SimpleNamespace(
+        get_for_cycle=lambda cycle_id: calls.append(cycle_id) or expected,
+        get_tournament=lambda _tournament_id: pytest.fail(
+            "legacy cycle must use the primary tournament lookup"
+        ),
+    )
+
+    assert controller._active_model_tournament({"id": "cycle-1", "state": {}}) is expected
+    assert calls == ["cycle-1"]
+
+
+@pytest.mark.no_database
+def test_operational_successor_discards_old_model_results_only() -> None:
+    source = {
+        "dataset_end_date": "2026-08-31",
+        "factor_sota_status": "ready",
+        "screen_selected_feature_set_ids": ["alpha158", "alpha360"],
+        "feature_screen_evidence": {"old": True},
+        "model_champions": [{"old": True}],
+        "model_ensemble_status": "complete",
+        "prediction_champion": {"old": True},
+        "fin_quant_status": "ready",
+        "research_tournament_status": "succeeded",
+    }
+
+    clean = AutopilotController._without_model_tournament_results(source)
+
+    assert clean == {
+        "dataset_end_date": "2026-08-31",
+        "factor_sota_status": "ready",
+    }
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize(
+    ("source_status", "branch_status", "run_status", "job_status", "expected"),
+    [
+        ("running", "blocked", "blocked", "failed", True),
+        ("running", "running", "blocked", "failed", False),
+        ("running", "blocked", "evaluating", "failed", False),
+        ("running", "blocked", "blocked", "queued", False),
+        ("succeeded", "blocked", "blocked", "failed", False),
+    ],
+)
+def test_operational_successor_waits_for_every_durable_source_owner(
+    source_status: str,
+    branch_status: str,
+    run_status: str,
+    job_status: str,
+    expected: bool,
+) -> None:
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.research = SimpleNamespace(
+        get_run=lambda run_id: {
+            "id": run_id,
+            "status": run_status,
+            "job_id": "current-job",
+        }
+    )
+    controller.jobs = SimpleNamespace(
+        get=lambda job_id: {"id": job_id, "status": job_status}
+    )
+    cycle = {
+        "branches": [
+            {
+                "id": "source-branch",
+                "status": branch_status,
+                "research_run_id": "source-run",
+                "job_id": "generation-job",
+                "details": {"tournament_id": "source-tournament"},
+            }
+        ]
+    }
+    source = {"id": "source-tournament", "status": source_status}
+
+    assert controller._operational_source_owners_terminal(cycle, source) is expected
 
 
 @pytest.mark.no_database
@@ -573,3 +657,330 @@ def test_active_cycle_atomically_adopts_exact_unattached_payload_job(
     assert adopted["id"] == job["id"]
     assert research.get_run(run["id"])["job_id"] == job["id"]
     assert JobStore(database_url).get(job["id"])["status"] == "queued"
+
+
+def _seed_operational_remediation_source(
+    database_url: str,
+    tmp_path: Path,
+) -> tuple[dict, dict, dict, dict, dict[str, str]]:
+    autopilot = AutopilotStore(database_url)
+    cycle = autopilot.ensure_cycle(
+        {
+            "name": "resource-remediation-dataset",
+            "lineage_id": "d" * 64,
+            "end_date": "2026-08-31",
+            "provenance": {"dataset_identity_sha256": "e" * 64},
+        },
+        config_revision=1,
+    )
+    tournaments = ResearchTournamentStore(database_url)
+    source = tournaments.ensure_preregistered(
+        cycle_id=str(cycle["id"]),
+        dataset_identity_sha256="e" * 64,
+    )
+    screen = [
+        item
+        for item in source["trials"]
+        if (item.get("spec") or {}).get("round") == "feature_screen"
+    ]
+    resource_trial, operational_trial, inherited_trial = screen[:3]
+    tournaments.transition_trial(str(resource_trial["id"]), "queued")
+    tournaments.transition_trial(str(resource_trial["id"]), "running")
+    resource_trial = tournaments.transition_trial(
+        str(resource_trial["id"]),
+        "failed",
+        candidate_id="source-resource-candidate",
+        metrics={"reason_code": "resource_blocked"},
+        evidence={
+            "contract_version": "model-feature-screen-failure-v1",
+            "investment_hypothesis_rejected": False,
+            "error": "memory budget exceeded",
+        },
+    )
+    tournaments.transition_trial(str(operational_trial["id"]), "queued")
+    tournaments.transition_trial(str(operational_trial["id"]), "running")
+    operational_trial = tournaments.transition_trial(
+        str(operational_trial["id"]),
+        "failed",
+        candidate_id="source-operational-candidate",
+        metrics={"reason_code": "screen_execution_failed"},
+        # Historical PortAna failures carried this incorrect marker.  The
+        # absence of computed performance metrics still makes them operational.
+        evidence={
+            "contract_version": "model-feature-screen-failure-v1",
+            "investment_hypothesis_rejected": True,
+            "error": "PortAnaRecord execution failed before metrics",
+        },
+    )
+    tournaments.transition_trial(str(inherited_trial["id"]), "queued")
+    tournaments.transition_trial(str(inherited_trial["id"]), "running")
+    inherited_trial = tournaments.transition_trial(
+        str(inherited_trial["id"]),
+        "passed",
+        candidate_id="source-passed-candidate",
+        metrics={"cells": [{"gate": "passed"}]},
+        evidence={"contract_version": "source-passed-evidence-v1"},
+    )
+    research = ResearchStore(database_url)
+    run = research.create_run(
+        kind="platform_model_feature_screen_operational_settlement_short_1_5d",
+        objective="freeze the quiescent source before operational remediation",
+        dataset="resource-remediation-dataset",
+        requested_by=f"autopilot:{cycle['id']}",
+        budget={},
+        config={
+            "contract_version": "platform-model-tournament-run-v2-horizon",
+            "autopilot_cycle_id": cycle["id"],
+            "research_tournament_id": source["id"],
+        },
+        artifact_path=tmp_path / "operational-source-run",
+    )
+    jobs = JobStore(database_url)
+    job = jobs.create(
+        "model_evaluate",
+        {
+            "research_run_id": run["id"],
+            "research_tournament_id": source["id"],
+        },
+        tmp_path / "operational-source.log",
+        dedupe_active_kind=False,
+        idempotency_key=f"operational-source:{source['id']}",
+    )
+    research.attach_job(str(run["id"]), str(job["id"]))
+    branch = autopilot.create_branch(
+        str(cycle["id"]),
+        scenario="fin_model",
+        scope_key="platform:feature_screen:operational-source",
+        research_run_id=str(run["id"]),
+        job_id=str(job["id"]),
+        details={
+            "branch_kind": "platform_model_feature_screen",
+            "tournament_id": str(source["id"]),
+            "model_recompute_executor_version": "model-recompute-docker-v6",
+            "candidate_bindings": [
+                {"trial_id": str(resource_trial["id"])},
+                {"trial_id": str(operational_trial["id"])},
+                {"trial_id": str(inherited_trial["id"])},
+            ],
+        },
+    )
+    jobs.finish(str(job["id"]), exit_code=1, error="operational source settled")
+    research.mark_run(
+        str(run["id"]),
+        "blocked",
+        error="operational source settled",
+    )
+    assert autopilot.reconcile() == 1
+    tournaments.mark_running(str(source["id"]))
+    return (
+        tournaments.get_tournament(str(source["id"])),
+        resource_trial,
+        operational_trial,
+        inherited_trial,
+        {
+            "cycle_id": str(cycle["id"]),
+            "branch_id": str(branch["id"]),
+            "run_id": str(run["id"]),
+            "job_id": str(job["id"]),
+        },
+    )
+
+
+def test_operational_remediation_preserves_mixed_failures_and_source_history(
+    tmp_path: Path,
+    database_url: str,
+) -> None:
+    source, resource_trial, operational_trial, inherited_trial, _owners = (
+        _seed_operational_remediation_source(database_url, tmp_path)
+    )
+    store = ResearchTournamentStore(database_url)
+
+    successor = store.ensure_operational_remediation_preregistered(
+        source_tournament_id=str(source["id"]),
+        source_executor_version="model-recompute-docker-v6",
+        target_executor_version="model-recompute-docker-v7",
+    )
+
+    unchanged = store.get_tournament(str(source["id"]))
+    assert unchanged["status"] == "blocked"
+    assert unchanged["multiple_testing"]["contract_version"] == (
+        "model-tournament-operational-settlement-v1"
+    )
+    assert unchanged["multiple_testing"][
+        "all_bound_branches_runs_and_jobs_terminal"
+    ] is True
+    unchanged_resource = next(
+        item for item in unchanged["trials"] if item["id"] == resource_trial["id"]
+    )
+    assert unchanged_resource["status"] == "failed"
+    assert unchanged_resource["candidate_id"] == "source-resource-candidate"
+    assert unchanged_resource["evidence"] == resource_trial["evidence"]
+    assert successor["stage"] == "model_full"
+    remediation = successor["manifest"]["operational_remediation"]
+    assert remediation["source_tournament_id"] == source["id"]
+    assert remediation["performance_triggered"] is False
+    assert remediation["contract_upgrade"] is True
+    assert remediation["same_frozen_evaluation_contract"] is False
+    assert remediation["all_trials_re_preregistered"] is True
+    assert remediation["new_multiple_testing_family"] is True
+    assert successor["manifest"]["feature_set_window_policy"][
+        "identical_periods_within_horizon"
+    ] is True
+    replacement = next(
+        item for item in successor["trials"] if item["name"] == resource_trial["name"]
+    )
+    operational_replacement = next(
+        item
+        for item in successor["trials"]
+        if item["name"] == operational_trial["name"]
+    )
+    inherited = next(
+        item for item in successor["trials"] if item["name"] == inherited_trial["name"]
+    )
+    assert replacement["status"] == "preregistered"
+    assert replacement["candidate_id"] is None
+    assert replacement["spec_sha256"] == resource_trial["spec_sha256"]
+    assert operational_replacement["status"] == "preregistered"
+    assert operational_replacement["candidate_id"] is None
+    assert operational_replacement["spec_sha256"] == operational_trial["spec_sha256"]
+    assert inherited["status"] == "preregistered"
+    assert inherited["candidate_id"] is None
+    assert inherited["metrics"] is None
+    assert inherited["evidence"] is None
+    unchanged_inherited = next(
+        item for item in unchanged["trials"] if item["id"] == inherited_trial["id"]
+    )
+    assert unchanged_inherited["status"] == "passed"
+    assert unchanged_inherited["candidate_id"] == "source-passed-candidate"
+    assert unchanged_inherited["evidence"] == inherited_trial["evidence"]
+
+
+@pytest.mark.parametrize(
+    ("owner", "expected_error"),
+    [
+        ("branch", "source branch is not terminal"),
+        ("run", "source research run is not terminal"),
+        ("job", "source job is not terminal"),
+    ],
+)
+def test_operational_remediation_refuses_nonterminal_source_owner(
+    tmp_path: Path,
+    database_url: str,
+    owner: str,
+    expected_error: str,
+) -> None:
+    source, _resource, _operational, _inherited, owners = (
+        _seed_operational_remediation_source(database_url, tmp_path)
+    )
+    store = ResearchTournamentStore(database_url)
+    with store.engine.begin() as connection:
+        if owner == "branch":
+            connection.execute(
+                update(autopilot_branches)
+                .where(autopilot_branches.c.id == owners["branch_id"])
+                .values(status="running", finished_at=None)
+            )
+        elif owner == "run":
+            connection.execute(
+                update(research_runs)
+                .where(research_runs.c.id == owners["run_id"])
+                .values(status="evaluating", finished_at=None)
+            )
+        else:
+            connection.execute(
+                update(job_rows)
+                .where(job_rows.c.id == owners["job_id"])
+                .values(status="queued", finished_at=None)
+            )
+
+    with pytest.raises(ValueError, match=expected_error):
+        store.ensure_operational_remediation_preregistered(
+            source_tournament_id=str(source["id"]),
+            source_executor_version="model-recompute-docker-v6",
+            target_executor_version="model-recompute-docker-v7",
+        )
+    with pytest.raises(KeyError):
+        store.get_for_cycle_stage(owners["cycle_id"], "model_full")
+
+
+def test_concurrent_operational_remediation_settles_source_once(
+    tmp_path: Path,
+    database_url: str,
+) -> None:
+    source, _resource, _operational, _inherited, owners = (
+        _seed_operational_remediation_source(database_url, tmp_path)
+    )
+    barrier = Barrier(2)
+
+    def create_successor() -> str:
+        barrier.wait()
+        successor = ResearchTournamentStore(
+            database_url
+        ).ensure_operational_remediation_preregistered(
+            source_tournament_id=str(source["id"]),
+            source_executor_version="model-recompute-docker-v6",
+            target_executor_version="model-recompute-docker-v7",
+        )
+        return str(successor["id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        successor_ids = [
+            future.result()
+            for future in [executor.submit(create_successor) for _ in range(2)]
+        ]
+
+    assert len(set(successor_ids)) == 1
+    store = ResearchTournamentStore(database_url)
+    assert store.get_tournament(str(source["id"]))["status"] == "blocked"
+    assert (
+        store.get_for_cycle_stage(owners["cycle_id"], "model_full")["id"]
+        == successor_ids[0]
+    )
+
+
+def test_real_model_failure_cannot_open_operational_remediation(database_url: str) -> None:
+    autopilot = AutopilotStore(database_url)
+    cycle = autopilot.ensure_cycle(
+        {
+            "name": "real-gate-failure-dataset",
+            "lineage_id": "a" * 64,
+            "end_date": "2026-08-31",
+            "provenance": {"dataset_identity_sha256": "b" * 64},
+        },
+        config_revision=1,
+    )
+    store = ResearchTournamentStore(database_url)
+    source = store.ensure_preregistered(
+        cycle_id=str(cycle["id"]), dataset_identity_sha256="b" * 64
+    )
+    trial = next(
+        item
+        for item in source["trials"]
+        if (item.get("spec") or {}).get("round") == "feature_screen"
+    )
+    store.transition_trial(str(trial["id"]), "queued")
+    store.transition_trial(str(trial["id"]), "running")
+    store.transition_trial(
+        str(trial["id"]),
+        "failed",
+        candidate_id="real-failed-candidate",
+        metrics={
+            "reason_code": "performance_gate_failed",
+            "rank_ic": -0.05,
+            "annualized_excess_return_with_cost": -0.20,
+        },
+        evidence={
+            "contract_version": "model-feature-screen-gate-v1",
+            "performance_metrics_produced": True,
+            "investment_hypothesis_rejected": True,
+        },
+    )
+
+    with pytest.raises(ValueError, match="no operational trial"):
+        store.ensure_operational_remediation_preregistered(
+            source_tournament_id=str(source["id"]),
+            source_executor_version="executor-v1",
+            target_executor_version="executor-v2",
+        )
+    with pytest.raises(KeyError):
+        store.get_for_cycle_stage(str(cycle["id"]), "model_full")

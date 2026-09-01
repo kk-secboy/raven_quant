@@ -11,6 +11,10 @@ import pytest
 
 from quant_platform.model_recompute import ModelResourceLimitError
 from quant_platform.model_research_governance import canonical_sha256
+from quant_platform.research_execution_cadence import (
+    build_research_execution_cadence_contract,
+)
+from quant_platform.research_horizon import SHORT_1_5D
 from quant_platform.worker import LocalJobWorker
 
 pytestmark = pytest.mark.no_database
@@ -46,10 +50,15 @@ def test_quant_bundle_materializes_qlib_signal_record_dependencies() -> None:
         Path(__file__).resolve().parents[1] / "scripts" / "evaluate_quant_bundle.py"
     ).read_text(encoding="utf-8")
     save_index = source.index('"pred.pkl": predictions[["score"]]')
+    boundary_index = source.index("resolve_qlib_portfolio_calendar_boundary(")
     portfolio_index = source.index("record = PortAnaRecord(")
     assert '"label.pkl": labels.to_frame("label")' in source
     assert '"signal": "<PRED>"' in source
-    assert save_index < portfolio_index
+    assert boundary_index < save_index < portfolio_index
+    assert '"class": "GovernedDPlusOneTopkDropoutStrategy"' in source
+    assert '"module_path": "quant_platform.qlib_research_strategy"' in source
+    assert '"research_execution_cadence": manifest[' in source
+    assert '"end_time": periods["valid_end"]' in source
     assert "Qlib quant-bundle portfolio record generation was skipped" in source
 
 
@@ -208,6 +217,9 @@ def _manifest() -> dict[str, Any]:
         "universe": "cn_all",
         "benchmark": "SH000300",
         "model_timeout_seconds": 7200,
+        "research_execution_cadence": (
+            build_research_execution_cadence_contract(SHORT_1_5D)
+        ),
     }
 
 
@@ -371,12 +383,21 @@ def test_quant_ensemble_factor_only_retrains_every_member_and_equal_ranks(
             "b" * 64,
         )
 
-    def fake_portfolio(**kwargs: Any) -> tuple[dict[str, Any], Path]:
+    def fake_portfolio(**kwargs: Any) -> tuple[dict[str, Any], Path, dict[str, Any]]:
         output = Path(kwargs["workspace"]) / "output"
         output.mkdir(parents=True, exist_ok=False)
         report_path = output / "portfolio_report.parquet"
         report_path.write_bytes(b"ensemble-report")
-        return ({"ic": 0.03}, report_path)
+        return (
+            {"ic": 0.03},
+            report_path,
+            {
+                "contract_version": "qlib-portfolio-calendar-boundary-v1",
+                "backtest_end": "2023-12-29",
+                "interval_end": "2024-01-02",
+                "interval_end_has_market_data": False,
+            },
+        )
 
     monkeypatch.setattr(module, "_execute_single_model_cell", fake_member)
     monkeypatch.setattr(module, "_evaluate_equal_rank_portfolio", fake_portfolio)
@@ -408,6 +429,12 @@ def test_quant_ensemble_factor_only_retrains_every_member_and_equal_ranks(
     combined = pd.read_parquet(result["predictions_path"])
     assert combined["score"].between(0.0, 1.0).all()
     assert result["execution_evidence"]["execution"] == "sequential_cpu_only"
+    assert (
+        result["execution_evidence"]["portfolio_calendar_boundary"][
+            "interval_end_has_market_data"
+        ]
+        is False
+    )
 
 
 def test_quant_incumbent_allows_only_runtime_path_translation(tmp_path: Path) -> None:
@@ -489,6 +516,9 @@ def test_quant_full_grid_preserves_policy_and_execution_evidence(
                 }[manifest["model_engine"]],
                 "portfolio_report_sha256": module.file_sha256(report_path),
                 "resource_policy": policy,
+                "research_execution_cadence_sha256": manifest[
+                    "research_execution_cadence"
+                ]["evidence_sha256"],
             },
             execution,
         )

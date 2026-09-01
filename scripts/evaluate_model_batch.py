@@ -26,6 +26,10 @@ from quant_platform.model_research_governance import (
     verify_model_prediction_artifact,
 )
 from quant_platform.rdagent_dataset_view import prepare_rdagent_dataset_view
+from quant_platform.research_execution_cadence import (
+    validate_research_execution_cadence_contract,
+)
+from quant_platform.research_label_binding import validate_research_label_binding
 
 
 def calendar_between(provider: Path, start: str, end: str) -> list[str]:
@@ -48,6 +52,26 @@ def main() -> None:
     args = parser.parse_args()
     provider = Path(args.provider_uri).resolve()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    label_binding = validate_research_label_binding(
+        manifest.get("research_label_binding") or {}
+    )
+    execution_cadence = validate_research_execution_cadence_contract(
+        manifest.get("research_execution_cadence") or {},
+        expected_horizon_profile=str(label_binding["horizon_profile"]),
+    )
+    if (
+        manifest.get("research_label_binding_sha256")
+        != label_binding["binding_sha256"]
+        or manifest.get("research_window_contract")
+        != label_binding["research_window_contract"]
+        or manifest.get("research_window_contract_sha256")
+        != label_binding["research_window_contract_sha256"]
+        or manifest.get("dataset_identity_sha256")
+        != label_binding["dataset_identity_sha256"]
+        or int(manifest.get("label_horizon_sessions") or 0)
+        != int(label_binding["label_horizon_sessions"])
+    ):
+        raise ValueError("model evaluation label binding changed in transit")
     provenance = json.loads(
         (provider / "metadata" / "provenance.json").read_text(encoding="utf-8")
     )
@@ -99,6 +123,13 @@ def main() -> None:
     }
     if len(valid_ends) != 1 or len(test_windows) != 1:
         raise ValueError("model profiles must share one pre-final cutoff and final OOS")
+    recent_periods = next(
+        dict(item["periods"])
+        for item in profiles
+        if str(item.get("id") or "") == "recent_3y"
+    )
+    if recent_periods != dict(label_binding["periods"]):
+        raise ValueError("model evaluation cadence is bound to another research window")
     pre_final_end = next(iter(valid_ends))
     output = Path(args.output).resolve()
     artifact_root = output.parent / "independent-model-evaluations"
@@ -142,6 +173,7 @@ def main() -> None:
                 "research_window_contract_sha256": manifest.get(
                     "research_window_contract_sha256"
                 ),
+                "research_execution_cadence": execution_cadence,
                 "label_horizon_sessions": _candidate.get("label_horizon_sessions")
                 or manifest.get("label_horizon_sessions"),
                 "universe": manifest.get("universe", "cn_all"),
@@ -161,6 +193,11 @@ def main() -> None:
             "candidate_id": candidate_id,
             "dataset_identity_sha256": dataset_identity,
             "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "horizon_profile": label_binding["horizon_profile"],
+            "research_execution_cadence": execution_cadence,
+            "research_execution_cadence_sha256": execution_cadence[
+                "evidence_sha256"
+            ],
             "final_oos_opened": False,
             "profiles": {},
         }
@@ -230,6 +267,9 @@ def main() -> None:
                     "model_label_contract_sha256": screen_result[
                         "model_label_contract_sha256"
                     ],
+                    "research_execution_cadence_sha256": screen_result[
+                        "research_execution_cadence_sha256"
+                    ],
                     "execution_evidence_sha256": screen_execution["evidence_sha256"],
                     "execution_environment_sha256": screen_execution[
                         "execution_environment_sha256"
@@ -246,6 +286,11 @@ def main() -> None:
                     "evaluation_stage": "feature_screen",
                     "selection_profile": "recent_3y",
                     "selection_seed": screen_seed,
+                    "horizon_profile": label_binding["horizon_profile"],
+                    "research_execution_cadence": execution_cadence,
+                    "research_execution_cadence_sha256": execution_cadence[
+                        "evidence_sha256"
+                    ],
                     "final_oos_opened": False,
                     "cells": [cell],
                 }
@@ -338,6 +383,9 @@ def main() -> None:
             "model_label_contract_sha256": screening_result[
                 "model_label_contract_sha256"
             ],
+            "research_execution_cadence_sha256": screening_result[
+                "research_execution_cadence_sha256"
+            ],
             "execution_evidence_sha256": screening_execution["evidence_sha256"],
             "execution_environment_sha256": screening_execution[
                 "execution_environment_sha256"
@@ -411,6 +459,9 @@ def main() -> None:
                         "model_label_contract_sha256": result[
                             "model_label_contract_sha256"
                         ],
+                        "research_execution_cadence_sha256": result[
+                            "research_execution_cadence_sha256"
+                        ],
                     }
                     execution_environments.add(
                         str(execution_evidence["execution_environment_sha256"])
@@ -462,6 +513,10 @@ def main() -> None:
         result = {
             "status": "ok",
             "evaluation_stage": evaluation_stage,
+            "research_execution_cadence": execution_cadence,
+            "research_execution_cadence_sha256": execution_cadence[
+                "evidence_sha256"
+            ],
             "research_tournament_id": str(
                 manifest.get("research_tournament_id") or ""
             ),
@@ -566,6 +621,10 @@ def main() -> None:
         ]
     result = {
         "status": "ok",
+        "research_execution_cadence": execution_cadence,
+        "research_execution_cadence_sha256": execution_cadence[
+            "evidence_sha256"
+        ],
         "evaluations": evaluations,
         "resource_blocked_count": sum(
             item.get("status") == "resource_blocked" for item in evaluations

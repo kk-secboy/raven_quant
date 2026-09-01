@@ -54,6 +54,10 @@ from .model_research_governance import (
 from .model_research_governance import (
     validate_quant_bundle_evidence as _validate_quant_bundle_evidence,
 )
+from .research_execution_cadence import (
+    build_research_execution_cadence_contract,
+    validate_research_execution_cadence_contract,
+)
 from .research_horizon import primary_label_policy_contract
 from .research_label_binding import validate_research_label_binding
 
@@ -935,6 +939,96 @@ class RDAGentCandidateStore:
             except IntegrityError as exc:
                 raise ValueError("this immutable run artifact is already registered") from exc
         return self.get_run_artifact(artifact_id, verify=True)
+
+    def register_or_reuse_run_artifact(
+        self,
+        *,
+        research_run_id: str,
+        artifact_type: str,
+        storage_path: str | Path,
+        producer: str,
+        actor: str,
+        contract_version: str,
+        source_iteration: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Register one immutable artifact, or reuse its exact run-local identity.
+
+        Durable jobs may be retried after an operational outcome such as a
+        resource limit.  If the deterministic evaluator emits the same bytes,
+        the database uniqueness contract deliberately identifies those bytes as
+        the same artifact for that research run and artifact type.  Reusing the
+        recorded row preserves immutable history; it must not create a second
+        logical artifact merely because the retry wrote another filesystem path.
+
+        Provenance is still fail-closed.  Equal bytes are reusable only when the
+        producer, artifact contract, source iteration, and metadata also match.
+        """
+
+        _, content_sha256, size_bytes = _path_evidence(storage_path)
+        normalized_type = _nonempty(artifact_type, "artifact type")
+        normalized_producer = _nonempty(producer, "artifact producer")
+        normalized_contract = _nonempty(contract_version, "artifact contract")
+        normalized_metadata = dict(metadata or {})
+
+        def reusable() -> dict[str, Any] | None:
+            existing = self.find_run_artifact(
+                research_run_id=research_run_id,
+                artifact_type=normalized_type,
+                content_sha256=content_sha256,
+                verify=True,
+            )
+            if existing is None:
+                return None
+            manifest = dict(existing.get("manifest_json") or {})
+            if (
+                int(existing.get("size_bytes") or 0) != size_bytes
+                or str(existing.get("contract_version") or "")
+                != normalized_contract
+                or str(existing.get("producer") or "") != normalized_producer
+                or existing.get("source_iteration") != source_iteration
+                or manifest.get("artifact_contract_version")
+                != normalized_contract
+                or manifest.get("producer") != normalized_producer
+                or manifest.get("source_iteration") != source_iteration
+                or manifest.get("metadata") != normalized_metadata
+            ):
+                raise ValueError(
+                    "immutable run artifact content already has different provenance"
+                )
+            return existing
+
+        existing = reusable()
+        if existing is not None:
+            return existing
+        try:
+            registered = self.register_run_artifact(
+                research_run_id=research_run_id,
+                artifact_type=normalized_type,
+                storage_path=storage_path,
+                producer=normalized_producer,
+                actor=actor,
+                contract_version=normalized_contract,
+                source_iteration=source_iteration,
+                metadata=normalized_metadata,
+            )
+        except ValueError as exc:
+            if str(exc) != "this immutable run artifact is already registered":
+                raise
+            # Another worker may have committed the same immutable identity
+            # after the optimistic lookup.  Resolve the unique row and apply
+            # the same strict provenance checks instead of treating that race
+            # as a failed evaluation.
+            existing = reusable()
+            if existing is None:
+                raise
+            return existing
+        if (
+            str(registered.get("content_sha256") or "") != content_sha256
+            or int(registered.get("size_bytes") or 0) != size_bytes
+        ):
+            raise ValueError("run artifact changed while it was being registered")
+        return registered
 
     def get_run_artifact(self, artifact_id: str, *, verify: bool = False) -> dict[str, Any]:
         with self.engine.connect() as connection:
@@ -2026,6 +2120,25 @@ class RDAGentCandidateStore:
                 or item.get("evidence_sha256") != evidence_sha256
             ):
                 raise ValueError("model result evidence SHA-256 is invalid")
+            candidate_manifest = dict(candidate.manifest_json or {})
+            label_binding = validate_research_label_binding(
+                candidate_manifest.get("research_label_binding") or {}
+            )
+            expected_cadence = build_research_execution_cadence_contract(
+                str(label_binding["horizon_profile"])
+            )
+            observed_cadence = validate_research_execution_cadence_contract(
+                evidence.get("research_execution_cadence") or {},
+                expected_horizon_profile=str(label_binding["horizon_profile"]),
+            )
+            if (
+                candidate_manifest.get("research_label_binding_sha256")
+                != label_binding["binding_sha256"]
+                or observed_cadence != expected_cadence
+                or evidence.get("research_execution_cadence_sha256")
+                != expected_cadence["evidence_sha256"]
+            ):
+                raise ValueError("model result changed its frozen decision cadence")
             admission_input = {
                 **evidence_without_hash,
                 "independent_evaluator_evidence_sha256": evidence_sha256,
@@ -2117,6 +2230,11 @@ class RDAGentCandidateStore:
                         "execution_evidence_sha256": seed_result["execution_evidence_sha256"],
                         "execution_environment_sha256": seed_result[
                             "execution_environment_sha256"
+                        ],
+                        "horizon_profile": label_binding["horizon_profile"],
+                        "research_execution_cadence": expected_cadence,
+                        "research_execution_cadence_sha256": expected_cadence[
+                            "evidence_sha256"
                         ],
                         "coverage": seed_result.get("coverage"),
                         "run_multiple_testing": validated["multiple_testing"],
@@ -3171,6 +3289,15 @@ class RDAGentCandidateStore:
                 validated_label_binding = validate_research_label_binding(
                     frozen_label_binding
                 )
+                expected_cadence = build_research_execution_cadence_contract(
+                    str(validated_label_binding["horizon_profile"])
+                )
+                observed_cadence = validate_research_execution_cadence_contract(
+                    envelope.get("research_execution_cadence") or {},
+                    expected_horizon_profile=str(
+                        validated_label_binding["horizon_profile"]
+                    ),
+                )
                 if (
                     composition.get("research_label_binding_sha256")
                     != validated_label_binding["binding_sha256"]
@@ -3178,8 +3305,11 @@ class RDAGentCandidateStore:
                     != validated_label_binding
                     or envelope.get("research_label_binding_sha256")
                     != validated_label_binding["binding_sha256"]
+                    or observed_cadence != expected_cadence
+                    or envelope.get("research_execution_cadence_sha256")
+                    != expected_cadence["evidence_sha256"]
                 ):
-                    raise ValueError("quant result used another research label")
+                    raise ValueError("quant result used another research label or cadence")
             ledger_receipt = dict(envelope.get("research_trial_ledger_receipt") or {})
             ledger_receipt_sha256 = canonical_sha256(
                 {
@@ -3201,6 +3331,11 @@ class RDAGentCandidateStore:
                     frozen_label_binding is not None
                     and ledger_receipt.get("research_label_binding_sha256")
                     != validated_label_binding["binding_sha256"]
+                )
+                or (
+                    frozen_label_binding is not None
+                    and ledger_receipt.get("research_execution_cadence_sha256")
+                    != expected_cadence["evidence_sha256"]
                 )
                 or quant_bundle_candidate_id
                 not in dict(ledger_receipt.get("candidate_statuses") or {})
@@ -3268,6 +3403,12 @@ class RDAGentCandidateStore:
                                     "label_horizon_sessions"
                                 ]
                             )
+                            or validated.get("research_execution_cadence")
+                            != expected_cadence
+                            or validated.get(
+                                "research_execution_cadence_sha256"
+                            )
+                            != expected_cadence["evidence_sha256"]
                         )
                     )
                 ):

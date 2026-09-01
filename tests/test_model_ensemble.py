@@ -9,14 +9,24 @@ import pytest
 from quant_platform.model_ensemble import (
     EnsemblePredictionsPending,
     bounded_ensemble_combinations,
+    build_model_ensemble_label_contract,
     daily_rank_correlation,
     equal_rank_predictions,
+    validate_model_ensemble_label_contract,
 )
+from quant_platform.model_research_governance import canonical_sha256
 from quant_platform.model_strategy_contract import (
     MODEL_ENSEMBLE_SIGNAL_CONTRACT_VERSION,
     model_signal_identity,
     normalize_model_signal_config,
 )
+from quant_platform.research_horizon import (
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SWING_1_6M,
+    research_horizon_contract,
+)
+from quant_platform.research_label_binding import resolve_research_label_binding
 
 pytestmark = pytest.mark.no_database
 
@@ -26,11 +36,104 @@ def test_ensemble_materializes_qlib_signal_record_dependencies() -> None:
         Path(__file__).resolve().parents[1] / "scripts" / "evaluate_model_ensemble.py"
     ).read_text(encoding="utf-8")
     save_index = source.index('"pred.pkl": combined[["score"]]')
+    boundary_index = source.index("resolve_qlib_portfolio_calendar_boundary(")
     portfolio_index = source.index("record = PortAnaRecord(")
     assert '"label.pkl": labels.to_frame("label")' in source
     assert '"signal": "<PRED>"' in source
-    assert save_index < portfolio_index
+    assert boundary_index < save_index < portfolio_index
+    assert '"class": "GovernedDPlusOneTopkDropoutStrategy"' in source
+    assert '"module_path": "quant_platform.qlib_research_strategy"' in source
+    assert '"research_execution_cadence": execution_cadence' in source
+    assert '"end_time": periods["valid_end"]' in source
+    assert "fields=[label_expression]" in source
+    assert 'fields=["Ref($close, -2)/Ref($close, -1)-1"]' not in source
     assert "Qlib ensemble portfolio record generation was skipped" in source
+
+
+def _label_binding(profile: str, *, feature_id: str, feature_sha256: str) -> dict:
+    horizon = research_horizon_contract(profile)
+    periods = {
+        "train_start": "2010-01-04",
+        "train_end": "2018-12-28",
+        "valid_start": "2019-01-02",
+        "valid_end": "2022-12-30",
+        "test_start": "2024-01-03",
+        "test_end": "2026-08-20",
+    }
+    feature_set = {
+        "id": feature_id,
+        "definition_sha256": feature_sha256,
+        "features": {"alpha": {"expression": "$close"}},
+    }
+    window = {
+        "contract_version": "research-window-v1",
+        "horizon_profile": profile,
+        "horizon_contract_sha256": horizon.sha256,
+        "dataset_name": "cn-governed-day",
+        "dataset_identity_sha256": "d" * 64,
+        "feature_set_id": feature_id,
+        "feature_set_sha256": feature_sha256,
+        "label_horizons_sessions": list(horizon.label_horizons_sessions),
+        "purge_sessions": horizon.purge_sessions,
+        "embargo_sessions": horizon.embargo_sessions,
+        "label_maturity_enforced": True,
+        "periods": periods,
+    }
+    binding = resolve_research_label_binding(
+        {
+            "horizon_profile": profile,
+            "dataset": window["dataset_name"],
+            "dataset_identity_sha256": window["dataset_identity_sha256"],
+            "periods": periods,
+            "feature_set": feature_set,
+            "research_window_contract": window,
+            "research_window_contract_sha256": canonical_sha256(window),
+        }
+    )
+    assert binding is not None
+    return binding
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_horizon"),
+    ((SHORT_1_5D, 5), (SWING_1_6M, 63), (LONG_1_3Y, 252)),
+)
+def test_ensemble_label_contract_uses_each_horizons_frozen_forward_return(
+    profile: str, expected_horizon: int
+) -> None:
+    bindings = {
+        "ridge-1": _label_binding(
+            profile, feature_id="alpha158", feature_sha256="a" * 64
+        ),
+        "gru-1": _label_binding(
+            profile, feature_id="alpha360", feature_sha256="b" * 64
+        ),
+    }
+
+    contract = build_model_ensemble_label_contract(bindings)
+
+    assert contract["label_identity"]["horizon_profile"] == profile
+    assert contract["label_identity"]["label_horizon_sessions"] == expected_horizon
+    assert contract["label_identity"]["label_expression"] == (
+        f"Ref($close,-{expected_horizon + 1})/Ref($close,-1)-1"
+    )
+    assert validate_model_ensemble_label_contract(
+        contract, member_bindings=bindings
+    ) == contract
+
+
+def test_ensemble_label_contract_rejects_members_from_different_horizons() -> None:
+    bindings = {
+        "short-1": _label_binding(
+            SHORT_1_5D, feature_id="alpha158", feature_sha256="a" * 64
+        ),
+        "swing-1": _label_binding(
+            SWING_1_6M, feature_id="alpha158", feature_sha256="a" * 64
+        ),
+    }
+
+    with pytest.raises(ValueError, match="different frozen label targets"):
+        build_model_ensemble_label_contract(bindings)
 
 
 def _predictions(order: list[int], *, days: int = 60) -> pd.DataFrame:

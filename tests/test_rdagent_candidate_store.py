@@ -30,6 +30,7 @@ from quant_platform.rdagent_candidate_store import (
     validate_model_evaluation_evidence,
     validate_quant_bundle_evidence,
 )
+from quant_platform.research_store import ResearchStore
 
 
 def _metrics() -> dict[str, float]:
@@ -263,6 +264,138 @@ def test_quant_bundle_validator_requires_all_three_ablations() -> None:
 def test_research_candidates_fail_closed_for_capital() -> None:
     with pytest.raises(ValueError, match="research-only"):
         RDAGentCandidateStore.require_capital_admission("model", "model-1")
+
+
+@pytest.mark.no_database
+def test_run_artifact_retry_reuses_matching_provenance_before_insert(
+    tmp_path: Path,
+) -> None:
+    result_path = tmp_path / "retry-result.json"
+    result_path.write_text('{"status":"resource_blocked"}\n', encoding="utf-8")
+    metadata = {
+        "dataset_identity_sha256": "a" * 64,
+        "feature_set_id": "qlib-alpha360",
+    }
+    existing = {
+        "id": "immutable-artifact-1",
+        "research_run_id": "run-1",
+        "artifact_type": "model_independent_evaluation",
+        "contract_version": "model-independent-evaluation-v1",
+        "producer": "quantlab_independent_evaluator",
+        "source_iteration": None,
+        "size_bytes": result_path.stat().st_size,
+        "manifest_json": {
+            "artifact_contract_version": "model-independent-evaluation-v1",
+            "producer": "quantlab_independent_evaluator",
+            "source_iteration": None,
+            "metadata": metadata,
+        },
+    }
+    store = RDAGentCandidateStore.__new__(RDAGentCandidateStore)
+    store.find_run_artifact = lambda **_kwargs: existing
+
+    def unexpected_register(**_kwargs):
+        raise AssertionError("an identical retry must not insert another artifact")
+
+    store.register_run_artifact = unexpected_register
+
+    reused = store.register_or_reuse_run_artifact(
+        research_run_id="run-1",
+        artifact_type="model_independent_evaluation",
+        storage_path=result_path,
+        producer="quantlab_independent_evaluator",
+        actor="worker",
+        contract_version="model-independent-evaluation-v1",
+        metadata=metadata,
+    )
+
+    assert reused is existing
+
+
+def test_identical_run_artifact_retry_reuses_immutable_row(
+    tmp_path: Path, database_url: str
+) -> None:
+    run = ResearchStore(database_url).create_run(
+        kind="platform_model_feature_screen_test",
+        objective="verify idempotent resource retry artifacts",
+        dataset="sealed-dataset",
+        requested_by="test",
+        budget={},
+        config={},
+        artifact_path=tmp_path / "run",
+    )
+    first_path = tmp_path / "attempt-1" / "result.json"
+    retry_path = tmp_path / "attempt-2" / "result.json"
+    first_path.parent.mkdir()
+    retry_path.parent.mkdir()
+    contents = '{"status":"resource_blocked"}\n'
+    first_path.write_text(contents, encoding="utf-8")
+    retry_path.write_text(contents, encoding="utf-8")
+    store = RDAGentCandidateStore(database_url)
+    provenance = {
+        "dataset_identity_sha256": "a" * 64,
+        "feature_set_id": "qlib-alpha360",
+    }
+
+    first = store.register_or_reuse_run_artifact(
+        research_run_id=run["id"],
+        artifact_type="model_independent_evaluation",
+        storage_path=first_path,
+        producer="quantlab_independent_evaluator",
+        actor="worker",
+        contract_version="model-independent-evaluation-v1",
+        metadata=provenance,
+    )
+    retried = store.register_or_reuse_run_artifact(
+        research_run_id=run["id"],
+        artifact_type="model_independent_evaluation",
+        storage_path=retry_path,
+        producer="quantlab_independent_evaluator",
+        actor="worker",
+        contract_version="model-independent-evaluation-v1",
+        metadata=provenance,
+    )
+
+    assert retried["id"] == first["id"]
+    assert retried["storage_path"] == str(first_path.resolve())
+    assert len(store.list_run_artifacts(run["id"], verify=True)) == 1
+
+
+def test_identical_run_artifact_retry_rejects_changed_provenance(
+    tmp_path: Path, database_url: str
+) -> None:
+    run = ResearchStore(database_url).create_run(
+        kind="platform_model_feature_screen_provenance_test",
+        objective="reject a mismatched retry provenance",
+        dataset="sealed-dataset",
+        requested_by="test",
+        budget={},
+        config={},
+        artifact_path=tmp_path / "run",
+    )
+    result_path = tmp_path / "result.json"
+    result_path.write_text('{"status":"resource_blocked"}\n', encoding="utf-8")
+    store = RDAGentCandidateStore(database_url)
+    store.register_or_reuse_run_artifact(
+        research_run_id=run["id"],
+        artifact_type="model_independent_evaluation",
+        storage_path=result_path,
+        producer="quantlab_independent_evaluator",
+        actor="worker",
+        contract_version="model-independent-evaluation-v1",
+        metadata={"feature_set_id": "qlib-alpha360"},
+    )
+
+    with pytest.raises(ValueError, match="different provenance"):
+        store.register_or_reuse_run_artifact(
+            research_run_id=run["id"],
+            artifact_type="model_independent_evaluation",
+            storage_path=result_path,
+            producer="quantlab_independent_evaluator",
+            actor="worker",
+            contract_version="model-independent-evaluation-v1",
+            metadata={"feature_set_id": "qlib-alpha158"},
+        )
 
 
 def test_bundle_inventory_rechecks_every_file_and_rejects_extras(tmp_path: Path) -> None:
