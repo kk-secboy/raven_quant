@@ -266,6 +266,12 @@ def main() -> None:
                         workflow.log_params(
                             {"ensemble_id": ensemble_id, "profile": profile_id, "seed": seed}
                         )
+                        recorder.save_objects(
+                            **{
+                                "pred.pkl": combined[["score"]],
+                                "label.pkl": labels.to_frame("label"),
+                            }
+                        )
                         record = PortAnaRecord(
                             recorder,
                             config={
@@ -273,7 +279,7 @@ def main() -> None:
                                     "class": "TopkDropoutStrategy",
                                     "module_path": "qlib.contrib.strategy",
                                     "kwargs": {
-                                        "signal": combined["score"],
+                                        "signal": "<PRED>",
                                         "topk": int(manifest.get("topk", 50)),
                                         "n_drop": int(manifest.get("n_drop", 5)),
                                     },
@@ -301,7 +307,12 @@ def main() -> None:
                             },
                             risk_analysis_freq="day",
                         )
-                        record.generate()
+                        generated = record.generate()
+                        if not isinstance(generated, dict):
+                            raise RuntimeError(
+                                "Qlib ensemble portfolio record generation was skipped"
+                            )
+                        record.check(include_self=True, parents=False)
                         report = recorder.load_object(
                             "portfolio_analysis/report_normal_1day.pkl"
                         )

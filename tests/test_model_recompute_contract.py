@@ -121,6 +121,8 @@ def test_model_sandbox_materializes_qlib_signal_record_dependencies() -> None:
     assert '"label.pkl": labels' in source
     assert '"signal": "<PRED>"' in source
     assert save_index < portfolio_index < generate_index
+    assert "Qlib portfolio record generation was skipped" in source
+    assert "record.check(include_self=True, parents=False)" in source
 
 
 def test_live_inference_requires_an_immutable_checkpoint_before_docker(

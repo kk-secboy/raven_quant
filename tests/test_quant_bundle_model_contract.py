@@ -41,6 +41,18 @@ def _module() -> ModuleType:
     return module
 
 
+def test_quant_bundle_materializes_qlib_signal_record_dependencies() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "evaluate_quant_bundle.py"
+    ).read_text(encoding="utf-8")
+    save_index = source.index('"pred.pkl": predictions[["score"]]')
+    portfolio_index = source.index("record = PortAnaRecord(")
+    assert '"label.pkl": labels.to_frame("label")' in source
+    assert '"signal": "<PRED>"' in source
+    assert save_index < portfolio_index
+    assert "Qlib quant-bundle portfolio record generation was skipped" in source
+
+
 def test_fin_quant_rejects_legacy_recent_only_prediction_selection() -> None:
     worker = object.__new__(LocalJobWorker)
     selection = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -18,6 +19,18 @@ from quant_platform.model_strategy_contract import (
 )
 
 pytestmark = pytest.mark.no_database
+
+
+def test_ensemble_materializes_qlib_signal_record_dependencies() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "evaluate_model_ensemble.py"
+    ).read_text(encoding="utf-8")
+    save_index = source.index('"pred.pkl": combined[["score"]]')
+    portfolio_index = source.index("record = PortAnaRecord(")
+    assert '"label.pkl": labels.to_frame("label")' in source
+    assert '"signal": "<PRED>"' in source
+    assert save_index < portfolio_index
+    assert "Qlib ensemble portfolio record generation was skipped" in source
 
 
 def _predictions(order: list[int], *, days: int = 60) -> pd.DataFrame:

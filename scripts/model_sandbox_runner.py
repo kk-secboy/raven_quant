@@ -731,7 +731,10 @@ def main() -> None:
                 },
                 risk_analysis_freq="day",
             )
-            record.generate()
+            generated = record.generate()
+            if not isinstance(generated, dict):
+                raise RuntimeError("Qlib portfolio record generation was skipped")
+            record.check(include_self=True, parents=False)
             report = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
             workflow_identity = workflow.identity_dict()
         excess = report["return"] - report["bench"] - report["cost"]

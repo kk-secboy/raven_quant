@@ -1001,6 +1001,12 @@ def _evaluate_equal_rank_portfolio(
         dataset_identity_sha256=str(manifest["dataset_identity_sha256"]),
     ) as workflow:
         recorder = workflow.get_recorder()
+        recorder.save_objects(
+            **{
+                "pred.pkl": predictions[["score"]],
+                "label.pkl": labels.to_frame("label"),
+            }
+        )
         record = PortAnaRecord(
             recorder,
             config={
@@ -1008,7 +1014,7 @@ def _evaluate_equal_rank_portfolio(
                     "class": "TopkDropoutStrategy",
                     "module_path": "qlib.contrib.strategy",
                     "kwargs": {
-                        "signal": predictions["score"],
+                        "signal": "<PRED>",
                         "topk": int(manifest.get("topk", 50)),
                         "n_drop": int(manifest.get("n_drop", 5)),
                     },
@@ -1030,7 +1036,10 @@ def _evaluate_equal_rank_portfolio(
             },
             risk_analysis_freq="day",
         )
-        record.generate()
+        generated = record.generate()
+        if not isinstance(generated, dict):
+            raise RuntimeError("Qlib quant-bundle portfolio record generation was skipped")
+        record.check(include_self=True, parents=False)
         report = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
     excess = report["return"] - report["bench"] - report["cost"]
     risk = risk_analysis(excess, freq="day")["risk"]
