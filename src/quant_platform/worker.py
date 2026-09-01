@@ -52,7 +52,7 @@ from .forward_only_rehabilitation import (
     EVIDENCE_MODE_REPLAY,
     require_replay_markers,
 )
-from .job_commands import KNOWN_JOB_COMMAND_KINDS, build_command
+from .job_commands import build_command
 from .job_commands._shared import (
     _bind_daily_simulation_settlement_calendar as _bind_daily_simulation_settlement_calendar,
 )
@@ -2537,74 +2537,7 @@ class LocalJobWorker:
         return result
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
-        if job["kind"] in KNOWN_JOB_COMMAND_KINDS:
-            return build_command(self, job)
-        payload = job["payload"]
-        if job["kind"] in {
-            "weekly_report",
-            "monthly_decision_day",
-            "preopen_check",
-            "intraday_execution_check",
-        }:
-            output = self.settings.data_root / "artifacts" / "ops-reports" / job["kind"] / job["id"]
-            output.mkdir(parents=True, exist_ok=True)
-            result_path = output / "result.json"
-            command = [
-                sys.executable,
-                "-m",
-                "quant_platform.ops_tasks",
-                job["kind"],
-                "--date",
-                str(payload["local_date"]),
-                "--result",
-                str(result_path),
-            ]
-            if payload.get("dataset"):
-                command.extend(["--dataset", str(payload["dataset"])])
-            if job["kind"] == "intraday_execution_check":
-                command.extend(["--as-of", str(payload["as_of"])])
-            return command, result_path, {}
-        if job["kind"] == "strategy_health_collect":
-            required = (
-                "strategy_version_id",
-                "promotion_stage_id",
-                "simulation_batch_id",
-                "formal_backtest_id",
-                "daily_dataset_identity_sha256",
-                "requested_at",
-            )
-            if any(not str(payload.get(key) or "") for key in required):
-                raise ValueError("strategy health collection payload is incomplete")
-            output = (
-                self.settings.data_root
-                / "artifacts"
-                / "strategy-health-jobs"
-                / str(job["id"])
-            )
-            output.mkdir(parents=True, exist_ok=True)
-            result_path = output / "result.json"
-            script = self.project_root / "scripts" / "collect_strategy_health.py"
-            return (
-                [
-                    sys.executable,
-                    str(script),
-                    "--strategy-version-id",
-                    str(payload["strategy_version_id"]),
-                    "--promotion-stage-id",
-                    str(payload["promotion_stage_id"]),
-                    "--simulation-batch-id",
-                    str(payload["simulation_batch_id"]),
-                    "--formal-backtest-id",
-                    str(payload["formal_backtest_id"]),
-                    "--daily-dataset-identity-sha256",
-                    str(payload["daily_dataset_identity_sha256"]),
-                    "--output",
-                    str(result_path),
-                ],
-                result_path,
-                {},
-            )
-        raise ValueError(f"unsupported job kind: {job['kind']}")
+        return build_command(self, job)
 
     def _queue_data_pipeline_successor(self, job: dict) -> dict:
         payload = dict(job["payload"])
