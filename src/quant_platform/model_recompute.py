@@ -18,7 +18,7 @@ from .model_research_governance import (
     resolve_model_label_contract,
 )
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v5-mlflow-run-lifecycle"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v6-qlib-signal-record"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"

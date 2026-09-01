@@ -699,6 +699,16 @@ def main() -> None:
             workflow.log_params(
                 {"candidate_id": manifest["candidate_id"], "seed": seed}
             )
+            # PortAnaRecord formally depends on the root SignalRecord artifacts.
+            # Persist the exact already-computed predictions and labels instead of
+            # invoking model.predict a second time, which could diverge for a
+            # stochastic model or use a different default dataset segment.
+            recorder.save_objects(
+                **{
+                    "pred.pkl": predictions.to_frame("score"),
+                    "label.pkl": labels,
+                }
+            )
             record = PortAnaRecord(
                 recorder,
                 config={
@@ -706,7 +716,7 @@ def main() -> None:
                         "class": "TopkDropoutStrategy",
                         "module_path": "qlib.contrib.strategy",
                         "kwargs": {
-                            "signal": predictions,
+                            "signal": "<PRED>",
                             "topk": int(manifest.get("topk", 50)),
                             "n_drop": int(manifest.get("n_drop", 5)),
                         },

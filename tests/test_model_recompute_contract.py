@@ -111,6 +111,18 @@ def test_model_sandbox_closes_implicit_training_run_before_governed_workflow() -
     assert "Qlib training recorder remained active after model fit" in source
 
 
+def test_model_sandbox_materializes_qlib_signal_record_dependencies() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
+    ).read_text(encoding="utf-8")
+    save_index = source.index('"pred.pkl": predictions.to_frame("score")')
+    portfolio_index = source.index("record = PortAnaRecord(")
+    generate_index = source.index("record.generate()")
+    assert '"label.pkl": labels' in source
+    assert '"signal": "<PRED>"' in source
+    assert save_index < portfolio_index < generate_index
+
+
 def test_live_inference_requires_an_immutable_checkpoint_before_docker(
     tmp_path: Path,
 ) -> None:
