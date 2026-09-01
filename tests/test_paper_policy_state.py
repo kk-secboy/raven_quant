@@ -157,9 +157,9 @@ def test_paper_policy_state_is_wired_through_artifact_batch_and_worker() -> None
     store = (root / "src" / "quant_platform" / "simulation_store.py").read_text(
         encoding="utf-8"
     )
-    worker = (root / "src" / "quant_platform" / "worker.py").read_text(
-        encoding="utf-8"
-    )
+    commands = (
+        root / "src" / "quant_platform" / "job_commands" / "simulation.py"
+    ).read_text(encoding="utf-8")
 
     assert '"paper_policy_state": seal_paper_policy_state' in script
     assert '_canonical_bytes({"target_weights": target_weights})' in script
@@ -167,9 +167,9 @@ def test_paper_policy_state_is_wired_through_artifact_batch_and_worker() -> None
     assert "def latest_paper_previous_snapshot(" in store
     assert "simulation_batches.c.status == \"succeeded\"" in store
     assert "simulation_batches.c.signal_date < before_signal_date" in store
-    assert "self.simulations.latest_paper_previous_snapshot(" in worker
-    assert "bind_current_paper_holdings(" in worker
-    assert '"previous_snapshot": previous_snapshot' in worker
+    assert "worker.simulations.latest_paper_previous_snapshot(" in commands
+    assert "bind_current_paper_holdings(" in commands
+    assert '"previous_snapshot": previous_snapshot' in commands
 
 
 @pytest.mark.no_database

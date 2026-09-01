@@ -8,6 +8,7 @@ command builders can use them without importing the worker module itself.
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,10 @@ from quant_data.path_utils import to_wsl_path as _to_wsl_path
 from ..feature_set_registry import get_feature_set
 from ..model_recompute import GOVERNED_MODEL_ENGINES
 from ..model_research_governance import canonical_sha256 as model_canonical_sha256
+from ..simulation_store import (
+    build_settlement_calendar_binding,
+    validate_settlement_calendar_binding,
+)
 
 
 def _frozen_model_label_contract(model_signal: dict[str, Any] | None) -> tuple[dict, str] | None:
@@ -106,3 +111,51 @@ def _frozen_evaluation_feature_set(payload: dict) -> dict:
     ):
         raise ValueError("model evaluation feature set changed after job creation")
     return feature_set
+
+def _require_supported_simulation_execution(
+    job_kind: str, *, execution_adapter: str | None = None
+) -> None:
+    """Fail closed for every retired short-selling execution path.
+
+    Historical pair jobs remain queryable and generic job retry is intentionally
+    broad.  The worker is therefore the final authority boundary: neither an
+    old queued job nor a retried cancelled job may start pair replay code after
+    the long-only Autopilot release.
+    """
+
+    if (
+        str(job_kind) == "simulation_replay"
+        and str(execution_adapter or "") != "long_only"
+    ):
+        raise ValueError(
+            "pair simulation execution is retired; historical ledgers are read-only"
+        )
+
+def _bind_daily_simulation_settlement_calendar(
+    manifest: dict[str, Any], execution_dataset: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-verify the batch calendar against the exact worker-side dataset."""
+
+    result = dict(manifest)
+    if str(result.get("execution_frequency") or "") != "day":
+        return result
+    settlement_trade_date = date.fromisoformat(str(result["trade_date"]))
+    provenance = dict(execution_dataset.get("provenance") or {})
+    persisted = validate_settlement_calendar_binding(
+        result.get("settlement_calendar_binding"),
+        trade_date=settlement_trade_date,
+        dataset_identity_sha256=str(
+            provenance.get("dataset_identity_sha256") or ""
+        ),
+        dataset_lineage_id=str(provenance.get("dataset_lineage_id") or ""),
+    )
+    observed = build_settlement_calendar_binding(
+        execution_dataset,
+        trade_date=settlement_trade_date,
+    )
+    if observed != persisted:
+        raise ValueError(
+            "daily simulation settlement calendar changed after batch binding"
+        )
+    result["settlement_calendar_binding"] = observed
+    return result

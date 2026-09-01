@@ -369,7 +369,7 @@ def test_worker_builds_production_qlib_order_plan_job(
         },
     ]
     monkeypatch.setattr(
-        "quant_platform.worker.list_qlib_datasets",
+        "quant_platform.job_commands.simulation.list_qlib_datasets",
         lambda _root: governed_datasets,
     )
     monkeypatch.setattr(

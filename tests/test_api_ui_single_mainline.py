@@ -176,7 +176,9 @@ def test_long_only_replay_api_accepts_only_an_immutable_order_plan_identity() ->
         assert marker in (
             ROOT / "scripts" / "run_recommendation_refresh.py"
         ).read_text(encoding="utf-8")
-    assert 'if job["kind"] == "simulation_order_plan":' in WORKER_SOURCE
+    assert '"simulation_order_plan": simulation_order_plan_command' in (
+        ROOT / "src" / "quant_platform" / "job_commands" / "simulation.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_web_uses_only_the_single_mainline_routes() -> None:
