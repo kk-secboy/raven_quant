@@ -60,7 +60,7 @@ from quant_platform.capital_oos_receipt import (
 from quant_platform.capital_oos_receipt import (
     sha256_file as capital_oos_sha256_file,
 )
-from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelConfig
+from quant_platform.cost_model import CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.factor_library_store import validate_incremental_evidence
 from quant_platform.factor_recompute import (
@@ -129,7 +129,6 @@ from quant_platform.model_strategy_contract import (
     normalize_model_signal_config,
     validate_model_formal_admission_binding,
 )
-from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.qlib_backtest import (
     COMPONENT_COST_STRESS_MULTIPLIERS,
     QLIB_ENGINE_VERSION,
@@ -685,26 +684,12 @@ def _validate_governed_profile_consensus(
 
 
 def _version_contract_columns(config: dict[str, Any], *, strategy_type: str) -> dict[str, Any]:
-    if strategy_type == "pair":
-        signal_frequency = "day"
-        signal_horizon = "1d"
-        execution_frequency = "1min"
-        contract_hash = _canonical_sha256(
-            {
-                "strategy_type": "pair",
-                "signal_frequency": signal_frequency,
-                "signal_horizon": signal_horizon,
-                "execution_frequency": execution_frequency,
-                "config": config,
-            }
-        )
-    else:
-        signal_frequency = str(config.get("signal_frequency") or "day")
-        signal_horizon = f"{int(config.get('signal_period') or 1)}bar"
-        execution_frequency = str(config.get("execution_frequency") or "day")
-        contract_hash = str(config.get("execution_contract_hash") or "")
-        if not _is_sha256(contract_hash):
-            raise ValueError("strategy execution contract hash is required")
+    signal_frequency = str(config.get("signal_frequency") or "day")
+    signal_horizon = f"{int(config.get('signal_period') or 1)}bar"
+    execution_frequency = str(config.get("execution_frequency") or "day")
+    contract_hash = str(config.get("execution_contract_hash") or "")
+    if not _is_sha256(contract_hash):
+        raise ValueError("strategy execution contract hash is required")
     return {
         "evidence_mode": str(
             config.get("evidence_mode")
@@ -1994,76 +1979,6 @@ def _multifactor_manifest_failures(
             failures.append(
                 "formal model admission differs between manifest and validation evidence"
             )
-    return failures
-
-
-def _pair_artifact_failures(
-    version: dict[str, Any], backtest: dict[str, Any], metrics: dict[str, Any]
-) -> list[str]:
-    artifact_root = Path(str(backtest["artifact_path"]))
-    manifest_path = artifact_root / "manifest.json"
-    pair_manifest_path = artifact_root / "pair_artifact_manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        pair_manifest = json.loads(pair_manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return ["pair backtest artifact manifests are missing or unreadable"]
-    if not isinstance(manifest, dict) or not isinstance(pair_manifest, dict):
-        return ["pair backtest artifact manifests must be JSON objects"]
-    provenance = metrics.get("provenance")
-    provenance = provenance if isinstance(provenance, dict) else {}
-    failures: list[str] = []
-    try:
-        require_qlib_workflow_identity(provenance.get("qlib_workflow"))
-    except ValueError as exc:
-        failures.append(str(exc))
-    if provenance.get("execution_manifest_sha256") != _sha256_file(manifest_path):
-        failures.append("pair execution manifest does not match its SHA-256 provenance")
-    if provenance.get("pair_artifact_manifest_sha256") != _sha256_file(pair_manifest_path):
-        failures.append("pair artifact manifest does not match its SHA-256 provenance")
-    expected_config_sha256 = _canonical_sha256(version.get("config") or {})
-    expected_pair = {
-        key: (version.get("pair") or {}).get(key)
-        for key in ("leg_y", "leg_x", "asset_class", "shorting_mode")
-    }
-    for candidate in (manifest, pair_manifest):
-        observed_pair = {key: dict(candidate.get("pair") or {}).get(key) for key in expected_pair}
-        if (
-            candidate.get("backtest_id") != backtest.get("id")
-            or candidate.get("strategy_version_id") != version.get("id")
-            or candidate.get("dataset") != backtest.get("dataset")
-            or candidate.get("periods") != backtest.get("periods")
-            or candidate.get("execution_contract_hash") != version.get("execution_contract_hash")
-            or observed_pair != expected_pair
-        ):
-            failures.append("pair artifact manifest does not match the immutable strategy/backtest")
-            break
-    if pair_manifest.get("format_version") != "pair-replay-artifact-v1":
-        failures.append("pair artifact manifest format is unsupported")
-    if pair_manifest.get("strategy_config_sha256") != expected_config_sha256:
-        failures.append("pair artifact strategy config identity does not match the version")
-    if _canonical_sha256(manifest.get("config") or {}) != expected_config_sha256:
-        failures.append("pair execution manifest config does not match the version")
-    files = pair_manifest.get("files")
-    if not isinstance(files, dict):
-        failures.append("pair artifact file manifest is missing")
-        return failures
-    for name in (
-        "daily_returns.parquet",
-        "daily_ledger.parquet",
-        "kalman_spread.parquet",
-        "trades.json",
-        "rejections.json",
-    ):
-        evidence = files.get(name)
-        path = artifact_root / name
-        if (
-            not isinstance(evidence, dict)
-            or not path.is_file()
-            or path.stat().st_size != int(evidence.get("bytes") or -1)
-            or _sha256_file(path) != str(evidence.get("sha256") or "")
-        ):
-            failures.append(f"pair artifact {name} failed immutable verification")
     return failures
 
 
@@ -3637,193 +3552,6 @@ class StrategyStore:
             raise ValueError("strategy version creation conflicted with another request") from exc
         return self.get_version(version_id)
 
-    @staticmethod
-    def _validate_pair_definition(
-        *,
-        leg_y: str,
-        leg_x: str,
-        asset_class: str,
-        shorting_mode: str,
-        config: dict[str, Any],
-    ) -> dict[str, Any]:
-        first = leg_y.strip().upper()
-        second = leg_x.strip().upper()
-        if not first or not second or first == second:
-            raise ValueError("pair strategy requires two distinct instruments")
-        if asset_class not in {"etf", "stock", "mixed"}:
-            raise ValueError("pair asset_class must be etf, stock, or mixed")
-        if shorting_mode not in {"shadow_borrow", "margin_borrow"}:
-            raise ValueError("pair shorting mode must be shadow_borrow or legacy margin_borrow")
-        validated = PairTradingConfig(**config)
-        return {
-            "leg_y": first,
-            "leg_x": second,
-            "asset_class": asset_class,
-            "shorting_mode": shorting_mode,
-            "config": asdict(validated),
-        }
-
-    def create_pair(
-        self,
-        *,
-        name: str,
-        description: str,
-        leg_y: str,
-        leg_x: str,
-        asset_class: str,
-        shorting_mode: str,
-        config: dict[str, Any],
-        actor: str,
-    ) -> dict[str, Any]:
-        if not name.strip() or not description.strip() or not actor.strip():
-            raise ValueError("pair strategy name, description, and actor are required")
-        definition = self._validate_pair_definition(
-            leg_y=leg_y,
-            leg_x=leg_x,
-            asset_class=asset_class,
-            shorting_mode=shorting_mode,
-            config=config,
-        )
-        strategy_id = uuid.uuid4().hex
-        version_id = uuid.uuid4().hex
-        now = _now()
-        try:
-            with self.engine.begin() as connection:
-                connection.execute(
-                    insert(strategies).values(
-                        id=strategy_id,
-                        name=name.strip(),
-                        description=description.strip(),
-                        status="draft",
-                        created_by=actor.strip(),
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                connection.execute(
-                    insert(strategy_versions).values(
-                        id=version_id,
-                        strategy_id=strategy_id,
-                        version=1,
-                        status="draft",
-                        strategy_type="pair",
-                        **_version_contract_columns(definition["config"], strategy_type="pair"),
-                        benchmark="CASH",
-                        universe=f"pair:{definition['leg_y']}:{definition['leg_x']}",
-                        config_json=definition["config"],
-                        created_by=actor.strip(),
-                        created_at=now,
-                    )
-                )
-                connection.execute(
-                    insert(strategy_pairs).values(
-                        strategy_version_id=version_id,
-                        leg_y=definition["leg_y"],
-                        leg_x=definition["leg_x"],
-                        asset_class=definition["asset_class"],
-                        shorting_mode=definition["shorting_mode"],
-                        created_at=now,
-                    )
-                )
-                self._event(
-                    connection,
-                    strategy_id=strategy_id,
-                    version_id=version_id,
-                    event_type="strategy.pair_created",
-                    actor=actor.strip(),
-                    payload={key: definition[key] for key in ("leg_y", "leg_x", "asset_class")},
-                )
-        except IntegrityError as exc:
-            raise ValueError(f"strategy name {name!r} already exists") from exc
-        return self.get(strategy_id)
-
-    def create_pair_version(
-        self,
-        strategy_id: str,
-        *,
-        leg_y: str,
-        leg_x: str,
-        asset_class: str,
-        shorting_mode: str,
-        config: dict[str, Any],
-        actor: str,
-    ) -> dict[str, Any]:
-        if not actor.strip():
-            raise ValueError("pair strategy version actor is required")
-        definition = self._validate_pair_definition(
-            leg_y=leg_y,
-            leg_x=leg_x,
-            asset_class=asset_class,
-            shorting_mode=shorting_mode,
-            config=config,
-        )
-        version_id = uuid.uuid4().hex
-        now = _now()
-        try:
-            with self.engine.begin() as connection:
-                strategy = connection.execute(
-                    select(strategies).where(strategies.c.id == strategy_id).with_for_update()
-                ).first()
-                if strategy is None:
-                    raise KeyError(strategy_id)
-                family_type = connection.scalar(
-                    select(strategy_versions.c.strategy_type)
-                    .where(strategy_versions.c.strategy_id == strategy_id)
-                    .limit(1)
-                )
-                if family_type != "pair":
-                    raise ValueError("multifactor strategy families require promoted factors")
-                latest = connection.scalar(
-                    select(func.max(strategy_versions.c.version)).where(
-                        strategy_versions.c.strategy_id == strategy_id
-                    )
-                )
-                version_number = int(latest or 0) + 1
-                connection.execute(
-                    insert(strategy_versions).values(
-                        id=version_id,
-                        strategy_id=strategy_id,
-                        version=version_number,
-                        status="draft",
-                        strategy_type="pair",
-                        **_version_contract_columns(definition["config"], strategy_type="pair"),
-                        benchmark="CASH",
-                        universe=f"pair:{definition['leg_y']}:{definition['leg_x']}",
-                        config_json=definition["config"],
-                        created_by=actor.strip(),
-                        created_at=now,
-                    )
-                )
-                connection.execute(
-                    insert(strategy_pairs).values(
-                        strategy_version_id=version_id,
-                        leg_y=definition["leg_y"],
-                        leg_x=definition["leg_x"],
-                        asset_class=definition["asset_class"],
-                        shorting_mode=definition["shorting_mode"],
-                        created_at=now,
-                    )
-                )
-                connection.execute(
-                    update(strategies).where(strategies.c.id == strategy_id).values(updated_at=now)
-                )
-                self._event(
-                    connection,
-                    strategy_id=strategy_id,
-                    version_id=version_id,
-                    event_type="strategy.pair_version_created",
-                    actor=actor.strip(),
-                    payload={
-                        "version": version_number,
-                        **{key: definition[key] for key in ("leg_y", "leg_x", "asset_class")},
-                    },
-                )
-        except IntegrityError as exc:
-            raise ValueError(
-                "pair strategy version creation conflicted with another request"
-            ) from exc
-        return self.get_version(version_id)
-
     def get(self, strategy_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(
@@ -3849,25 +3577,6 @@ class StrategyStore:
 
     def list(self, limit: int = 100) -> list[dict[str, Any]]:
         statement = select(strategies).order_by(strategies.c.updated_at.desc()).limit(limit)
-        with self.engine.connect() as connection:
-            ids = [str(row.id) for row in connection.execute(statement)]
-        return [self.get(strategy_id) for strategy_id in ids]
-
-    def list_pairs(self, limit: int = 100) -> list[dict[str, Any]]:
-        statement = (
-            select(strategies.c.id)
-            .join(
-                strategy_versions,
-                strategy_versions.c.strategy_id == strategies.c.id,
-            )
-            .join(
-                strategy_pairs,
-                strategy_pairs.c.strategy_version_id == strategy_versions.c.id,
-            )
-            .group_by(strategies.c.id)
-            .order_by(strategies.c.updated_at.desc())
-            .limit(limit)
-        )
         with self.engine.connect() as connection:
             ids = [str(row.id) for row in connection.execute(statement)]
         return [self.get(strategy_id) for strategy_id in ids]
@@ -5625,11 +5334,7 @@ class StrategyStore:
 
         backtest = self.get_backtest(backtest_id)
         version = self.get_version(backtest["strategy_version_id"])
-        failures = (
-            _pair_artifact_failures(version, backtest, metrics)
-            if version.get("strategy_type") == "pair"
-            else _multifactor_manifest_failures(version, backtest, metrics)
-        )
+        failures = _multifactor_manifest_failures(version, backtest, metrics)
         if version.get("strategy_type") == "multifactor":
             failures.extend(
                 self._hypothesis_group_manifest_failures(version["id"], backtest)
@@ -5690,169 +5395,6 @@ class StrategyStore:
             row["periods"] = row.pop("periods_json")
             row["metrics"] = row.pop("metrics_json")
         return rows
-
-    def _approve_pair(
-        self,
-        version: dict[str, Any],
-        backtest: dict[str, Any],
-        *,
-        actor: str,
-        reason: str,
-    ) -> dict[str, Any]:
-        # This is a research approval, not capital approval.  A passing pair may
-        # own a persistent shadow ledger, while its catalog capabilities keep
-        # recommendations, financing and real trading permanently disabled.
-        config = PairTradingConfig(**version["config"])
-        metrics = dict(backtest["metrics"] or {})
-        failures: list[str] = []
-        if actor == version["created_by"]:
-            failures.append("pair strategy approval requires a second operator")
-        if not backtest.get("execution_dataset"):
-            failures.append("pair backtest requires an immutable minute execution dataset")
-        if (
-            metrics.get("backtest_engine") != "quantlab_pair"
-            or metrics.get("pair_native_backtest") is not True
-        ):
-            failures.append("a native QuantLab pair backtest is required")
-        pair = version.get("pair") or {}
-        if metrics.get("leg_y") != pair.get("leg_y") or metrics.get("leg_x") != pair.get("leg_x"):
-            failures.append("pair backtest instruments do not match the strategy version")
-        evidence = metrics.get("initial_pair_evidence")
-        if not isinstance(evidence, dict):
-            failures.append("initial pair correlation and cointegration evidence is required")
-            evidence = {}
-        checks: dict[str, tuple[Any, Any, str]] = {
-            "correlation": (evidence.get("correlation"), config.min_correlation, "min"),
-            "cointegration_pvalue": (
-                evidence.get("cointegration_pvalue"),
-                config.max_cointegration_pvalue,
-                "max",
-            ),
-            "hedge_ratio_min": (
-                evidence.get("hedge_ratio"),
-                config.min_hedge_ratio,
-                "min",
-            ),
-            "hedge_ratio_max": (
-                evidence.get("hedge_ratio"),
-                config.max_hedge_ratio,
-                "max",
-            ),
-            "max_drawdown": (
-                abs(float(metrics["max_drawdown"]))
-                if metrics.get("max_drawdown") is not None
-                else None,
-                config.max_drawdown,
-                "max",
-            ),
-            "sharpe_ratio": (metrics.get("sharpe_ratio"), config.min_sharpe_ratio, "min"),
-            "closed_trade_count": (
-                metrics.get("closed_trade_count"),
-                config.min_closed_trades,
-                "min",
-            ),
-            "trading_days": (metrics.get("trading_days"), config.min_backtest_days, "min"),
-            "rolling_cointegration_pass_rate": (
-                metrics.get("rolling_cointegration_pass_rate"),
-                config.min_rolling_cointegration_pass_rate,
-                "min",
-            ),
-            "pair_robustness_pass_rate": (
-                metrics.get("pair_robustness_pass_rate"),
-                config.min_robustness_pass_rate,
-                "min",
-            ),
-            "capacity_fill_ratio": (
-                metrics.get("capacity_fill_ratio"),
-                config.min_capacity_fill_ratio,
-                "min",
-            ),
-        }
-        for name, (value, threshold, mode) in checks.items():
-            if (
-                value is None
-                or (mode == "max" and value > threshold)
-                or (mode == "min" and value < threshold)
-            ):
-                failures.append(f"{name}={value} violates {mode} {threshold}")
-        for name in (
-            "minute_execution_enforced",
-            "shortability_enforced",
-            "market_controls_enforced",
-            "atomic_pair_execution_enforced",
-            "transaction_costs_enforced",
-            "borrow_cost_enforced",
-        ):
-            if metrics.get(name) is not True:
-                failures.append(f"{name} is required for pair strategy approval")
-        if metrics.get("open_position_at_end") is not False:
-            failures.append("pair backtest must finish without an open spread position")
-        if metrics.get("cost_schedule_version") not in KNOWN_COST_SCHEDULE_VERSIONS:
-            failures.append("pair backtest cost schedule is missing or obsolete")
-        provenance = metrics.get("provenance")
-        if not isinstance(provenance, dict):
-            failures.append("reproducible pair backtest provenance is required")
-        else:
-            try:
-                require_qlib_workflow_identity(provenance.get("qlib_workflow"))
-            except ValueError as exc:
-                failures.append(str(exc))
-            for field in (
-                "daily_dataset_identity_sha256",
-                "daily_snapshot_manifest_sha256",
-                "minute_snapshot_manifest_sha256",
-                "strategy_config_sha256",
-                "execution_manifest_sha256",
-                "pair_engine_sha256",
-                "shortability_evidence_sha256",
-            ):
-                if not _is_sha256(provenance.get(field)):
-                    failures.append(f"provenance {field} must be a SHA-256 digest")
-        if failures:
-            raise ValueError("pair strategy risk gate failed: " + "; ".join(failures))
-        now = _now()
-        with self.engine.begin() as connection:
-            # Pair execution is retained only as an offline/read-only legacy
-            # lane and keeps its original single-approved-version semantics.
-            connection.execute(
-                update(strategy_versions)
-                .where(
-                    strategy_versions.c.strategy_id == version["strategy_id"],
-                    strategy_versions.c.status == "approved",
-                )
-                .values(status="retired")
-            )
-            connection.execute(
-                update(strategy_versions)
-                .where(strategy_versions.c.id == version["id"])
-                .values(
-                    status="approved",
-                    approved_by=actor,
-                    approval_reason=reason,
-                    approved_at=now,
-                )
-            )
-            connection.execute(
-                update(strategies)
-                .where(strategies.c.id == version["strategy_id"])
-                .values(status="approved", updated_at=now)
-            )
-            self._event(
-                connection,
-                strategy_id=version["strategy_id"],
-                version_id=version["id"],
-                event_type="strategy.pair_shadow_approved",
-                actor=actor,
-                payload={
-                    "reason": reason,
-                    "backtest_id": backtest["id"],
-                    "simulation_mode": "shadow_pair",
-                    "financing_enabled": False,
-                    "real_trading_eligible": False,
-                    "gate_evidence": {name: value[0] for name, value in checks.items()},
-                },
-            )
-        return self.get_version(version["id"])
 
     def approve(self, version_id: str, *, actor: str, reason: str) -> dict[str, Any]:
         version = self.get_version(version_id)
@@ -6031,13 +5573,6 @@ class StrategyStore:
                     "governed strategy requires a settled passing capital OOS receipt: "
                     + str(exc)
                 ) from exc
-        if version.get("strategy_type") == "pair":
-            return self._approve_pair(
-                version,
-                backtests[0],
-                actor=actor,
-                reason=reason,
-            )
         drawdown = metrics.get("max_drawdown")
         checks = {
             "tracking_error": (

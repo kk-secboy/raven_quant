@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import asdict
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -40,7 +39,6 @@ from quant_data.execution_contract import (
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.api import create_app
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
-from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.paper_policy_state import seal_paper_policy_state
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.promotion import PromotionStore
@@ -50,7 +48,6 @@ from quant_platform.simulation_store import (
     SimulationStore,
     build_settlement_calendar_evidence,
 )
-from quant_platform.strategy_store import StrategyStore
 
 TRADE_DATE = date(2026, 7, 13)
 SOURCE_LINEAGE = "9" * 64
@@ -1431,56 +1428,7 @@ def test_legacy_or_changed_source_contract_cannot_be_activated(database_url: str
         store.set_status(simulation["id"], "active")
 
 
-def test_pair_simulation_writes_are_retired(database_url: str, tmp_path) -> None:
-    strategies = StrategyStore(database_url)
-    created = strategies.create_pair(
-        name="research only pair simulation",
-        description="pair strategies may keep a persistent shadow-only ledger",
-        leg_y="SH600000",
-        leg_x="SH600001",
-        asset_class="stock",
-        shorting_mode="margin_borrow",
-        config=asdict(PairTradingConfig()),
-        actor="researcher-a",
-    )
-    version = created["versions"][0]
-    backtest = strategies.create_backtest(
-        version_id=version["id"],
-        dataset="snapshot",
-        execution_dataset="execution-snapshot/liquid_stocks_1m+margin_eligibility",
-        periods={"start": "2024-01-01", "end": "2026-07-13"},
-        artifact_path=tmp_path / "data" / "artifacts" / "backtests",
-    )
-    strategies.mark_backtest(backtest["id"], "succeeded", metrics={"provenance": {}})
-    with strategies.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version["id"])
-            .values(status="approved")
-        )
-    store = SimulationStore(database_url)
-    with pytest.raises(ValueError, match="pair simulation writes are retired"):
-        store.create(
-            name="research only pair simulation ledger",
-            source_type="strategy_version",
-            source_id=version["id"],
-            daily_dataset=_daily_dataset(),
-            execution_dataset=_execution_dataset("1min"),
-            initial_cash=PairTradingConfig().initial_capital,
-            execution_policy={
-                "execution_algorithm": "vwap",
-                "slice_minutes": 5,
-                "max_slices": 1,
-                "max_participation": 0.01,
-                "volume_profile": [{"time": "10:00", "weight": 1.0}],
-            },
-            cost_schedule_version=COST_SCHEDULE_VERSION,
-            actor="simulation-operator",
-            execution_adapter="pair",
-        )
-
-
-def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
+def test_simulation_api_exposes_ledger(
     database_url: str, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, simulation, batch = _create_batch(database_url, tmp_path)
@@ -1493,25 +1441,6 @@ def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
             simulation["execution_contract_hash"],
             simulation["execution_policy"]["simulation_semantics_sha256"],
         ),
-    )
-    retired_version_id = create_strategy_version(
-        database_url,
-        tmp_path,
-        recipe_id="short_relative_strength",
-    )
-    with store.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == retired_version_id)
-            .values(status="approved")
-        )
-    enable_recommendation_authority_for_test(database_url, [retired_version_id])
-    retired_portfolio = RecommendationStore(database_url).create(
-        name="retired hypothetical performance fixture",
-        strategy_version_id=retired_version_id,
-        dataset="snapshot",
-        hypothetical_initial_value=1_000_000,
-        actor="test",
     )
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
@@ -1530,10 +1459,6 @@ def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
         )
         paused = client.post(f"/api/simulation-portfolios/{simulation['id']}/pause")
         activated = client.post(f"/api/simulation-portfolios/{simulation['id']}/activate")
-        retired = client.get(
-            "/api/recommendation-portfolios/"
-            f"{retired_portfolio['id']}/hypothetical-performance"
-        )
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == simulation["id"]
     assert detail.status_code == 200
@@ -1543,5 +1468,4 @@ def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
     assert reviewed.json()["review_subject"] == "member_simulation_ledger"
     assert paused.json()["status"] == "paused"
     assert activated.json()["status"] == "active"
-    assert retired.status_code == 410
     assert store.get(simulation["id"])["status"] == "active"

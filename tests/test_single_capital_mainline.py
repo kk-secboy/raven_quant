@@ -15,15 +15,12 @@ def test_old_autopilot_capital_pipeline_is_not_a_runtime_entry() -> None:
     autopilot = _source("src/quant_platform/autopilot.py")
     api = _source("src/quant_platform/api.py")
     scheduler = _source("src/quant_platform/scheduler.py")
-    legacy = _source("src/quant_platform/autopilot_capital_pipeline.py")
 
+    assert not (ROOT / "src/quant_platform/autopilot_capital_pipeline.py").exists()
     for runtime in (autopilot, api, scheduler):
         assert "AutopilotCapitalPipeline(" not in runtime
         assert ".capital_pipeline" not in runtime
         assert "_advance_capital_cycle" not in runtime
-    assert 'CAPITAL_PIPELINE_LIFECYCLE = "legacy_readonly"' in legacy
-    assert "Current" in legacy
-    assert "must not instantiate or call this class" in legacy
 
 
 def test_read_only_champion_selection_feeds_only_fin_strategy() -> None:

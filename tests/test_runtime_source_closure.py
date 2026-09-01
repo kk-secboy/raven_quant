@@ -158,13 +158,11 @@ def test_current_v14_closure_covers_execution_research_and_construction() -> Non
         "src/quant_platform/horizon_review.py",
         "src/quant_platform/strategy_recipes.py",
         "src/quant_platform/strategy_rule_compiler.py",
-        "src/quant_platform/transparent_baseline_bootstrap.py",
         "src/quant_platform/transparent_baseline_lockbox.py",
         "src/quant_platform/transparent_baseline_runner.py",
         "src/quant_data/qlib_builder.py",
         "src/quant_platform/runtime_source_closure.py",
         "src/quant_data/database.py",
-        "src/quant_platform/api.py#StrategyConfigRequest",
     } <= paths
     assert "src/quant_platform/api.py" not in paths
     assert not any(path.startswith(("tests/", "web/")) for path in paths)

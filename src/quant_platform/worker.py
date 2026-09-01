@@ -618,14 +618,10 @@ def _require_supported_simulation_execution(
 
     Historical pair jobs remain queryable and generic job retry is intentionally
     broad.  The worker is therefore the final authority boundary: neither an
-    old queued job nor a retried cancelled job may start pair backtest/replay
-    code after the long-only Autopilot release.
+    old queued job nor a retried cancelled job may start pair replay code after
+    the long-only Autopilot release.
     """
 
-    if str(job_kind) == "pair_backtest":
-        raise ValueError(
-            "pair backtest execution is retired; historical artifacts are read-only"
-        )
     if (
         str(job_kind) == "simulation_replay"
         and str(execution_adapter or "") != "long_only"
@@ -2729,8 +2725,6 @@ class LocalJobWorker:
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
-        if job["kind"] == "pair_backtest":
-            _require_supported_simulation_execution("pair_backtest")
         if job["kind"] == "research_asset_acquire":
             output = (
                 self.settings.data_root

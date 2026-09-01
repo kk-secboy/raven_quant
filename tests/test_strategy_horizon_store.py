@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -15,8 +16,11 @@ from quant_data.database import (
     strategy_health_snapshots,
     strategy_versions,
 )
-from quant_platform.autopilot_capital_pipeline import AutopilotCapitalPipeline
-from quant_platform.promotion import ForwardGateThresholds, PromotionStore
+from quant_platform.promotion import (
+    ForwardGateThresholds,
+    PromotionStore,
+    forward_gate_thresholds_for_horizon,
+)
 from quant_platform.research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
@@ -183,9 +187,11 @@ def test_autopilot_horizon_gate_registers_complete_paper_validation_contract(
     version = StrategyStore(database_url).get_version(version_id)
     assert version["horizon_profile"] == horizon_profile
 
-    pipeline = object.__new__(AutopilotCapitalPipeline)
-    thresholds = pipeline._forward_thresholds_for_cycle(
-        {"config_revision": 0, "horizon_profile": horizon_profile}
+    minimum = forward_gate_thresholds_for_horizon(horizon_profile)
+    thresholds = replace(
+        minimum,
+        min_forward_calendar_days=max(minimum.min_forward_calendar_days, 183),
+        min_forward_trading_days=max(minimum.min_forward_trading_days, 126),
     )
     gate = PromotionStore(database_url).register_forward_gate(
         version_id,

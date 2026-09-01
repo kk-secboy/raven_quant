@@ -22,7 +22,6 @@ POSITION_RISK_SOURCE_ENTRY_PATHS = (
     "scripts/evaluate_quant_bundle.py",
     "scripts/run_multifactor_backtest.py",
     "scripts/run_recommendation_refresh.py",
-    "src/quant_platform/transparent_baseline_bootstrap.py",
 )
 # ``StrategyConfigRequest`` is deliberately still owned by api.py.  Sealing
 # the whole API would pull authentication, web projections and unrelated

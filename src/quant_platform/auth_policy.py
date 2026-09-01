@@ -8,7 +8,6 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "data:write",
         "portfolio:write",
         "automation:manage",
-        "alerts:manage",
     },
     "viewer": {"read"},
 }
@@ -43,8 +42,6 @@ def permission_for(method: str, path: str) -> str:
         "/api/rdagent/"
     ):
         return "research:write"
-    if path.startswith("/api/research-campaigns") or path.startswith("/api/research-programs"):
-        return "research:write"
     if path.startswith("/api/factor-library") or path.startswith("/api/research-sota"):
         return "research:write"
     if path.startswith("/api/factors/") and path.endswith("/promote"):
@@ -53,11 +50,8 @@ def permission_for(method: str, path: str) -> str:
         return "research:write"
     if (
         path == "/api/strategies"
-        or path == "/api/pair-strategies"
-        or path.startswith("/api/pair-strategies/")
         or (path.startswith("/api/strategies/") and path.endswith("/versions"))
         or path.endswith("/backtests")
-        or path.endswith("/pair-backtests")
         or path.endswith("/parameter-experiments")
     ):
         return "strategy:write"
@@ -93,8 +87,6 @@ def permission_for(method: str, path: str) -> str:
         return "automation:manage"
     if path.startswith("/api/data-automation"):
         return "automation:manage"
-    if path.startswith("/api/alerts"):
-        return "alerts:manage"
     return "admin:write"
 
 

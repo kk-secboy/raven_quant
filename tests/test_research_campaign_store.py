@@ -20,8 +20,6 @@ from quant_data.database import (
 )
 from quant_platform.job_store import JobStore
 from quant_platform.legacy_research_retirement import LegacyResearchRetirement
-from quant_platform.research_campaign_store import ResearchCampaignStore
-from quant_platform.research_program_store import ResearchProgramStore
 from quant_platform.schedule_store import (
     LEGACY_RESEARCH_SCHEDULE_ERROR,
     ScheduleStore,
@@ -75,41 +73,6 @@ def _seed_legacy_campaign(database_url: str) -> str:
             )
         )
     return campaign_id
-
-
-def test_campaign_history_remains_queryable(database_url: str) -> None:
-    campaign_id = _seed_legacy_campaign(database_url)
-    store = ResearchCampaignStore(database_url)
-
-    campaign = store.get(campaign_id)
-
-    assert campaign["status"] == "cancelled"
-    assert campaign["state"] == {"retired": True}
-    assert campaign["events"][0]["event_type"] == "campaign.cancelled"
-    assert [item["id"] for item in store.list()] == [campaign_id]
-
-
-def test_campaign_write_and_scheduler_paths_are_retired(database_url: str) -> None:
-    store = ResearchCampaignStore(database_url)
-    message = "legacy research campaigns are read-only"
-
-    with pytest.raises(RuntimeError, match=message):
-        store.create(
-            name="forbidden",
-            objective="must not run",
-            dataset="cn-research",
-            benchmark="SH000300",
-            universe="cn_all",
-            recipe_id="legacy_recipe",
-            config={},
-            actor="test",
-        )
-    with pytest.raises(RuntimeError, match=message):
-        store.claim_due()
-    with pytest.raises(RuntimeError, match=message):
-        store.transition("missing", event_type="forbidden")
-    with pytest.raises(RuntimeError, match=message):
-        store.set_status("missing", "cancelled", actor="test")
 
 
 def test_one_time_retirement_uses_the_only_privileged_legacy_write_path(
@@ -169,12 +132,19 @@ def test_one_time_retirement_uses_the_only_privileged_legacy_write_path(
     assert result["retired_program_ids"] == [program_id]
     assert repeated["retired_campaign_ids"] == []
     assert repeated["retired_program_ids"] == []
-    campaign = ResearchCampaignStore(database_url).get(campaign_id)
-    program = ResearchProgramStore(database_url).get(program_id)
-    assert campaign["status"] == "cancelled"
-    assert campaign["events"][0]["event_type"] == "campaign.cancelled"
-    assert program["status"] == "cancelled"
-    assert program["events"][0]["event_type"] == "program.cancelled"
+    with open_database(database_url).connect() as connection:
+        campaign_status = connection.scalar(
+            select(research_campaigns.c.status).where(
+                research_campaigns.c.id == campaign_id
+            )
+        )
+        program_status = connection.scalar(
+            select(research_programs.c.status).where(
+                research_programs.c.id == program_id
+            )
+        )
+    assert campaign_status == "cancelled"
+    assert program_status == "cancelled"
     with open_database(database_url).connect() as connection:
         campaign_events = connection.execute(
             select(research_campaign_events.c.id).where(
@@ -349,18 +319,6 @@ def test_succeeded_campaign_schedule_is_disabled_but_history_and_oos_remain(
         actor_schedule_id,
     }
 
-    windows = ResearchProgramStore(database_url).irreversible_final_oos_windows(
-        program_id
-    )
-    assert windows == [
-        {
-            "test_start": "2019-01-02",
-            "test_end": "2019-12-31",
-            "sources": ["campaign_succeeded"],
-            "campaign_ids": [campaign_id],
-        }
-    ]
-
 
 def test_schedule_run_owned_orphan_running_job_is_cancelled_idempotently(
     database_url: str,
@@ -473,7 +431,12 @@ def test_schedule_run_owned_orphan_running_job_is_cancelled_idempotently(
     assert after_first.status == "running"
     assert after_first.cancel_requested_at is not None
     assert after_second.cancel_requested_at == after_first.cancel_requested_at
-    assert ResearchCampaignStore(database_url).get(campaign_id)["status"] == "succeeded"
+    with open_database(database_url).connect() as connection:
+        assert connection.scalar(
+            select(research_campaigns.c.status).where(
+                research_campaigns.c.id == campaign_id
+            )
+        ) == "succeeded"
 
 
 def _seed_claimed_schedule(

@@ -461,12 +461,6 @@ class SchedulerEngine:
         # response compatibility, but never advance that historical workflow.
         transparent_baseline_reconciles = 0
         transparent_baseline_reconcile_failures = 0
-        # Pair trading requires short sales and borrow-cost assumptions.  The
-        # single Autopilot capital line is deliberately long-only, so legacy
-        # pair records remain readable but are never scheduled or traded.
-        pair_shadow_accounts_created = 0
-        pair_shadow_backtests_enqueued = 0
-        pair_shadow_batches_materialized = 0
         simulation_replays_enqueued = self._enqueue_due_simulation_replays(current)
         projected = self.project_alerts()
         health_recorded = 0
@@ -497,9 +491,6 @@ class SchedulerEngine:
             "three_horizon_account_advanced": int(
                 bool(three_horizon_result.get("advanced"))
             ),
-            "pair_shadow_batches_materialized": pair_shadow_batches_materialized,
-            "pair_shadow_backtests_enqueued": pair_shadow_backtests_enqueued,
-            "pair_shadow_accounts_created": pair_shadow_accounts_created,
             "model_refits_enqueued": model_refits_enqueued,
             "factor_library_materializations_enqueued": (
                 factor_library_materializations_enqueued

@@ -74,43 +74,16 @@ def test_autopilot_trial_history_is_unified_and_does_not_require_a_tournament() 
 
 
 def test_legacy_http_execution_surfaces_stay_retired() -> None:
-    retired_route = '@app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)'
-    assert retired_route in API_SOURCE
-    assert '"replacement": "/api/recommendation-portfolios"' in API_SOURCE
+    assert '"/api/portfolios' not in API_SOURCE
     assert '"/api/broker' not in API_SOURCE
     assert '"/api/pair-portfolios' not in API_SOURCE
 
 
-def test_legacy_research_programs_and_campaigns_are_read_only() -> None:
-    for retired_schema in (
-        "ResearchProgramCreateRequest",
-        "ResearchProgramStatusRequest",
-        "ResearchCampaignCreateRequest",
-        "ResearchCampaignStatusRequest",
-    ):
-        assert retired_schema not in API_SOURCE
-    for route, replacement in (
-        ("/api/research-programs", "/api/autopilot"),
-        ("/api/research-campaigns", "/api/autopilot"),
-    ):
-        assert f'@app.get("{route}")' in API_SOURCE
-        write_block = API_SOURCE.split(f'@app.post("{route}"', 1)[1].split(
-            "@app.", 1
-        )[0]
-        assert "HTTPException(" in write_block
-        assert "410" in write_block
-        assert replacement in write_block
-
-    for function_name in (
-        "set_research_program_status",
-        "check_research_program_now",
-        "set_research_campaign_status",
-        "retry_research_campaign",
-    ):
-        block = API_SOURCE.split(f"def {function_name}", 1)[1].split("@app.", 1)[0]
-        assert "HTTPException(410" in block
-        assert "legacy_research_programs." not in block
-        assert "legacy_research_campaigns." not in block
+def test_legacy_research_programs_and_campaigns_are_removed() -> None:
+    for route in ("/api/research-programs", "/api/research-campaigns"):
+        assert route not in API_SOURCE
+    for store_module in ("research_program_store", "research_campaign_store"):
+        assert not (ROOT / "src" / "quant_platform" / f"{store_module}.py").exists()
 
 
 def test_real_broker_gateway_is_not_a_production_build_capability() -> None:
@@ -203,12 +176,6 @@ def test_pair_shadow_is_not_part_of_the_automatic_capital_line() -> None:
         "self._materialize_due_pair_shadow_batches(",
     ):
         assert forbidden not in tick
-    for marker in (
-        "pair_shadow_accounts_created = 0",
-        "pair_shadow_backtests_enqueued = 0",
-        "pair_shadow_batches_materialized = 0",
-    ):
-        assert marker in tick
     for retired_implementation in (
         "def _ensure_approved_pair_shadow_accounts",
         "def _enqueue_due_pair_shadow_backtests",

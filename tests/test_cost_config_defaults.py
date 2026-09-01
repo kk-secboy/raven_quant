@@ -49,16 +49,11 @@ def test_dated_versions_resolve_real_rates() -> None:
 
 
 def test_strategy_request_defaults_use_current_law_rates() -> None:
-    from quant_platform.api import PairStrategyConfigRequest, StrategyConfigRequest
+    from quant_platform.api import StrategyConfigRequest
 
     strategy = StrategyConfigRequest(recipe_id="custom", recipe_version="custom")
     assert strategy.stock_sell_stamp_duty_rate == CURRENT_STOCK_SELL_STAMP_DUTY_RATE
     assert strategy.transfer_fee_rate == CURRENT_TRANSFER_FEE_RATE
-
-    pair = PairStrategyConfigRequest()
-    assert pair.stock_sell_stamp_duty_rate == CURRENT_STOCK_SELL_STAMP_DUTY_RATE
-    assert pair.transfer_fee_rate == CURRENT_TRANSFER_FEE_RATE
-    assert pair.lot_size is None
 
 
 def test_strategy_request_accepts_dated_version_labels() -> None:

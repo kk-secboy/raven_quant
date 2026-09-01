@@ -16,7 +16,6 @@ from quant_data.database import (
     alerts,
     allocation_schedule_groups,
     audit_events,
-    backtest_runs,
     open_database,
     recommendation_portfolios,
     recommendation_snapshots,
@@ -1201,7 +1200,7 @@ class DeploymentReadinessStore:
         current = now or _now()
         # DataTaskStore.list() reconciles the operational projection and groups
         # the durable work-unit ledger.  Build it once per assessment so the
-        # research and pair profiles cannot repeat that expensive work.
+        # remaining profiles cannot repeat that expensive work.
         tasks = {
             str(item["task_key"]): item
             for item in self.data_tasks.list()
@@ -1209,12 +1208,10 @@ class DeploymentReadinessStore:
         research_checks = self._research_checks(tasks)
         recommendation_checks = [*research_checks, *self._recommendation_checks()]
         allocation_checks = [*recommendation_checks, *self._allocation_checks(current)]
-        pair_checks = [*research_checks, *self._pair_research_checks(tasks)]
         profiles = [
             _profile("research", "研究与回测", research_checks),
             _profile("recommendation_tracking", "推荐组合与假设跟踪", recommendation_checks),
             _profile("strategy_allocation", "多策略推荐组合", allocation_checks),
-            _profile("pair_research", "配对交易研究", pair_checks),
         ]
         highest_ready = next(
             (item["id"] for item in reversed(profiles) if item["status"] == "ready"),
@@ -1658,65 +1655,6 @@ class DeploymentReadinessStore:
                 unsupported_active == 0,
                 f"仍活动的非生产调度 {unsupported_active} 个",
                 "将不属于当前研究与推荐管线的调度设为 retired",
-            ),
-        ]
-
-    def _pair_research_checks(
-        self,
-        tasks: dict[str, dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        minute_status = str(tasks.get("pair_execution_1m", {}).get("status", "missing"))
-        shortability_status = str(tasks.get("margin_eligibility", {}).get("status", "missing"))
-        with self.engine.connect() as connection:
-            approved_pairs = int(
-                connection.scalar(
-                    select(func.count())
-                    .select_from(strategy_versions)
-                    .where(
-                        strategy_versions.c.strategy_type == "pair",
-                        strategy_versions.c.status == "approved",
-                        strategy_versions.c.is_legacy.is_(False),
-                    )
-                )
-                or 0
-            )
-            validated_backtests = int(
-                connection.scalar(
-                    select(func.count())
-                    .select_from(backtest_runs)
-                    .join(
-                        strategy_versions,
-                        strategy_versions.c.id == backtest_runs.c.strategy_version_id,
-                    )
-                    .where(
-                        strategy_versions.c.strategy_type == "pair",
-                        backtest_runs.c.status == "succeeded",
-                        backtest_runs.c.is_legacy.is_(False),
-                    )
-                )
-                or 0
-            )
-        return [
-            _check(
-                "pair_minute_data",
-                "配对研究分钟数据",
-                minute_status == "succeeded",
-                f"分钟数据任务状态 {minute_status}",
-                "完成配对研究所需的分钟数据快照",
-            ),
-            _check(
-                "pair_shortability_data",
-                "逐日可融券证据",
-                shortability_status == "succeeded",
-                f"可融券资格任务状态 {shortability_status}",
-                "下载并校验逐日可融券资格",
-            ),
-            _check(
-                "approved_pair_strategy",
-                "已审批配对研究策略",
-                approved_pairs > 0 and validated_backtests > 0,
-                f"已审批版本 {approved_pairs} 个，成功研究回测 {validated_backtests} 个",
-                "完成配对研究回测和独立审批；配对执行不属于本系统",
             ),
         ]
 

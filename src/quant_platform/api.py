@@ -154,7 +154,6 @@ from .research_automation import (
     resolve_research_periods,
     resolve_research_window_contract,
 )
-from .research_campaign_store import ResearchCampaignStore
 from .research_horizon import (
     LEGACY_AMBIGUOUS,
     LONG_1_3Y,
@@ -164,7 +163,6 @@ from .research_horizon import (
     primary_label_policy_contract,
     research_horizon_contract,
 )
-from .research_program_store import ResearchProgramStore
 from .research_report_backfill import ResearchReportBackfillStore
 from .research_store import ResearchStore
 from .research_tournament import ResearchTournamentStore
@@ -1537,93 +1535,6 @@ class StrategyDefaultsUpdateRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=2000)
 
 
-class PairStrategyConfigRequest(BaseModel):
-    formation_window: int = Field(default=60, ge=20, le=252)
-    min_correlation: float = Field(default=0.80, ge=0, le=1)
-    max_cointegration_pvalue: float = Field(default=0.05, gt=0, le=1)
-    cointegration_recheck_days: int = Field(default=5, ge=1, le=63)
-    entry_zscore: float = Field(default=1.50, gt=0, le=10)
-    exit_zscore: float = Field(default=0.50, ge=0, le=10)
-    stop_zscore: float = Field(default=3.00, gt=0, le=20)
-    max_holding_days: int = Field(default=5, ge=1, le=20)
-    initial_capital: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
-    pair_gross_fraction: float = Field(default=0.20, gt=0, le=1)
-    max_volume_participation: float = Field(default=0.01, gt=0, le=0.20)
-    min_capacity_fill_ratio: float = Field(default=0.95, gt=0, le=1)
-    cost_schedule_version: str = COST_SCHEDULE_VERSION
-    effective_from: str = "2000-01-01"
-    effective_to: str | None = None
-    buy_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
-    sell_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
-    stock_sell_stamp_duty_rate: float = Field(
-        default=CURRENT_STOCK_SELL_STAMP_DUTY_RATE, ge=0, le=0.02
-    )
-    etf_sell_stamp_duty_rate: float = Field(default=0.0, ge=0, le=0.02)
-    transfer_fee_rate: float = Field(default=CURRENT_TRANSFER_FEE_RATE, ge=0, le=0.02)
-    min_commission: float = Field(default=5.0, ge=0, le=1000)
-    fixed_slippage_rate: float = Field(default=0.0005, ge=0, le=0.02)
-    impact_at_max_participation: float = Field(default=0.0010, ge=0, le=0.10)
-    annual_borrow_rate: float = Field(default=0.08, gt=0, le=1)
-    # None resolves per-leg board order-unit rules via market_rules.
-    lot_size: int | None = Field(default=None, ge=1, le=10000)
-    kalman_process_variance: float = Field(default=1e-5, gt=0, le=1)
-    kalman_observation_variance: float = Field(default=1e-3, gt=0, le=1)
-    min_hedge_ratio: float = Field(default=0.10, gt=0, le=100)
-    max_hedge_ratio: float = Field(default=10.0, gt=0, le=100)
-    max_drawdown: float = Field(default=0.10, gt=0, le=0.50)
-    min_sharpe_ratio: float = Field(default=0.0, ge=-5, le=10)
-    min_closed_trades: int = Field(default=5, ge=1, le=10000)
-    min_backtest_days: int = Field(default=252, ge=60, le=2520)
-    min_rolling_cointegration_pass_rate: float = Field(default=0.80, ge=0, le=1)
-    min_robustness_pass_rate: float = Field(default=0.75, ge=0, le=1)
-
-    @model_validator(mode="after")
-    def valid_pair_thresholds(self) -> PairStrategyConfigRequest:
-        if not self.exit_zscore < self.entry_zscore < self.stop_zscore:
-            raise ValueError("z-score thresholds must satisfy exit < entry < stop")
-        if self.min_hedge_ratio >= self.max_hedge_ratio:
-            raise ValueError("min_hedge_ratio must be below max_hedge_ratio")
-        CostModelConfig.from_mapping(self.model_dump())
-        return self
-
-
-class PairStrategyCreateRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=150)
-    description: str = Field(min_length=10, max_length=2000)
-    leg_y: str = Field(min_length=4, max_length=32)
-    leg_x: str = Field(min_length=4, max_length=32)
-    asset_class: Literal["etf", "stock", "mixed"] = "etf"
-    shorting_mode: Literal["shadow_borrow", "margin_borrow"] = "shadow_borrow"
-    config: PairStrategyConfigRequest = Field(default_factory=PairStrategyConfigRequest)
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
-class PairStrategyVersionCreateRequest(BaseModel):
-    leg_y: str = Field(min_length=4, max_length=32)
-    leg_x: str = Field(min_length=4, max_length=32)
-    asset_class: Literal["etf", "stock", "mixed"] = "etf"
-    shorting_mode: Literal["shadow_borrow", "margin_borrow"] = "shadow_borrow"
-    config: PairStrategyConfigRequest = Field(default_factory=PairStrategyConfigRequest)
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
-class PairStrategyBacktestRequest(BaseModel):
-    dataset: str
-    execution_snapshot: str
-    minute_dataset: str
-    shortability_dataset: str
-    start: date
-    end: date
-
-    @model_validator(mode="after")
-    def valid_period(self) -> PairStrategyBacktestRequest:
-        if self.end <= self.start:
-            raise ValueError("backtest end must be after start")
-        if self.minute_dataset == self.shortability_dataset:
-            raise ValueError("minute and shortability evidence must be separate datasets")
-        return self
-
-
 class StrategyBacktestRequest(BaseModel):
     dataset: str
     execution_dataset: str | None = None
@@ -2110,10 +2021,6 @@ class AllocationScheduleRetireRequest(BaseModel):
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
 
-class AlertActionRequest(BaseModel):
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
 class AuthBootstrapRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     display_name: str = Field(min_length=1, max_length=100)
@@ -2218,8 +2125,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         settings.data_root,
     )
     parameter_experiments = ParameterExperimentStore(settings.database_url)
-    legacy_research_campaigns = ResearchCampaignStore(settings.database_url)
-    legacy_research_programs = ResearchProgramStore(settings.database_url)
     research_tournaments = ResearchTournamentStore(settings.database_url)
     autopilot_trial_audit = AutopilotTrialAuditService(
         research=research,
@@ -4676,74 +4581,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         worker.notify()
         return _public_rdagent_run(research.get_run(run["id"]))
 
-    @app.get("/api/research-programs")
-    def list_research_programs(
-        limit: int = Query(100, ge=1, le=500),
-    ) -> list[dict[str, Any]]:
-        return _sanitize_public_value(legacy_research_programs.list(limit=limit))
-
-    @app.get("/api/research-programs/{program_id}")
-    def get_research_program(program_id: str) -> dict[str, Any]:
-        try:
-            return _sanitize_public_value(legacy_research_programs.get(program_id))
-        except KeyError as exc:
-            raise HTTPException(404, "research program not found") from exc
-
-    @app.post("/api/research-programs")
-    def create_research_program(request: Request) -> dict[str, Any]:
-        del request
-        raise HTTPException(
-            410,
-            "legacy research programs are retired; use /api/autopilot",
-        )
-
-    @app.post("/api/research-programs/{program_id}/status")
-    def set_research_program_status(
-        program_id: str,
-        request: Request,
-    ) -> dict[str, Any]:
-        del program_id, request
-        raise HTTPException(410, "legacy research programs are read-only")
-
-    @app.post("/api/research-programs/{program_id}/check-now")
-    def check_research_program_now(program_id: str, request: Request) -> dict[str, Any]:
-        del program_id, request
-        raise HTTPException(410, "legacy research programs are read-only")
-
-    @app.get("/api/research-campaigns")
-    def list_research_campaigns(
-        limit: int = Query(100, ge=1, le=500),
-    ) -> list[dict[str, Any]]:
-        return _sanitize_public_value(legacy_research_campaigns.list(limit=limit))
-
-    @app.get("/api/research-campaigns/{campaign_id}")
-    def get_research_campaign(campaign_id: str) -> dict[str, Any]:
-        try:
-            return _sanitize_public_value(legacy_research_campaigns.get(campaign_id))
-        except KeyError as exc:
-            raise HTTPException(404, "research campaign not found") from exc
-
-    @app.post("/api/research-campaigns")
-    def create_research_campaign(request: Request) -> dict[str, Any]:
-        del request
-        raise HTTPException(
-            410,
-            "legacy research campaigns are retired; use /api/autopilot",
-        )
-
-    @app.post("/api/research-campaigns/{campaign_id}/status")
-    def set_research_campaign_status(
-        campaign_id: str,
-        request: Request,
-    ) -> dict[str, Any]:
-        del campaign_id, request
-        raise HTTPException(410, "legacy research campaigns are read-only")
-
-    @app.post("/api/research-campaigns/{campaign_id}/retry")
-    def retry_research_campaign(campaign_id: str, request: Request) -> dict[str, Any]:
-        del campaign_id, request
-        raise HTTPException(410, "legacy research campaigns are read-only")
-
     @app.get("/api/factors")
     def list_factors(
         status: str | None = None,
@@ -4957,30 +4794,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.post("/api/pair-strategies", status_code=201)
-    def create_pair_strategy(payload: PairStrategyCreateRequest, request: Request) -> dict:
-        del payload, request
-        raise HTTPException(
-            410,
-            "pair strategy writes are retired; Autopilot is long-only",
-        )
-
-    @app.get("/api/pair-strategies")
-    def list_pair_strategies(
-        limit: int = Query(100, ge=1, le=500),
-    ) -> list[dict]:
-        return strategies.list_pairs(limit)
-
-    @app.post("/api/pair-strategies/{strategy_id}/versions", status_code=201)
-    def create_pair_strategy_version(
-        strategy_id: str, payload: PairStrategyVersionCreateRequest, request: Request
-    ) -> dict:
-        del strategy_id, payload, request
-        raise HTTPException(
-            410,
-            "pair strategy writes are retired; Autopilot is long-only",
-        )
-
     @app.get("/api/backtests")
     def list_backtests(
         version_id: str | None = None,
@@ -5107,7 +4920,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         try:
             version = strategies.get_version(version_id)
             if version.get("strategy_type") != "multifactor":
-                raise ValueError("pair strategy versions require the pair-backtests endpoint")
+                raise ValueError("only multifactor strategy versions can be backtested")
             execution_method = str(version.get("config", {}).get("execution_method", "open"))
             if execution_method in {"twap", "vwap", "next_bar"}:
                 if not payload.execution_dataset:
@@ -5305,16 +5118,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         )
         worker.notify()
         return job
-
-    @app.post("/api/strategy-versions/{version_id}/pair-backtests", status_code=202)
-    def create_pair_strategy_backtest(
-        version_id: str, payload: PairStrategyBacktestRequest
-    ) -> dict:
-        del version_id, payload
-        raise HTTPException(
-            410,
-            "pair backtests are retired; Autopilot is long-only",
-        )
 
     @app.post("/api/strategy-versions/{version_id}/approve")
     def approve_strategy(
@@ -5609,11 +5412,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             platform_safe_mode=safe_mode.status(),
         )
 
-    @app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)
-    @app.api_route("/api/portfolios/{legacy_path:path}", methods=["GET", "POST"], status_code=410)
-    def legacy_portfolios_retired(legacy_path: str = "") -> dict[str, str]:
-        return {"status": "retired", "replacement": "/api/recommendation-portfolios"}
-
     @app.get("/api/recommendation-portfolios")
     def list_recommendation_portfolios(
         limit: int = Query(100, ge=1, le=500),
@@ -5702,17 +5500,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(404, "recommendation portfolio not found") from exc
         latest = portfolio.get("latest_snapshot") or {}
         return list(latest.get("holdings") or [])
-
-    @app.get("/api/recommendation-portfolios/{portfolio_id}/hypothetical-performance")
-    def get_recommendation_hypothetical_performance(portfolio_id: str) -> list[dict]:
-        try:
-            recommendations.get(portfolio_id)
-        except KeyError as exc:
-            raise HTTPException(404, "recommendation portfolio not found") from exc
-        raise HTTPException(
-            410,
-            "hypothetical recommendation performance is retired; use simulation NAV",
-        )
 
     @app.post("/api/recommendation-portfolios/{portfolio_id}/refresh", status_code=202)
     def refresh_recommendation_portfolio(
@@ -6231,27 +6018,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/schedule-runs")
     def list_schedule_runs(limit: int = Query(200, ge=1, le=500)) -> list[dict]:
         return schedules.list_runs(limit)
-
-    @app.get("/api/alerts")
-    def list_alerts(
-        status: Literal["open", "acknowledged", "resolved"] | None = None,
-        limit: int = Query(200, ge=1, le=500),
-    ) -> list[dict]:
-        return alerts.list(status=status, limit=limit)
-
-    @app.post("/api/alerts/{alert_id}/acknowledge")
-    def acknowledge_alert(alert_id: str, payload: AlertActionRequest, request: Request) -> dict:
-        try:
-            return alerts.acknowledge(alert_id, actor=authenticated_actor(request, payload.actor))
-        except KeyError as exc:
-            raise HTTPException(404, "alert not found") from exc
-
-    @app.post("/api/alerts/{alert_id}/resolve")
-    def resolve_alert(alert_id: str, payload: AlertActionRequest, request: Request) -> dict:
-        try:
-            return alerts.resolve(alert_id, actor=authenticated_actor(request, payload.actor))
-        except KeyError as exc:
-            raise HTTPException(404, "alert not found") from exc
 
     @app.get("/api/scheduler/status")
     def scheduler_status() -> dict:

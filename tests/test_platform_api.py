@@ -14,7 +14,6 @@ from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.models import FetchSpec
 from quant_data.qlib_builder import build_qlib_output_manifest
-from quant_platform.alert_store import AlertStore
 from quant_platform.api import create_app
 from quant_platform.factor_library import compile_qlib_expression
 from quant_platform.feature_set_registry import get_feature_set
@@ -76,7 +75,6 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
         readiness = client.get("/api/operations/readiness")
         datasets = client.get("/api/datasets")
         market = client.get("/api/market/overview")
-        pair_strategies = client.get("/api/pair-strategies")
         bootstrap = client.post(
             "/api/jobs/bootstrap",
             json={"profile": "core", "start": "2016-01-01", "end": "latest"},
@@ -102,8 +100,6 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
     assert market.status_code == 200
     assert market.json()["status"] == "not_ready"
     assert market.json()["source"]["is_realtime"] is False
-    assert pair_strategies.status_code == 200
-    assert pair_strategies.json() == []
     assert bootstrap.status_code == 409
     assert bootstrap.json()["detail"] == (
         "missing deployment secret: TUSHARE_API_URL, TUSHARE_TOKEN"
@@ -598,18 +594,6 @@ def test_api_creates_bounded_rdagent_research_run(
             },
         )
         runs = client.get("/api/rdagent/runs").json()
-        program = client.post(
-            "/api/research-programs",
-            json={
-                "name": "monthly index research",
-                "dataset": "research-snapshot",
-                "recipe_id": "index_enhancement",
-                "loop_n": 1,
-                "duration": "30m",
-            },
-        )
-        programs = client.get("/api/research-programs").json()
-        retired_campaign_without_payload = client.post("/api/research-campaigns")
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert response.json()["budget"] == {"loop_n": 1, "duration": "30m"}
@@ -623,30 +607,14 @@ def test_api_creates_bounded_rdagent_research_run(
     assert "frozen" in frozen_model_run.json()["detail"]
     assert frozen_schedule.status_code == 410
     assert "frozen" in frozen_schedule.json()["detail"]
-    assert program.status_code == 410
-    assert "legacy research programs are retired" in program.json()["detail"]
-    assert programs == []
-    assert retired_campaign_without_payload.status_code == 410
-    assert "legacy research campaigns are retired" in (
-        retired_campaign_without_payload.json()["detail"]
-    )
 
 
-def test_api_manages_schedules_and_alert_acknowledgement(
+def test_api_manages_schedules(
     tmp_path: Path, monkeypatch, database_url: str
 ) -> None:
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
-    alert = AlertStore(database_url).create(
-        source_type="job",
-        source_id="failed-job",
-        severity="critical",
-        category="job_failure",
-        title="Scheduled job failed",
-        message="fixture failure",
-        dedupe_key="api-alert-fixture",
-    )
     app = create_app(tmp_path)
     with TestClient(app) as client:
         created = client.post(
@@ -688,15 +656,9 @@ def test_api_manages_schedules_and_alert_acknowledgement(
             },
         )
         schedules = client.get("/api/schedules").json()
-        acknowledged = client.post(
-            f"/api/alerts/{alert['id']}/acknowledge",
-            json={"actor": "risk-owner"},
-        )
     assert created.status_code == 201
     assert complete.status_code == 201
     assert {"incremental_sync", "data_pipeline"} <= {
         item["kind"] for item in schedules
     }
     assert rejected.status_code == 422
-    assert acknowledged.status_code == 200
-    assert acknowledged.json()["status"] == "acknowledged"
