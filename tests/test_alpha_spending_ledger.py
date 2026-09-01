@@ -20,6 +20,7 @@ from quant_platform.alpha_spending_ledger import (
     CAPITAL_OOS_POLICY_SHA256,
     CAPITAL_OOS_TOTAL_ALPHA,
     _bootstrap_gate,
+    _oos_decay_check,
     batch_alpha,
     capital_oos_policy_manifest,
     capital_oos_vintage_link_payload,
@@ -194,3 +195,54 @@ def test_stable_family_validator_rejects_candidate_or_date_smuggling() -> None:
             validate_capital_oos_family_manifest(contaminated)
     with pytest.raises(ValueError, match="invalid field types"):
         validate_capital_oos_family_manifest({**manifest, "label_horizon_days": True})
+
+
+def test_policy_marks_statistics_report_only_with_decay_pass_rule() -> None:
+    policy = capital_oos_policy_manifest()
+    # 宽进严出:HAC/bootstrap 统计证据只入档,正式 OOS 改走衰减检查。
+    assert policy["bootstrap_remains_an_independent_hard_gate"] is False
+    assert policy["statistical_evidence_role"] == "report_only"
+    assert "0.5" in policy["final_oos_pass_rule"]
+
+
+def test_oos_decay_check_passes_at_half_the_sealed_research_edge() -> None:
+    index = pd.bdate_range("2024-01-02", periods=300)
+    difference = pd.Series(0.0006, index=index)
+    decay = _oos_decay_check(
+        difference, {"research_mean_daily_after_cost_excess": 0.0012}
+    )
+    assert decay["contract_version"] == "oos-research-decay-v1"
+    assert decay["oos_mean_daily_after_cost_excess"] == pytest.approx(0.0006)
+    assert decay["decay_ratio"] == pytest.approx(0.5)
+    assert decay["decay_passed"] is True
+    assert decay["oos_annualized_after_cost_excess"] == pytest.approx(
+        0.0006 * 252.0
+    )
+    assert decay["research_annualized_after_cost_excess"] == pytest.approx(
+        0.0012 * 252.0
+    )
+
+
+def test_oos_decay_check_vetoes_collapsed_or_edgeless_candidates() -> None:
+    index = pd.bdate_range("2024-01-02", periods=300)
+    collapsed = _oos_decay_check(
+        pd.Series(0.0002, index=index),
+        {"research_mean_daily_after_cost_excess": 0.0012},
+    )
+    assert collapsed["decay_ratio"] < 0.5
+    assert collapsed["decay_passed"] is False
+    # 研究期没有正边缘时,OOS 没有可衰减的基准,直接不通过。
+    edgeless = _oos_decay_check(
+        pd.Series(0.0002, index=index),
+        {"research_mean_daily_after_cost_excess": -0.0005},
+    )
+    assert edgeless["decay_ratio"] is None
+    assert edgeless["decay_passed"] is False
+
+
+def test_oos_decay_check_is_not_evaluable_without_a_sealed_reference() -> None:
+    index = pd.bdate_range("2024-01-02", periods=300)
+    decay = _oos_decay_check(pd.Series(0.0002, index=index), None)
+    assert decay["research_mean_daily_after_cost_excess"] is None
+    assert decay["decay_ratio"] is None
+    assert decay["decay_passed"] is None

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
@@ -638,12 +637,10 @@ def build_strategy_research_competition_plan(
 
 
 def _metric_passes(metrics: Mapping[str, Any]) -> bool:
-    dsr = metrics.get("deflated_sharpe_probability")
+    # The deflated Sharpe probability is computed and archived as report-only
+    # evidence; per the wide-entry gate policy it never vetoes a research gate.
     return (
-        isinstance(dsr, (int, float))
-        and math.isfinite(float(dsr))
-        and float(dsr) >= 0.95
-        and metrics.get("robustness_passed") is True
+        metrics.get("robustness_passed") is True
         and metrics.get("component_cost_stress_passed") is True
         and metrics.get("rolling_passed") is True
         and metrics.get("event_stress_passed") is True
@@ -741,16 +738,13 @@ def build_strategy_stage_evidence(
     challenger_metrics = dict(
         (observed[challenger_role].get("metrics") or {}).get("out_of_sample") or {}
     )
-    gate_passed = (
-        float(bootstrap["observed_mean_difference"]) > 0.0
-        and float(bootstrap["confidence_interval_95"][0]) > 0.0
-        and adjusted_p_value <= float(plan["family_alpha"])
-        and float(bootstrap["one_sided_p_value"]) <= alpha_threshold
-        and pbo.get("status") == "ok"
-        and pbo.get("pbo") is not None
-        and float(pbo["pbo"]) <= 0.50
-        and _metric_passes(challenger_metrics)
-    )
+    # Gate recalibration (wide-in, strict-out): the research stage only
+    # fail-closes on data integrity (paired complete grid, finite returns —
+    # enforced above) and on the challenger's stress metrics.  The bootstrap
+    # mean difference, confidence interval, alpha-spending p-values and PBO
+    # are still computed and sealed below, but they are a report-only health
+    # check: the single life-or-death gate is the forward paper performance.
+    gate_passed = _metric_passes(challenger_metrics)
     evidence = {
         "contract_version": "fin-strategy-stage-evidence-v1",
         "delivery_status": "research_only",
@@ -770,6 +764,9 @@ def build_strategy_stage_evidence(
             "holm_equivalent_adjusted_p_value": adjusted_p_value,
         },
         "pbo": pbo,
+        # Bootstrap/alpha-spending/PBO above are archived as a health report,
+        # not a verdict: they never flip ``gate_passed``.
+        "statistical_evidence_role": "report_only",
         "challenger_stress_gates_passed": _metric_passes(challenger_metrics),
         "prerequisite_evidence_sha256": (
             prerequisite.get("evidence_sha256") if prerequisite is not None else None

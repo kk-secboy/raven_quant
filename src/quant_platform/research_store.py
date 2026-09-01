@@ -149,7 +149,15 @@ def _evaluation_evidence(
 
 @dataclass(frozen=True, slots=True)
 class FactorGatePolicy:
-    """Versioned, deterministic admission policy for production factor candidates."""
+    """Versioned, deterministic admission policy for production factor candidates.
+
+    Wide-in, strict-out recalibration: only evidence integrity (runnability,
+    PIT cleanliness, effective coverage) and redundancy (correlation versus
+    the existing library) veto admission.  Standalone economic effect and
+    statistical significance are still computed and archived, but they are a
+    report-only health check; the forward paper gate is the single
+    life-or-death gate.
+    """
 
     version: str = "factor-gate-v3-hac-bh"
     min_abs_ic: float = 0.02
@@ -163,14 +171,13 @@ class FactorGatePolicy:
     max_bh_q_value: float = 0.10
 
     def evaluate_layers(self, metrics: dict[str, Any]) -> dict[str, Any]:
-        """Separate evidence-integrity gates from standalone-alpha gates.
+        """Separate evidence-integrity vetoes from report-only effect evidence.
 
-        A weak but well-formed factor may still add information to a frozen
-        model.  Coverage, non-constant output, complete finite metrics and
-        sufficient observations are therefore *hard* gates; economic effect,
-        direction, significance, turnover and redundancy are standalone-effect
-        gates.  Callers may send only ``hard=passed/effect=failed`` candidates
-        to the governed incremental-ablation path.
+        Coverage, non-constant output, complete finite metrics, sufficient
+        observations and library redundancy are the *hard* gates.  Economic
+        effect, direction, significance and turnover are still computed and
+        archived as the standalone-effect layer, but they are report-only
+        and never veto admission (wide-in, strict-out).
         """
 
         hard_checks = (
@@ -194,6 +201,11 @@ class FactorGatePolicy:
                 lambda value: value <= 0.05,
                 "constant factor days <= 0.05",
             ),
+            (
+                "max_correlation",
+                lambda value: abs(value) <= self.max_correlation,
+                f"|correlation| <= {self.max_correlation}",
+            ),
         )
         effect_checks = (
             ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
@@ -216,11 +228,6 @@ class FactorGatePolicy:
                 "turnover",
                 lambda value: value <= self.max_turnover,
                 f"turnover <= {self.max_turnover}",
-            ),
-            (
-                "max_correlation",
-                lambda value: abs(value) <= self.max_correlation,
-                f"|correlation| <= {self.max_correlation}",
             ),
             (
                 "cost_adjusted_return",
@@ -288,8 +295,10 @@ class FactorGatePolicy:
         }
 
     def evaluate(self, metrics: dict[str, Any]) -> tuple[str, list[str]]:
+        # Wide-in, strict-out: only the hard evidence-integrity layer
+        # vetoes.  Effect/significance layers are archived report-only.
         layers = self.evaluate_layers(metrics)
-        reasons = [*layers["hard_reasons"], *layers["effect_reasons"]]
+        reasons = list(layers["hard_reasons"])
         return ("passed" if not reasons else "failed", reasons)
 
 
@@ -2015,15 +2024,12 @@ class ResearchStore:
         }
         if any(item["hard_status"] != "passed" for item in layers.values()):
             status = "gate_failed"
-        elif all(item["effect_status"] == "passed" for item in layers.values()):
-            status = "profile_pending"
-        elif layers["recent_3y"]["effect_status"] == "failed":
-            status = "incremental_pending"
         else:
-            # The recent window is the registered ranking/significance window.
-            # A failure only in a nested robustness window cannot be repaired by
-            # pretending it is a separate incremental hypothesis.
-            status = "gate_failed"
+            # Wide-in, strict-out: effect/significance layers no longer
+            # veto.  A well-formed, PIT-clean, low-redundancy factor
+            # proceeds to the profile-consensus path; its effect metrics
+            # stay archived as report-only evidence.
+            status = "profile_pending"
         if candidate["status"] == status:
             return candidate
         if candidate["status"] in {"promoted", "retired", "gate_passed"}:

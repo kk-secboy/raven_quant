@@ -478,8 +478,8 @@ def test_cycle_uses_its_exact_persisted_paper_threshold_revision() -> None:
             SHORT_1_5D,
             {
                 "min_forward_trading_days": 126,
-                "min_decision_batches": 60,
-                "min_closed_round_trips": 30,
+                "min_decision_batches": 0,
+                "min_closed_round_trips": 0,
                 "min_review_events": 0,
                 "min_financial_report_reviews": 0,
             },
@@ -487,21 +487,21 @@ def test_cycle_uses_its_exact_persisted_paper_threshold_revision() -> None:
         (
             SWING_1_6M,
             {
-                "min_forward_trading_days": 252,
+                "min_forward_trading_days": 126,
                 "min_decision_batches": 0,
-                "min_closed_round_trips": 6,
-                "min_review_events": 24,
+                "min_closed_round_trips": 0,
+                "min_review_events": 0,
                 "min_financial_report_reviews": 0,
             },
         ),
         (
             LONG_1_3Y,
             {
-                "min_forward_trading_days": 252,
+                "min_forward_trading_days": 126,
                 "min_decision_batches": 0,
                 "min_closed_round_trips": 0,
-                "min_review_events": 12,
-                "min_financial_report_reviews": 4,
+                "min_review_events": 0,
+                "min_financial_report_reviews": 0,
             },
         ),
     ],
@@ -556,9 +556,10 @@ def test_explicit_swing_web_floor_is_trading_time_not_daily_decisions() -> None:
 
     assert thresholds.min_forward_calendar_days == 240
     assert thresholds.min_forward_trading_days == 300
+    # 宽进严出:复核/闭环计数仍是冻结的归档字段,但下限归零、只入档。
     assert thresholds.min_decision_batches == 0
-    assert thresholds.min_review_events == 24
-    assert thresholds.min_closed_round_trips == 6
+    assert thresholds.min_review_events == 0
+    assert thresholds.min_closed_round_trips == 0
 
 
 def test_portfolio_job_creation_is_idempotent() -> None:

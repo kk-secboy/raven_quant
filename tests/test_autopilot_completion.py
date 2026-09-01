@@ -797,16 +797,13 @@ def test_completion_rejects_weaker_forward_thresholds() -> None:
 
 
 @pytest.mark.parametrize(
-    ("horizon_profile", "weakened_field"),
-    [
-        (SHORT_1_5D, "min_closed_round_trips"),
-        (SWING_1_6M, "min_review_events"),
-        (LONG_1_3Y, "min_financial_report_reviews"),
-    ],
+    "horizon_profile",
+    [SHORT_1_5D, SWING_1_6M, LONG_1_3Y],
 )
 def test_completion_enforces_every_horizon_authoritative_forward_minimum(
-    horizon_profile: str, weakened_field: str
+    horizon_profile: str,
 ) -> None:
+    # 宽进严出后唯一按周期收紧的前向下限是试跑窗口（交易日数）。
     minimum = forward_gate_thresholds_for_horizon(horizon_profile)
     assert AutopilotCompletionService._require_autopilot_forward_thresholds(
         minimum,
@@ -814,10 +811,10 @@ def test_completion_enforces_every_horizon_authoritative_forward_minimum(
     ) == minimum
     weakened = replace(
         minimum,
-        **{weakened_field: int(getattr(minimum, weakened_field)) - 1},
+        min_forward_trading_days=int(minimum.min_forward_trading_days) - 1,
     )
 
-    with pytest.raises(ValueError, match=weakened_field):
+    with pytest.raises(ValueError, match="min_forward_trading_days"):
         AutopilotCompletionService._require_autopilot_forward_thresholds(
             weakened,
             horizon_profile=horizon_profile,

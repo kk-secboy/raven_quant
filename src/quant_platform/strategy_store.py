@@ -4496,6 +4496,15 @@ class StrategyStore:
                         )
                     except ValueError:
                         continue
+                    # Archive the sealed research-period main metric so the
+                    # formal OOS settlement can run its decay check against
+                    # exactly this evidence (wide-in, strict-out).
+                    full_stack_bootstrap = (
+                        (full_stack.get("evidence") or {}).get(
+                            "paired_block_bootstrap"
+                        )
+                        or {}
+                    )
                     binding = {
                         "contract_version": "fin-strategy-formal-admission-binding-v1",
                         "admission": admission,
@@ -4523,6 +4532,20 @@ class StrategyStore:
                             "id": str(winner_row.id),
                             "content_sha256": str(winner_row.content_sha256),
                             "manifest_sha256": str(winner_row.manifest_sha256),
+                        },
+                        "research_reference": {
+                            "main_metric": "mean_daily_after_cost_excess_return",
+                            "research_mean_daily_after_cost_excess": (
+                                full_stack_bootstrap.get("observed_mean_difference")
+                            ),
+                            "research_observations": full_stack_bootstrap.get(
+                                "observations"
+                            ),
+                            "source_full_stack_evidence_sha256": (
+                                (full_stack.get("evidence") or {}).get(
+                                    "evidence_sha256"
+                                )
+                            ),
                         },
                     }
                     binding["binding_sha256"] = _canonical_sha256(binding)
@@ -6047,12 +6070,6 @@ class StrategyStore:
                 config.get("min_sortino_ratio", 0.0),
                 "min",
             ),
-            "deflated_sharpe_probability": (
-                metrics.get("deflated_sharpe_probability"),
-                0.95,
-                "min",
-            ),
-            "robustness_pass_rate": (metrics.get("robustness_pass_rate"), 1.0, "min"),
             "event_stress_count": (
                 metrics.get("event_stress_count"),
                 config.get("event_count", 5),
@@ -6089,11 +6106,14 @@ class StrategyStore:
                 "min",
             ),
         }
-        if conservative_incomplete_family:
-            # DSR is truthfully not computable because the historical trial
-            # matrix does not exist. Its narrow Bonferroni substitute is
-            # validated separately; do not convert None into a numeric pass.
-            checks.pop("deflated_sharpe_probability")
+        # Gate recalibration (wide-in, strict-out): the deflated Sharpe
+        # probability and the robustness pass rate are still archived in the
+        # approval record below, but they no longer veto; the forward paper
+        # gate is the only life-or-death gate.
+        report_only_metrics = {
+            "deflated_sharpe_probability": metrics.get("deflated_sharpe_probability"),
+            "robustness_pass_rate": metrics.get("robustness_pass_rate"),
+        }
         if str(config.get("horizon_profile") or LEGACY_AMBIGUOUS) == LEGACY_AMBIGUOUS:
             # Preserve the historical contract for versions whose research
             # horizon is unknown. New horizon strategies prove rolling
@@ -6212,21 +6232,18 @@ class StrategyStore:
             failures.append("event stress carried-position evidence is incomplete")
         robustness = metrics.get("robustness")
         artifact_root = Path(backtests[0]["artifact_path"]).resolve()
-        if (
-            not isinstance(robustness, dict)
-            or robustness.get("passed") is not True
-            or robustness.get("pass_rate") != 1.0
-            or set(robustness.get("scenarios") or {})
-            != {"double_cost", "turnover_75pct", "topk_80pct", "zero_retention_buffer"}
-        ):
+        # Scenario presence and artifact integrity remain structural vetoes;
+        # the scenario pass rate itself is archived (report-only) instead of
+        # vetoing approval.
+        if not isinstance(robustness, dict) or set(
+            robustness.get("scenarios") or {}
+        ) != {"double_cost", "turnover_75pct", "topk_80pct", "zero_retention_buffer"}:
             failures.append("all four independent robustness scenarios are required")
         else:
             failures.extend(_scenario_artifact_failures(robustness["scenarios"], artifact_root))
         component_stress = metrics.get("component_cost_stress")
         if (
             not isinstance(component_stress, dict)
-            or component_stress.get("passed") is not True
-            or component_stress.get("pass_rate") != 1.0
             or set(component_stress.get("scenarios") or {})
             != set(COMPONENT_COST_STRESS_MULTIPLIERS)
         ):
@@ -6672,6 +6689,17 @@ class StrategyStore:
                     "reason": reason,
                     "backtest_id": backtests[0]["id"],
                     "gate_evidence": {name: value[0] for name, value in checks.items()},
+                    # Archived health report: recalibrated away from vetoing
+                    # (wide-in, strict-out); thresholds shown are the former
+                    # reference values, kept for interpretability only.
+                    "report_only_gate_metrics": {
+                        "statistical_evidence_role": "report_only",
+                        **report_only_metrics,
+                        "reference_thresholds": {
+                            "deflated_sharpe_probability": 0.95,
+                            "robustness_pass_rate": 1.0,
+                        },
+                    },
                     **(
                         {"model_artifact_id": activated_model_artifact_id}
                         if activated_model_artifact_id is not None

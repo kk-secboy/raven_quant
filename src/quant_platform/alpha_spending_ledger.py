@@ -75,7 +75,12 @@ def capital_oos_policy_manifest() -> dict[str, Any]:
         "same_family_windows_must_be_disjoint": True,
         "maximum_unsettled_batches_per_family": 1,
         "failed_opened_window_spends_alpha": True,
-        "bootstrap_remains_an_independent_hard_gate": True,
+        "bootstrap_remains_an_independent_hard_gate": False,
+        "statistical_evidence_role": "report_only",
+        "final_oos_pass_rule": (
+            "oos_after_cost_excess >= 0.5 * sealed_research_edge "
+            "(decay check; unevaluable without a sealed research reference)"
+        ),
         "daily_dataset_identity_resets_family": False,
         "dataset_lineage_resets_family": False,
         "error_control_scope": "stable_investment_mandate_across_dataset_lineages",
@@ -278,6 +283,60 @@ def _bootstrap_gate(difference: pd.Series) -> dict[str, Any]:
         and float(evidence.get("one_sided_p_value") or 1.0) <= 0.05
     )
     return {**evidence, "hard_gate_passed": passed}
+
+
+CAPITAL_OOS_DECAY_CONTRACT = "oos-research-decay-v1"
+CAPITAL_OOS_MIN_DECAY_RATIO = 0.5
+
+
+def _oos_decay_check(
+    difference: pd.Series,
+    research_reference: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Compare the formal OOS after-cost excess with the sealed research edge.
+
+    Wide-in/strict-out recalibration: the once-only formal OOS no longer dies
+    on a fixed statistical threshold.  It passes when its mean daily
+    after-cost excess over the baseline keeps at least half of the edge sealed
+    in the research-stage evidence.  Both metric values and the ratio are
+    archived either way; without a sealed research reference (for example
+    legacy/autopilot families) the check is not evaluable and does not veto.
+    """
+
+    oos_mean = float(pd.to_numeric(difference, errors="coerce").mean())
+    reference = dict(research_reference or {})
+    research_mean_raw = reference.get("research_mean_daily_after_cost_excess")
+    try:
+        research_mean = (
+            float(research_mean_raw) if research_mean_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        research_mean = None
+    if research_mean is not None and not np.isfinite(research_mean):
+        research_mean = None
+    ratio: float | None = None
+    decay_passed: bool | None = None
+    if research_mean is not None:
+        if research_mean > 0.0 and np.isfinite(oos_mean):
+            ratio = oos_mean / research_mean
+            decay_passed = bool(ratio >= CAPITAL_OOS_MIN_DECAY_RATIO)
+        else:
+            # No positive research edge was sealed, so there is nothing the
+            # OOS window is allowed to decay from.
+            decay_passed = False
+    return {
+        "contract_version": CAPITAL_OOS_DECAY_CONTRACT,
+        "main_metric": "mean_daily_after_cost_excess_return",
+        "oos_mean_daily_after_cost_excess": oos_mean,
+        "oos_annualized_after_cost_excess": oos_mean * 252.0,
+        "research_mean_daily_after_cost_excess": research_mean,
+        "research_annualized_after_cost_excess": (
+            research_mean * 252.0 if research_mean is not None else None
+        ),
+        "decay_ratio": ratio,
+        "minimum_decay_ratio": CAPITAL_OOS_MIN_DECAY_RATIO,
+        "decay_passed": decay_passed,
+    }
 
 
 class CapitalOOSAlphaLedgerStore:
@@ -856,6 +915,7 @@ class CapitalOOSAlphaLedgerStore:
         failed: bool = False,
         failure_reason: str | None = None,
         supporting_evidence: Mapping[str, Any] | None = None,
+        research_reference: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         identifier = str(batch_id).strip()
         if not identifier:
@@ -925,6 +985,11 @@ class CapitalOOSAlphaLedgerStore:
                 "status": "not_run_execution_failed",
                 "hard_gate_passed": False,
             }
+            decay_evidence: dict[str, Any] = {
+                "contract_version": CAPITAL_OOS_DECAY_CONTRACT,
+                "status": "not_run_execution_failed",
+                "decay_passed": None,
+            }
             return_input_evidence: dict[str, Any] = {
                 "status": "not_available_execution_failed",
                 "candidate_net_returns_sha256": None,
@@ -952,6 +1017,7 @@ class CapitalOOSAlphaLedgerStore:
                 raise ValueError("capital OOS return index differs from preregistered window")
             raw_p_value = float(hac_evidence["one_sided_p_value"])
             bootstrap_evidence = _bootstrap_gate(difference)
+            decay_evidence = _oos_decay_check(difference, research_reference)
             normalized_dates = [item.date().isoformat() for item in difference.index]
             candidate_values = pd.to_numeric(candidate_net_returns).to_numpy(dtype=float)
             baseline_values = pd.to_numeric(baseline_net_returns).to_numpy(dtype=float)
@@ -998,11 +1064,14 @@ class CapitalOOSAlphaLedgerStore:
                 .with_for_update()
             ).one()
             threshold = Decimal(batch.batch_alpha)
-            passed = (
-                not failed
-                and _decimal(raw_p_value, label="raw_p_value") <= threshold
-                and bootstrap_evidence.get("hard_gate_passed") is True
-            )
+            # Wide-in/strict-out recalibration: the alpha-spending HAC p-value
+            # and the paired bootstrap remain sealed below as a report-only
+            # health check and no longer veto settlement.  The formal OOS
+            # life-or-death check is the decay of the after-cost excess versus
+            # the sealed research edge; an unevaluable decay check (no sealed
+            # research reference) does not veto, and the forward paper gate
+            # remains the final arbiter.
+            passed = not failed and decay_evidence.get("decay_passed") is not False
             evidence = {
                 "contract_version": "capital-final-oos-alpha-settlement-v1",
                 "batch_id": identifier,
@@ -1021,9 +1090,11 @@ class CapitalOOSAlphaLedgerStore:
                 "failure_recorded": failed,
                 "paired_hac": hac_evidence,
                 "paired_block_bootstrap": bootstrap_evidence,
+                "decay_check": decay_evidence,
                 "paired_return_inputs": return_input_evidence,
                 "oos_vintage_link": vintage_link_evidence,
-                "bootstrap_is_independent_hard_gate": True,
+                "bootstrap_is_independent_hard_gate": False,
+                "statistical_evidence_role": "report_only",
                 "supporting_evidence": support,
                 "supporting_evidence_sha256": support_sha,
                 "preregistration_sha256": str(batch.preregistration_sha256),

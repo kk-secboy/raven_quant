@@ -730,3 +730,139 @@ def test_strategy_result_contract_rejects_identity_or_authority_drift(
 
     with pytest.raises(ValueError, match="fin_strategy"):
         ParameterExperimentStore._validate_strategy_research_result(**values)
+
+
+def _worse_than_baseline_returns(challenger_role: str) -> dict[str, pd.Series]:
+    rng = np.random.default_rng(7)
+    index = pd.bdate_range("2022-01-03", periods=320)
+    baseline = pd.Series(rng.normal(0.0001, 0.008, len(index)), index=index)
+    candidate = baseline + pd.Series(
+        rng.normal(-0.0008, 0.0002, len(index)), index=index
+    )
+    return {"public_baseline": baseline, challenger_role: candidate}
+
+
+@pytest.mark.no_database
+def test_statistics_are_archived_report_only_and_never_veto_the_gate() -> None:
+    """宽进严出:落后于基线的候选照样过研究门,统计指标只入档。"""
+
+    plan = _plan()
+    role = "policy_challenger"
+    evidence = build_strategy_stage_evidence(
+        plan,
+        stage_name="policy_only",
+        trial_results=_trial_results(role),
+        daily_returns=_worse_than_baseline_returns(role),
+        governed_score_sha256={"public_baseline": "1" * 64, role: "1" * 64},
+    )
+    bootstrap = evidence["paired_block_bootstrap"]
+    # 统计上显著落后于基线:旧门禁会否决,新门禁只入档。
+    assert bootstrap["status"] == "ok"
+    assert float(bootstrap["observed_mean_difference"]) < 0.0
+    assert float(bootstrap["confidence_interval_95"][0]) < 0.0
+    assert (
+        evidence["alpha_spending"]["holm_equivalent_adjusted_p_value"] > 0.05
+    )
+    assert "pbo" in evidence
+    assert evidence["statistical_evidence_role"] == "report_only"
+    assert evidence["gate_passed"] is True
+    assert evidence["next_gate"] == "full_stack_pre_final"
+
+
+@pytest.mark.no_database
+def test_gate_still_vetoes_failed_stress_metrics() -> None:
+    """研究阶段硬门只防蠢:压力指标失败仍然否决。"""
+
+    plan = _plan()
+    role = "policy_challenger"
+    results = _trial_results(role)
+    results[1]["metrics"]["out_of_sample"]["robustness_passed"] = False
+    evidence = build_strategy_stage_evidence(
+        plan,
+        stage_name="policy_only",
+        trial_results=results,
+        daily_returns=_returns(role),
+        governed_score_sha256={"public_baseline": "1" * 64, role: "1" * 64},
+    )
+    assert evidence["challenger_stress_gates_passed"] is False
+    assert evidence["gate_passed"] is False
+    assert evidence["next_gate"] == "research_rejected"
+    assert evidence["statistical_evidence_role"] == "report_only"
+
+
+@pytest.mark.no_database
+def test_reasonable_candidate_passes_the_full_research_chain() -> None:
+    """正例:合理候选完整通过 两阶段评估 → 冠军 → OOS 衰减检查。"""
+
+    from quant_platform.alpha_spending_ledger import _oos_decay_check
+    from quant_platform.strategy_research_admission import (
+        build_fin_strategy_winner_artifact,
+    )
+
+    plan = _plan()
+    policy_role = "policy_challenger"
+    policy = build_strategy_stage_evidence(
+        plan,
+        stage_name="policy_only",
+        trial_results=_trial_results(policy_role),
+        daily_returns=_returns(policy_role),
+        governed_score_sha256={
+            "public_baseline": "1" * 64,
+            policy_role: "1" * 64,
+        },
+    )
+    assert policy["gate_passed"] is True
+    assert policy["next_gate"] == "full_stack_pre_final"
+
+    full_role = "full_stack_challenger"
+    full = build_strategy_stage_evidence(
+        plan,
+        stage_name="full_stack",
+        trial_results=_trial_results(full_role),
+        daily_returns=_returns(full_role),
+        governed_score_sha256={
+            "public_baseline": "1" * 64,
+            full_role: "2" * 64,
+        },
+        prerequisite_evidence=policy,
+    )
+    assert full["gate_passed"] is True
+    assert full["next_gate"] == "formal_final_oos_once"
+
+    pbo_value = full["pbo"].get("pbo")
+    winner = build_fin_strategy_winner_artifact(
+        research_run_id="run-1",
+        branch_outcomes=[
+            {
+                "strategy_version_id": "version-1",
+                "status": "eligible",
+                "plan_sha256": plan["plan_sha256"],
+                "policy_evidence_sha256": policy["evidence_sha256"],
+                "full_stack_evidence_sha256": full["evidence_sha256"],
+                "observed_mean_difference": full["paired_block_bootstrap"][
+                    "observed_mean_difference"
+                ],
+                "adjusted_p_value": full["alpha_spending"][
+                    "holm_equivalent_adjusted_p_value"
+                ],
+                "pbo": float(pbo_value) if pbo_value is not None else 0.0,
+            }
+        ],
+    )
+    assert winner["winner_strategy_version_id"] == "version-1"
+    assert winner["next_gate"] == "preregister_capital_final_oos_once"
+
+    # 正式 OOS 衰减检查:OOS 区间主指标保住研究期边缘的 80%(>= 0.5)即通过。
+    research_mean = float(
+        full["paired_block_bootstrap"]["observed_mean_difference"]
+    )
+    assert research_mean > 0.0
+    oos_difference = pd.Series(
+        research_mean * 0.8, index=pd.bdate_range("2024-01-02", periods=300)
+    )
+    decay = _oos_decay_check(
+        oos_difference,
+        {"research_mean_daily_after_cost_excess": research_mean},
+    )
+    assert decay["decay_ratio"] == pytest.approx(0.8)
+    assert decay["decay_passed"] is True

@@ -293,6 +293,8 @@ def _seed_evidence(
     backdate_stage: bool = True,
     fee: float = 0.0,
     gross: float = 1.0,
+    daily_return: float = 0.0,
+    benchmark_return: float | None = -0.0005,
 ) -> None:
     engine = store.engine
     with engine.begin() as connection:
@@ -375,7 +377,8 @@ def _seed_evidence(
                     cash=paper_account.initial_cash,
                     market_value=Decimal("0"),
                     nav=paper_account.initial_cash,
-                    daily_return=0.0,
+                    daily_return=daily_return,
+                    benchmark_return=benchmark_return,
                     drawdown=0.0,
                     market_date=sessions[index + 1],
                     has_stale_prices=False,
@@ -1757,13 +1760,19 @@ def test_gate_subitems_and_atomic_promotion(
     assert checks["decision_batches"]["observed"] == 89
     assert checks["closed_round_trips"]["observed"] == 30
     assert checks["data_completeness"]["observed"] == pytest.approx(89 / 90)
-    # 89 个成功批次中 88 个对账通过：对账率门槛 1.0 → 不足
+    # 89 个成功批次中 88 个对账通过：宽进严出后这些子项只入档不再否决
     assert checks["reconciliation_rate"]["observed"] == pytest.approx(88 / 89)
-    assert evaluation["passed"] is False
-    assert "reconciliation_rate" in str(evaluation["reasons"])
-    assert "data_completeness" in str(evaluation["reasons"])
+    assert checks["data_completeness"]["role"] == "report_only"
+    assert checks["data_completeness"]["passed"] is False
+    assert checks["reconciliation_rate"]["role"] == "report_only"
+    assert checks["reconciliation_rate"]["passed"] is False
+    assert checks["decision_batches"]["role"] == "report_only"
+    assert checks["closed_round_trips"]["role"] == "report_only"
+    assert checks["paper_outperforms_benchmark"]["role"] == "hard"
+    assert checks["max_forward_drawdown"]["role"] == "hard"
+    assert evaluation["passed"] is True
 
-    # 修复证据：全部成功且对账通过、成本偏差在阈值内
+    # 补齐证据：全部成功且对账通过、成本偏差在阈值内（仅作归档质量）
     engine = open_database(database_url)
     with engine.begin() as connection:
         connection.execute(
@@ -1955,9 +1964,63 @@ def test_cost_deviation_subitem(database_url: str, tmp_path: Path, monkeypatch) 
         gross=1000.0,
     )
     evaluation = promotion.evaluate_forward_gate(version_id)
-    assert evaluation["passed"] is False
+    # 宽进严出：成本偏差照算入档，但不再否决前向门
+    assert evaluation["passed"] is True
+    assert evaluation["checks"]["cost_deviation"]["role"] == "report_only"
     assert evaluation["checks"]["cost_deviation"]["passed"] is False
     assert evaluation["checks"]["cost_deviation"]["observed"] > 0.0001
+
+
+def test_forward_gate_vetoes_paper_that_fails_to_beat_the_benchmark(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    version_id, promotion, stage = _gated_paper_version(
+        database_url, tmp_path, monkeypatch
+    )
+    # 试跑期扣费后收益(0)跑输同期基准(+0.1%/日):唯一生死门否决。
+    _seed_evidence(
+        promotion,
+        stage["simulation_portfolio_id"],
+        nav_days=90,
+        succeeded=90,
+        valid_round_trips=30,
+        benchmark_return=0.001,
+    )
+    evaluation = promotion.evaluate_forward_gate(version_id)
+    assert evaluation["passed"] is False
+    check = evaluation["checks"]["paper_outperforms_benchmark"]
+    assert check["role"] == "hard"
+    assert check["passed"] is False
+    assert check["observed"] < check["threshold"]
+
+
+def test_forward_gate_vetoes_excessive_drawdown(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    version_id, promotion, stage = _gated_paper_version(
+        database_url, tmp_path, monkeypatch
+    )
+    portfolio_id = stage["simulation_portfolio_id"]
+    _seed_evidence(
+        promotion,
+        portfolio_id,
+        nav_days=90,
+        succeeded=90,
+        valid_round_trips=30,
+    )
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            update(simulation_nav)
+            .where(simulation_nav.c.portfolio_id == portfolio_id)
+            .values(drawdown=-0.30)
+        )
+    evaluation = promotion.evaluate_forward_gate(version_id)
+    assert evaluation["passed"] is False
+    check = evaluation["checks"]["max_forward_drawdown"]
+    assert check["role"] == "hard"
+    assert check["passed"] is False
+    assert check["observed"] == pytest.approx(0.30)
 
 
 # ---------------------------------------------------------------------------

@@ -344,7 +344,7 @@ def test_factor_sota_member_evaluation_revalidates_dataset_gate_and_seal() -> No
         )
 
 
-def test_factor_sota_incremental_admission_requires_hard_pass_effect_failure() -> None:
+def test_factor_sota_member_admission_archives_effect_without_vetoing() -> None:
     metrics = _passing_factor_metrics()
     metrics["ic"] = 0.0
     candidate, evaluation = _sealed_factor_evaluation(metrics)
@@ -356,14 +356,14 @@ def test_factor_sota_incremental_admission_requires_hard_pass_effect_failure() -
         dataset_identity_sha256="a" * 64,
     )
 
+    # 宽进严出:效应/显著性只入档,standalone 准入只看硬门(完整性/覆盖率/冗余)。
     candidate["admission_path"] = "standalone"
-    with pytest.raises(ValueError, match="evaluation gate"):
-        _validate_factor_sota_member_evaluation(
-            candidate=candidate,
-            evaluation=evaluation,
-            dataset="daily-v1",
-            dataset_identity_sha256="a" * 64,
-        )
+    _validate_factor_sota_member_evaluation(
+        candidate=candidate,
+        evaluation=evaluation,
+        dataset="daily-v1",
+        dataset_identity_sha256="a" * 64,
+    )
 
 
 @pytest.mark.parametrize("weight", [float("nan"), float("inf"), float("-inf")])

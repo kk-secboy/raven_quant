@@ -386,7 +386,7 @@ def test_failed_execution_auto_binds_existing_vintage(database_url: str) -> None
     assert link["oos_vintage_id"] == vintage_id
 
 
-def test_positive_paired_hac_and_bootstrap_must_both_pass(database_url: str) -> None:
+def test_positive_paired_effect_settles_with_report_only_statistics(database_url: str) -> None:
     store = CapitalOOSAlphaLedgerStore(database_url)
     batch = _reserve(store)
     vintage_id = _link_vintage(store, database_url, batch)
@@ -406,7 +406,11 @@ def test_positive_paired_hac_and_bootstrap_must_both_pass(database_url: str) -> 
     assert 0.0 < settled["raw_p_value"] <= float(batch["batch_alpha"])
     assert settled["passed"] is True
     evidence = settled["settlement_evidence_json"]
+    # 宽进严出:统计证据照算照存但不再否决;无研究期参考时衰减检查不可判。
     assert evidence["paired_block_bootstrap"]["hard_gate_passed"] is True
+    assert evidence["bootstrap_is_independent_hard_gate"] is False
+    assert evidence["statistical_evidence_role"] == "report_only"
+    assert evidence["decay_check"]["decay_passed"] is None
     assert evidence["paired_hac"]["contract_version"].startswith("one-sided")
     assert len(evidence["paired_return_inputs"]["candidate_net_returns_sha256"]) == 64
     assert evidence["oos_vintage_link"]["status"] == "verified"
@@ -497,3 +501,55 @@ def test_settled_batch_is_database_immutable(database_url: str) -> None:
                 .where(capital_oos_alpha_batches.c.id == batch["id"])
                 .values(passed=True)
             )
+def test_decay_check_vetoes_an_oos_edge_collapsed_below_half_of_research(
+    database_url: str,
+) -> None:
+    store = CapitalOOSAlphaLedgerStore(database_url)
+    batch = _reserve(store)
+    vintage_id = _link_vintage(store, database_url, batch)
+    index = pd.to_datetime(batch["trading_dates_json"])
+    baseline = pd.Series(0.0, index=index)
+    # 研究期密封边缘 0.002/日,OOS 只剩 0.0005/日(比率 0.25 < 0.5)。
+    candidate = pd.Series(0.0005, index=index)
+    settled = store.settle_batch(
+        batch["id"],
+        candidate_net_returns=candidate,
+        baseline_net_returns=baseline,
+        research_reference={"research_mean_daily_after_cost_excess": 0.002},
+        supporting_evidence={
+            "formal_oos_artifact_sha256": "d" * 64,
+            "oos_vintage_id": vintage_id,
+        },
+    )
+    assert settled["passed"] is False
+    decay = settled["settlement_evidence_json"]["decay_check"]
+    assert decay["research_mean_daily_after_cost_excess"] == 0.002
+    assert decay["oos_mean_daily_after_cost_excess"] == 0.0005
+    assert decay["decay_ratio"] == pytest.approx(0.25)
+    assert decay["decay_passed"] is False
+
+
+def test_decay_check_passes_when_oos_keeps_at_least_half_the_research_edge(
+    database_url: str,
+) -> None:
+    store = CapitalOOSAlphaLedgerStore(database_url)
+    batch = _reserve(store)
+    vintage_id = _link_vintage(store, database_url, batch)
+    index = pd.to_datetime(batch["trading_dates_json"])
+    baseline = pd.Series(0.0, index=index)
+    # 研究期密封边缘 0.002/日,OOS 保住 0.0012/日(比率 0.6 >= 0.5)。
+    candidate = pd.Series(0.0012, index=index)
+    settled = store.settle_batch(
+        batch["id"],
+        candidate_net_returns=candidate,
+        baseline_net_returns=baseline,
+        research_reference={"research_mean_daily_after_cost_excess": 0.002},
+        supporting_evidence={
+            "formal_oos_artifact_sha256": "d" * 64,
+            "oos_vintage_id": vintage_id,
+        },
+    )
+    assert settled["passed"] is True
+    decay = settled["settlement_evidence_json"]["decay_check"]
+    assert decay["decay_ratio"] == pytest.approx(0.6)
+    assert decay["decay_passed"] is True

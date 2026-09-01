@@ -108,6 +108,8 @@ _STAGE_FROZEN = "frozen"
 _REFERENCE_ORDER_VALUE = 100_000.0
 _DEFAULT_PAPER_INITIAL_CASH = 100_000.0
 MAX_FORWARD_CHALLENGERS_PER_HORIZON = 2
+# Forward-gate drawdown ceiling when the version config carries none.
+_DEFAULT_MAX_FORWARD_DRAWDOWN = 0.25
 _RECONCILIATION_TOLERANCE = 1e-6
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -269,16 +271,16 @@ def resolve_paper_initial_cash(
 class ForwardGateThresholds:
     """Pre-registered forward evidence gate (design 4.5/6.11).
 
-    The dataclass defaults preserve the legacy gate. Explicit product horizons
-    always use ``forward_gate_thresholds_for_horizon``: natural time is counted
-    in certified exchange sessions, swing reviews in distinct ISO weeks, long
-    reviews in distinct calendar months, and full holding cycles in valid
-    buy-to-flat round trips rather than sell-batch proxies.
+    Wide-in, strict-out recalibration: the frozen trial window (three to
+    six months of certified exchange sessions) plus the after-cost
+    benchmark comparison and the drawdown ceiling are the only hard
+    lines.  The remaining thresholds stay frozen with the gate and are
+    still measured, but they archive as report-only health metrics.
     """
 
-    min_forward_calendar_days: int = 20
+    min_forward_calendar_days: int = 90
     min_forward_trading_days: int = 0
-    min_decision_batches: int = 10
+    min_decision_batches: int = 0
     min_completed_cycles: int = 0
     min_closed_round_trips: int = 0
     min_review_events: int = 0
@@ -387,38 +389,42 @@ def _review_period_key(horizon_profile: str, completed_at: datetime) -> str:
 
 
 def forward_gate_thresholds_for_horizon(profile: str) -> ForwardGateThresholds:
-    """Return the frozen minimum forward proof for one product horizon."""
+    """Return the frozen minimum forward proof for one product horizon.
+
+    Wide-in, strict-out: the trial window is roughly three months of
+    certified sessions for short-horizon challengers and six months for
+    swing/long.  Decision, round-trip and review counts are still recorded
+    with the gate but archive as report-only health metrics.
+    """
 
     if profile == SHORT_1_5D:
         return ForwardGateThresholds(
             min_forward_calendar_days=0,
-            min_forward_trading_days=90,
-            min_decision_batches=60,
+            min_forward_trading_days=60,
+            min_decision_batches=0,
             min_completed_cycles=0,
-            min_closed_round_trips=30,
+            min_closed_round_trips=0,
         )
     if profile == SWING_1_6M:
         return ForwardGateThresholds(
             min_forward_calendar_days=0,
-            min_forward_trading_days=252,
+            min_forward_trading_days=120,
             min_decision_batches=0,
             min_completed_cycles=0,
-            min_closed_round_trips=6,
-            min_review_events=24,
+            min_closed_round_trips=0,
+            min_review_events=0,
         )
     if profile == LONG_1_3Y:
         return ForwardGateThresholds(
             min_forward_calendar_days=0,
-            # Three years of live operation is a useful maturity badge, but
-            # it is too slow to be the first recommendation gate.  The
-            # historical sealed OOS contract remains 756 sessions; the live
-            # gate requires roughly one exchange year plus monthly and PIT
-            # financial-report reviews.
-            min_forward_trading_days=252,
+            # Three years of live operation stays a maturity badge, not the
+            # first recommendation gate.  The historical sealed OOS contract
+            # remains 756 sessions; the live gate requires roughly six months.
+            min_forward_trading_days=120,
             min_decision_batches=0,
             min_completed_cycles=0,
-            min_review_events=12,
-            min_financial_report_reviews=4,
+            min_review_events=0,
+            min_financial_report_reviews=0,
         )
     if profile == LEGACY_AMBIGUOUS:
         return ForwardGateThresholds()
@@ -1630,6 +1636,16 @@ class PromotionStore:
                 )
             evidence = self._collect_evidence(connection, stage, portfolio, version)
 
+        # Wide-in, strict-out recalibration: this forward gate is the only
+        # life-or-death gate of the research-to-capital chain.  Hard lines are
+        # ledger integrity, the frozen trial window, beating the transparent
+        # benchmark after costs, and the maximum-drawdown ceiling.  Every
+        # other sub-metric is still measured and archived as a report-only
+        # health check.
+        version_config = dict(version.config_json or {})
+        max_drawdown_limit = float(
+            version_config.get("max_drawdown") or _DEFAULT_MAX_FORWARD_DRAWDOWN
+        )
         checks = {
             # A generic/manual batch on the paper account is not forward
             # evidence.  Treating it merely as absent would allow a mixed
@@ -1645,6 +1661,8 @@ class PromotionStore:
                 1.0,
                 "min",
             ),
+        }
+        report_only_checks = {
             "data_completeness": (
                 evidence["data_completeness"],
                 float(gate.min_data_completeness),
@@ -1669,13 +1687,13 @@ class PromotionStore:
             )
         profile = str(version.horizon_profile)
         if profile == LEGACY_AMBIGUOUS:
-            checks.update(
+            checks["forward_calendar_days"] = (
+                evidence["forward_calendar_days"],
+                int(gate.min_forward_calendar_days),
+                "min",
+            )
+            report_only_checks.update(
                 {
-                    "forward_calendar_days": (
-                        evidence["forward_calendar_days"],
-                        int(gate.min_forward_calendar_days),
-                        "min",
-                    ),
                     "decision_batches": (
                         evidence["decision_batches"],
                         int(gate.min_decision_batches),
@@ -1689,13 +1707,13 @@ class PromotionStore:
                 }
             )
         elif profile == SHORT_1_5D:
-            checks.update(
+            checks["forward_trading_days"] = (
+                evidence["forward_trading_days"],
+                int(gate.min_forward_trading_days),
+                "min",
+            )
+            report_only_checks.update(
                 {
-                    "forward_trading_days": (
-                        evidence["forward_trading_days"],
-                        int(gate.min_forward_trading_days),
-                        "min",
-                    ),
                     "decision_batches": (
                         evidence["decision_batches"],
                         int(gate.min_decision_batches),
@@ -1709,13 +1727,13 @@ class PromotionStore:
                 }
             )
         elif profile == SWING_1_6M:
-            checks.update(
+            checks["forward_trading_days"] = (
+                evidence["forward_trading_days"],
+                int(gate.min_forward_trading_days),
+                "min",
+            )
+            report_only_checks.update(
                 {
-                    "forward_trading_days": (
-                        evidence["forward_trading_days"],
-                        int(gate.min_forward_trading_days),
-                        "min",
-                    ),
                     "review_events": (
                         evidence["review_events"],
                         int(gate.min_review_events),
@@ -1729,13 +1747,13 @@ class PromotionStore:
                 }
             )
         elif profile == LONG_1_3Y:
-            checks.update(
+            checks["forward_trading_days"] = (
+                evidence["forward_trading_days"],
+                int(gate.min_forward_trading_days),
+                "min",
+            )
+            report_only_checks.update(
                 {
-                    "forward_trading_days": (
-                        evidence["forward_trading_days"],
-                        int(gate.min_forward_trading_days),
-                        "min",
-                    ),
                     "review_events": (
                         evidence["review_events"],
                         int(gate.min_review_events),
@@ -1757,14 +1775,49 @@ class PromotionStore:
                 "passed": (
                     observed >= threshold if mode == "min" else observed <= threshold
                 ),
+                "role": "hard",
             }
             for name, (observed, threshold, mode) in checks.items()
         }
+        report_only_results = {
+            name: {
+                "observed": observed,
+                "threshold": threshold,
+                "passed": (
+                    observed >= threshold if mode == "min" else observed <= threshold
+                ),
+                "role": "report_only",
+            }
+            for name, (observed, threshold, mode) in report_only_checks.items()
+        }
+        paper_return = evidence.get("paper_net_return")
+        benchmark_return = evidence.get("benchmark_net_return")
+        results["paper_outperforms_benchmark"] = {
+            "observed": paper_return,
+            "threshold": benchmark_return,
+            "passed": (
+                paper_return is not None
+                and benchmark_return is not None
+                and float(paper_return) > float(benchmark_return)
+            ),
+            "role": "hard",
+        }
+        observed_drawdown = evidence.get("max_drawdown")
+        results["max_forward_drawdown"] = {
+            "observed": observed_drawdown,
+            "threshold": max_drawdown_limit,
+            "passed": (
+                observed_drawdown is not None
+                and float(observed_drawdown) <= max_drawdown_limit
+            ),
+            "role": "hard",
+        }
+        archived = {**results, **report_only_results}
         failures = [name for name, result in results.items() if not result["passed"]]
         if failures:
             return _insufficient(
                 [f"{name} below/above the pre-registered threshold" for name in failures],
-                checks=results,
+                checks=archived,
                 evidence=evidence,
                 stage_id=str(stage.id),
                 criteria_json=criteria,
@@ -1774,7 +1827,7 @@ class PromotionStore:
             "status": "ok",
             "passed": True,
             "reasons": [],
-            "checks": results,
+            "checks": archived,
             "evidence": evidence,
             "stage_id": str(stage.id),
             "contract_version": PROMOTION_CONTRACT_VERSION,
@@ -2899,6 +2952,41 @@ class PromotionStore:
         total_value = float(fill_stats[1])
         realized_rate = total_fees / total_value if total_value > 0 else 0.0
         scheduled_rate = self._scheduled_one_side_rate(str(portfolio.cost_schedule_version))
+        nav_metric_rows = connection.execute(
+            select(
+                simulation_nav.c.daily_return,
+                simulation_nav.c.benchmark_return,
+                simulation_nav.c.drawdown,
+            )
+            .where(
+                simulation_nav.c.portfolio_id == portfolio_id,
+                simulation_nav.c.created_at >= opened_at,
+                simulation_nav.c.created_at <= observed_at,
+                simulation_nav.c.trade_date > opened_date,
+                simulation_nav.c.trade_date <= observed_date,
+                simulation_nav.c.market_date == simulation_nav.c.trade_date,
+                simulation_nav.c.performance_certified.is_(True),
+                simulation_nav.c.has_stale_prices.is_(False),
+            )
+            .order_by(simulation_nav.c.trade_date)
+        ).all()
+        # After-cost trial performance versus the transparent benchmark over
+        # the same certified window, plus the worst NAV drawdown.  NAV rows
+        # already net out fill fees, so the chained return is after-cost.
+        paper_wealth = 1.0
+        benchmark_wealth = 1.0
+        benchmark_complete = bool(nav_metric_rows)
+        max_drawdown: float | None = None
+        for nav_row in nav_metric_rows:
+            paper_wealth *= 1.0 + float(nav_row.daily_return)
+            if nav_row.benchmark_return is None:
+                benchmark_complete = False
+            else:
+                benchmark_wealth *= 1.0 + float(nav_row.benchmark_return)
+            drawdown = abs(float(nav_row.drawdown))
+            max_drawdown = (
+                drawdown if max_drawdown is None else max(max_drawdown, drawdown)
+            )
         return {
             "stage_opened_at": opened_at.isoformat(),
             "forward_signal_after": opened_date.isoformat(),
@@ -2931,6 +3019,11 @@ class PromotionStore:
             "realized_cost_rate": realized_rate,
             "scheduled_cost_rate": scheduled_rate,
             "cost_deviation": abs(realized_rate - scheduled_rate),
+            "paper_net_return": paper_wealth - 1.0,
+            "benchmark_net_return": (
+                benchmark_wealth - 1.0 if benchmark_complete else None
+            ),
+            "max_drawdown": max_drawdown,
         }
 
     @staticmethod

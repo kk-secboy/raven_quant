@@ -952,10 +952,22 @@ class LocalJobWorker:
             expected_trading_dates=list(batch.get("trading_dates_json") or []),
         )
         vintage = self.capital_oos.get_vintage_binding(batch_id)
+        # Wide-in/strict-out: the fin_strategy formal chain seals its research
+        # edge into the admission binding; hand it to the ledger so settlement
+        # runs the decay check instead of a fixed statistical threshold.
+        admission_binding = (backtest.get("periods") or {}).get(
+            "fin_strategy_formal_admission"
+        )
+        research_reference = (
+            admission_binding.get("research_reference")
+            if isinstance(admission_binding, dict)
+            else None
+        )
         settlement = self.capital_oos.settle_batch(
             batch_id,
             candidate_net_returns=candidate,
             baseline_net_returns=baseline,
+            research_reference=research_reference,
             supporting_evidence={
                 **artifact_evidence,
                 "backtest_id": backtest_id,
