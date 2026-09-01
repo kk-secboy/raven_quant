@@ -10,6 +10,7 @@ from quant_platform.model_recompute import (
     MODEL_QLIB_KERNELS,
     MODEL_RESOURCE_POLICY_VERSION,
     MODEL_SANDBOX_MEMORY_GB,
+    MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE,
     execute_model_candidate,
     governed_checkpoint_filename,
     governed_model_resource_policy,
@@ -76,6 +77,27 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
     spec.loader.exec_module(module)
     assert module.MODEL_RESOURCE_POLICY_VERSION == MODEL_RESOURCE_POLICY_VERSION
     assert module.MODEL_DATA_CONTRACT_VERSION == MODEL_DATA_CONTRACT_VERSION
+    assert (
+        module.MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
+        == MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
+        == "true"
+    )
+    source = runner_path.read_text(encoding="utf-8")
+    assert "model sandbox requires isolated Qlib file tracking compatibility" in source
+
+
+def test_model_sandbox_explicitly_opts_into_ephemeral_qlib_file_tracking() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "quant_platform"
+        / "model_recompute.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        'f"MLFLOW_ALLOW_FILE_STORE={MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE}"'
+        in source
+    )
+    assert '"mlflow_allow_file_store": MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE' in source
 
 
 def test_live_inference_requires_an_immutable_checkpoint_before_docker(

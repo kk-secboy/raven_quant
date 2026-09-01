@@ -18,7 +18,7 @@ from .model_research_governance import (
     resolve_model_label_contract,
 )
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v3-cpu-tournament"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v4-mlflow-file-compat"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
@@ -36,6 +36,7 @@ TRANSFORMER_CONCURRENCY_CAP = 1
 RESERVED_SERVICE_RESOURCE_FRACTION = 0.25
 MODEL_SANDBOX_MEMORY_GB = 40
 MODEL_QLIB_KERNELS = 3
+MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
 TOURNAMENT_SCREEN_SEED = 11
 TOURNAMENT_FULL_SEEDS = (11, 29, 47)
 GOVERNED_MODEL_ENGINES = frozenset(
@@ -517,6 +518,7 @@ def execute_model_candidate(
         "upstream_versions_sha256": upstream_versions_sha256,
         "sandbox_image": image,
         "sandbox_image_id": image_id,
+        "mlflow_allow_file_store": MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE,
     }
     execution_environment_sha256 = canonical_sha256(execution_environment)
     workspace.mkdir(parents=True, exist_ok=False)
@@ -608,6 +610,8 @@ def execute_model_candidate(
         "HOME=/tmp",
         "--env",
         "PYTHONPATH=/work",
+        "--env",
+        f"MLFLOW_ALLOW_FILE_STORE={MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE}",
         "--tmpfs",
         "/tmp:rw,nosuid,nodev,size=2g",
         "--mount",

@@ -25,6 +25,7 @@ MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS = 5
 LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
 MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
+MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 GOVERNED_MODEL_ENGINES = {
@@ -176,6 +177,10 @@ def main() -> None:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     if manifest.get("contract_version") != "model-sandbox-input-v1":
         raise ValueError("model sandbox input contract is invalid")
+    if os.environ.get("MLFLOW_ALLOW_FILE_STORE", "").strip().lower() != (
+        MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
+    ):
+        raise ValueError("model sandbox requires isolated Qlib file tracking compatibility")
     model_type = str(manifest["model_type"])
     if model_type not in {"Tabular", "TimeSeries"}:
         raise ValueError("only Tabular and TimeSeries RD-Agent models are supported")
