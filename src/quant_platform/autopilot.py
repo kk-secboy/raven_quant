@@ -185,6 +185,39 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _same_research_data_contract(
+    source_dataset: dict[str, Any], target_dataset: dict[str, Any]
+) -> bool:
+    """Return whether one cadence event may keep its original publication.
+
+    A newer immutable daily publication inside the same week/month/quarter may
+    wait behind the event that already owns that cadence bucket, but only while
+    the research data semantics are unchanged.  Continuing across a field or
+    research-feature contract migration would knowingly run the repaired code
+    on obsolete PIT semantics.
+    """
+
+    source = dict(source_dataset.get("provenance") or {})
+    target = dict(target_dataset.get("provenance") or {})
+    source_research = dict(source.get("research_features") or {})
+    target_research = dict(target.get("research_features") or {})
+    source_contract = (
+        str(source.get("frequency") or source_dataset.get("frequency") or ""),
+        str(source.get("field_contract_version") or ""),
+        str(source.get("eligibility_contract_version") or ""),
+        source_research.get("version"),
+    )
+    target_contract = (
+        str(target.get("frequency") or target_dataset.get("frequency") or ""),
+        str(target.get("field_contract_version") or ""),
+        str(target.get("eligibility_contract_version") or ""),
+        target_research.get("version"),
+    )
+    return all(value not in {"", None} for value in source_contract) and (
+        source_contract == target_contract
+    )
+
+
 def _branch_created_at(branch: dict[str, Any]) -> datetime:
     """Return one persisted branch timestamp as an aware UTC datetime.
 
@@ -1166,6 +1199,7 @@ class AutopilotController:
         )
         continuing_cycle: dict[str, Any] | None = None
         continuing_dataset: dict[str, Any] | None = None
+        research_contract_migration = False
         created = 0
         failed = 0
         # Each weekly/monthly/quarterly event stays on the immutable publication
@@ -1199,9 +1233,11 @@ class AutopilotController:
                 )
                 failed += 1
                 continue
+            same_research_contract = _same_research_data_contract(stale_dataset, dataset)
             if (
                 not latest_cycle_is_active
                 and continuing_cycle is None
+                and same_research_contract
                 and horizon_research_cadence_bucket(
                     horizon_profile,
                     str(
@@ -1220,6 +1256,9 @@ class AutopilotController:
                 continuing_cycle = stale_cycle
                 continuing_dataset = stale_dataset
             else:
+                research_contract_migration = (
+                    research_contract_migration or not same_research_contract
+                )
                 self.store.supersede_research_cycle(
                     str(stale_cycle["id"]),
                     replacement_dataset=dataset,
@@ -1243,17 +1282,11 @@ class AutopilotController:
                 "branches": created,
                 "failed": failed + int(cycle.get("status") == "blocked"),
             }
-        factor_due = self._factor_due(
-            dataset,
-            current,
-            config,
-            horizon_profile=horizon_profile,
+        factor_due = research_contract_migration or self._factor_due(
+            dataset, current, config, horizon_profile=horizon_profile
         )
-        model_due = self._model_due(
-            dataset,
-            current,
-            config,
-            horizon_profile=horizon_profile,
+        model_due = research_contract_migration or self._model_due(
+            dataset, current, config, horizon_profile=horizon_profile
         )
         cycle = self.store.get_cycle(str(cycle["id"]))
         research_already_started = bool(cycle.get("branches")) or bool(
@@ -1332,7 +1365,7 @@ class AutopilotController:
                 created += 1
             except ValueError:
                 failed += 1
-        elif self._retry_failed_branch(factor_branch):
+        elif factor_branch is not None and self._retry_failed_branch(factor_branch):
             created += 1
         if tournament is not None:
             platform_created, platform_failed = self._ensure_platform_model_branches(
@@ -1645,8 +1678,8 @@ class AutopilotController:
             )
         return {"cycles": 1, "branches": created, "failed": failed}
 
-    def _retry_failed_branch(self, branch: dict[str, Any]) -> bool:
-        if branch.get("status") != "failed":
+    def _retry_failed_branch(self, branch: dict[str, Any] | None) -> bool:
+        if branch is None or branch.get("status") != "failed":
             return False
         if int((branch.get("details") or {}).get("retry_count") or 0) >= 1:
             return False

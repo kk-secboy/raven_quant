@@ -537,12 +537,24 @@ def test_new_daily_snapshot_continues_same_cadence_immutable_cycle(
     old_dataset = {
         "name": f"daily-{old_end}",
         "end_date": old_end,
-        "provenance": {"dataset_identity_sha256": "a" * 64},
+        "provenance": {
+            "dataset_identity_sha256": "a" * 64,
+            "frequency": "day",
+            "field_contract_version": "daily-field-v8",
+            "eligibility_contract_version": "eligibility-v1",
+            "research_features": {"version": 8},
+        },
     }
     latest_dataset = {
         "name": f"daily-{latest_end}",
         "end_date": latest_end,
-        "provenance": {"dataset_identity_sha256": "b" * 64},
+        "provenance": {
+            "dataset_identity_sha256": "b" * 64,
+            "frequency": "day",
+            "field_contract_version": "daily-field-v8",
+            "eligibility_contract_version": "eligibility-v1",
+            "research_features": {"version": 8},
+        },
     }
     old_cycle = {
         "id": "cycle-old",
@@ -602,6 +614,115 @@ def test_new_daily_snapshot_continues_same_cadence_immutable_cycle(
 
     assert calls == {"cycle": old_cycle, "dataset": old_dataset}
     assert result == {"cycles": 1, "branches": 0, "failed": 0}
+
+
+def test_same_cadence_dataset_contract_migration_supersedes_obsolete_cycle(
+    monkeypatch,
+) -> None:
+    old_dataset = {
+        "name": "daily-obsolete-v5",
+        "end_date": "2026-08-28",
+        "provenance": {
+            "dataset_identity_sha256": "a" * 64,
+            "frequency": "day",
+            "field_contract_version": "daily-field-v5",
+            "eligibility_contract_version": "eligibility-v1",
+            "research_features": {"version": 5},
+        },
+    }
+    latest_dataset = {
+        "name": "daily-pit-v8",
+        "end_date": "2026-08-31",
+        "provenance": {
+            "dataset_identity_sha256": "b" * 64,
+            "frequency": "day",
+            "field_contract_version": "daily-field-v8",
+            "eligibility_contract_version": "eligibility-v1",
+            "research_features": {"version": 8},
+        },
+    }
+    old_cycle = {
+        "id": "cycle-obsolete",
+        "status": "active",
+        "horizon_profile": "swing_1_6m",
+        "dataset": old_dataset["name"],
+        "dataset_identity_sha256": "a" * 64,
+        "state": {"dataset_end_date": old_dataset["end_date"]},
+        "branches": [{"scenario": "fin_factor", "status": "running"}],
+    }
+    replacement_cycle = {
+        "id": "cycle-current",
+        "status": "active",
+        "horizon_profile": "swing_1_6m",
+        "dataset": latest_dataset["name"],
+        "dataset_identity_sha256": "b" * 64,
+        "state": {"dataset_end_date": latest_dataset["end_date"]},
+        "branches": [],
+    }
+    superseded: list[tuple[str, str]] = []
+    rolled_forward: list[str] = []
+
+    class Store:
+        @staticmethod
+        def list_cycles(*, limit):
+            assert limit == 500
+            return [old_cycle]
+
+        @staticmethod
+        def supersede_research_cycle(cycle_id, *, replacement_dataset):
+            superseded.append((cycle_id, str(replacement_dataset["name"])))
+            return old_cycle
+
+        @staticmethod
+        def ensure_cycle(dataset, **_kwargs):
+            assert dataset == latest_dataset
+            return replacement_cycle
+
+        @staticmethod
+        def get_cycle(cycle_id):
+            assert cycle_id == replacement_cycle["id"]
+            return replacement_cycle
+
+        @staticmethod
+        def set_cycle_state(*_args, **_kwargs):
+            raise AssertionError("contract migration must bypass the cadence no-op")
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.settings = SimpleNamespace(data_root="unused")
+    controller.store = Store()
+    controller._factor_due = lambda *_args, **_kwargs: False
+    controller._model_due = lambda *_args, **_kwargs: False
+
+    def roll_forward(cycle, bound_dataset):
+        assert cycle == replacement_cycle
+        assert bound_dataset == latest_dataset
+        rolled_forward.append(str(cycle["id"]))
+        return {**cycle, "status": "succeeded"}
+
+    controller._roll_forward_prediction_champion = roll_forward
+    monkeypatch.setattr(
+        autopilot_module,
+        "list_qlib_datasets",
+        lambda _root: [old_dataset, latest_dataset],
+    )
+
+    result = controller._tick_horizon(
+        current=datetime(2026, 8, 31, tzinfo=UTC),
+        config=normalize_autopilot_config(),
+        revision=1,
+        dataset=latest_dataset,
+        horizon_profile="swing_1_6m",
+    )
+
+    assert superseded == [("cycle-obsolete", "daily-pit-v8")]
+    assert rolled_forward == ["cycle-current"]
+    assert result == {"cycles": 1, "branches": 0, "failed": 0}
+
+
+def test_missing_factor_branch_is_not_retried() -> None:
+    controller = AutopilotController.__new__(AutopilotController)
+
+    assert controller._retry_failed_branch(None) is False
 
 
 def test_factor_model_and_quant_runs_bind_each_horizons_primary_label(
