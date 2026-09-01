@@ -1261,7 +1261,7 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     store = ScheduleStore(database_url)
     research_payload = {
         "objective": "Research a low-turnover quality factor for CSI 300 enhancement.",
-        "scenario": "fin_factor",
+        "scenario": "fin_quant",
         "dataset": "cn-research",
         "feature_set_id": "governed-baseline",
         "horizon": "short",
@@ -1293,7 +1293,7 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     schedule_run = next(item for item in schedule_runs if item["status"] == "enqueued")
     assert schedule_run["status"] == "enqueued"
     job = JobStore(database_url).get(schedule_run["job_id"])
-    assert job["kind"] == "rdagent_factor"
+    assert job["kind"] == "rdagent_quant"
     assert job["payload"]["loop_n"] == 2
     research_run = next(
         item
@@ -1302,6 +1302,44 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     )
     assert research_run["status"] == "queued"
     assert research_run["job_id"] == job["id"]
+
+
+def test_scheduler_skips_frozen_rdagent_scenario_schedule(
+    database_url: str, tmp_path: Path
+) -> None:
+    # Schedules created before the freeze stay readable, but the dispatcher
+    # must never enqueue new work for a frozen scenario.
+    current = datetime(2025, 1, 2, 12, 29, tzinfo=UTC)
+    settings = _settings(database_url, tmp_path)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="legacy frozen factor research",
+        kind="rdagent_research",
+        timezone="Asia/Shanghai",
+        run_time=time(20, 30),
+        trading_days_only=True,
+        payload={
+            "objective": "Research a low-turnover quality factor for CSI 300.",
+            "scenario": "fin_factor",
+            "dataset": "cn-research",
+            "feature_set_id": "governed-baseline",
+            "horizon": "short",
+            "loop_n": 2,
+            "duration": "1h",
+            "requested_by": "research-scheduler",
+            "period_mode": "rolling",
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(settings).tick(current + timedelta(minutes=1))
+    assert result["processed"] == 1
+    (schedule_run,) = store.list_runs()
+    assert schedule_run["status"] == "skipped"
+    assert "frozen" in schedule_run["message"]
+    assert JobStore(database_url).list() == []
 
 
 def test_expired_schedule_run_lease_is_reclaimed(database_url: str) -> None:

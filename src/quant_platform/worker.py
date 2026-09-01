@@ -105,7 +105,12 @@ from .rdagent_runtime import (
     rdagent_command,
     require_matching_rdagent_runtime_identity,
 )
-from .rdagent_scenarios import get_rdagent_scenario, is_rdagent_job, validate_asset_id
+from .rdagent_scenarios import (
+    FROZEN_RDAGENT_SCENARIOS,
+    get_rdagent_scenario,
+    is_rdagent_job,
+    validate_asset_id,
+)
 from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
@@ -627,6 +632,25 @@ def _require_supported_simulation_execution(
     ):
         raise ValueError(
             "pair simulation execution is retired; historical ledgers are read-only"
+        )
+
+
+def _require_supported_rdagent_execution(payload: dict) -> None:
+    """Fail closed for every frozen RD-Agent scenario.
+
+    Frozen scenarios keep their registry entries and historical runs, but the
+    worker is the final authority boundary: neither an old queued job nor a
+    retried cancelled job may start fin_factor, fin_model, general_model,
+    data_science, or llm_finetune execution after the freeze.  fin_strategy
+    shares the generic rdagent_run kind with general_model, so the payload
+    scenario, not the job kind, decides that case.
+    """
+
+    scenario = get_rdagent_scenario(str(payload.get("scenario") or "fin_factor"))
+    if scenario.id in FROZEN_RDAGENT_SCENARIOS:
+        raise ValueError(
+            f"RD-Agent scenario {scenario.id} is frozen; "
+            "historical runs and artifacts are read-only"
         )
 
 
@@ -3330,6 +3354,7 @@ class LocalJobWorker:
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
         if is_rdagent_job(job["kind"]):
+            _require_supported_rdagent_execution(payload)
             scenario = get_rdagent_scenario(str(payload.get("scenario") or "fin_factor"))
             raw_strategy_signal_binding = payload.get(
                 "strategy_research_signal_binding"

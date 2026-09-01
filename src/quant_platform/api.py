@@ -132,6 +132,7 @@ from .rdagent_runtime import (
     validate_duration_limit,
 )
 from .rdagent_scenarios import (
+    FROZEN_RDAGENT_SCENARIOS,
     get_rdagent_scenario,
     require_ready_scenario,
     resolve_rdagent_assets,
@@ -4380,6 +4381,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 409,
                 {"message": f"RD-Agent {payload.scenario} is not ready", "blockers": [str(exc)]},
             ) from exc
+        if scenario.id in FROZEN_RDAGENT_SCENARIOS:
+            raise HTTPException(
+                410,
+                f"RD-Agent scenario {scenario.id} is frozen; "
+                "historical runs and artifacts are read-only",
+            )
         if payload.loop_n > settings.rdagent_max_loops:
             raise HTTPException(
                 422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
@@ -6145,6 +6152,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 )
                 runtime = probe_rdagent(settings, project_root)
                 scenario = require_ready_scenario(runtime, settings, research_payload["scenario"])
+                if scenario.id in FROZEN_RDAGENT_SCENARIOS:
+                    raise HTTPException(
+                        410,
+                        f"RD-Agent scenario {scenario.id} is frozen; "
+                        "historical runs and artifacts are read-only",
+                    )
                 scheduled_periods: dict[str, str] | None = None
                 if scenario.requires_dataset:
                     dataset = require_qlib_dataset(

@@ -68,7 +68,7 @@ def test_automatic_acquisition_key_binds_snapshot_and_enabled_sources() -> None:
 
 
 @pytest.mark.no_database
-def test_scheduler_queues_arxiv_when_tushare_snapshot_is_unavailable(
+def test_scheduler_queues_nothing_when_tushare_snapshot_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine = object.__new__(SchedulerEngine)
@@ -93,19 +93,14 @@ def test_scheduler_queues_arxiv_when_tushare_snapshot_is_unavailable(
         missing_snapshot,
     )
 
-    assert engine._enqueue_daily_research_assets(datetime(2026, 8, 20, 13, tzinfo=UTC)) == 1
-    assert calls == [
-        {
-            "research_day": datetime(2026, 8, 20).date(),
-            "snapshot_name": "arxiv-only",
-            "include_tushare": False,
-            "include_arxiv": True,
-        }
-    ]
+    # The arXiv leg fed the frozen general_model scenario; without it a missing
+    # Tushare snapshot simply means no acquisition work for the day.
+    assert engine._enqueue_daily_research_assets(datetime(2026, 8, 20, 13, tzinfo=UTC)) == 0
+    assert calls == []
 
 
 @pytest.mark.no_database
-def test_scheduler_queues_tushare_and_arxiv_as_independent_jobs(
+def test_scheduler_queues_only_the_tushare_research_report_leg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine = object.__new__(SchedulerEngine)
@@ -126,20 +121,14 @@ def test_scheduler_queues_tushare_and_arxiv_as_independent_jobs(
         lambda *_args, **_kwargs: "research-assets-verified",
     )
 
-    assert engine._enqueue_daily_research_assets(datetime(2026, 8, 20, 13, tzinfo=UTC)) == 2
+    assert engine._enqueue_daily_research_assets(datetime(2026, 8, 20, 13, tzinfo=UTC)) == 1
     assert calls == [
-        {
-            "research_day": datetime(2026, 8, 20).date(),
-            "snapshot_name": "arxiv-only",
-            "include_tushare": False,
-            "include_arxiv": True,
-        },
         {
             "research_day": datetime(2026, 8, 20).date(),
             "snapshot_name": "research-assets-verified",
             "include_tushare": True,
             "include_arxiv": False,
-        },
+        }
     ]
 
 

@@ -75,6 +75,7 @@ from .promotion import PromotionStore
 from .rdagent_candidate_store import RDAGentCandidateStore
 from .rdagent_runtime import expected_rdagent_runtime_identity, probe_rdagent
 from .rdagent_scenarios import (
+    FROZEN_RDAGENT_SCENARIOS,
     get_rdagent_scenario,
     require_ready_scenario,
     resolve_rdagent_assets,
@@ -1441,15 +1442,8 @@ class SchedulerEngine:
             return 0
         research_day = local.date()
 
-        # arXiv has no dependency on a Tushare research-report snapshot.  Queue
-        # it first and under its own idempotency key so a missing entitlement,
-        # unavailable report snapshot, or failed Tushare job cannot suppress it.
-        enqueued = self._enqueue_research_asset_source(
-            research_day=research_day,
-            snapshot_name="arxiv-only",
-            include_tushare=False,
-            include_arxiv=True,
-        )
+        # The arXiv leg fed the frozen general_model scenario and is retired.
+        # Only the Tushare research-report leg (fin_factor_report) remains.
         try:
             snapshot_name = latest_verified_research_asset_snapshot(
                 self.settings.data_root,
@@ -1458,8 +1452,8 @@ class SchedulerEngine:
         except (OSError, ValueError):
             # Data publication is independently scheduled.  Do not bind an
             # acquisition job to a missing or unverified Tushare snapshot.
-            return enqueued
-        return enqueued + self._enqueue_research_asset_source(
+            return 0
+        return self._enqueue_research_asset_source(
             research_day=research_day,
             snapshot_name=snapshot_name,
             include_tushare=True,
@@ -2779,6 +2773,18 @@ class SchedulerEngine:
             max_duration=self.settings.rdagent_max_duration,
         )
         scenario = get_rdagent_scenario(payload["scenario"])
+        if scenario.id in FROZEN_RDAGENT_SCENARIOS:
+            # Frozen scenarios keep historical schedules readable, but the
+            # dispatcher must never enqueue new work for them.
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=(
+                    f"RD-Agent scenario {scenario.id} is frozen; "
+                    "historical runs are read-only"
+                ),
+            )
+            return None
         dataset: dict[str, Any] | None = None
         periods: dict[str, str] | None = None
         period_resolution: dict[str, Any] | None = None

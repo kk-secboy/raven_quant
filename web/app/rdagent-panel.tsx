@@ -17,10 +17,18 @@ type ScenarioId =
 type StrategyHorizon = "short" | "swing" | "long";
 
 const HORIZON_RESEARCH_SCENARIOS = new Set<ScenarioId>([
-  "fin_factor",
-  "fin_model",
   "fin_quant",
   "fin_strategy",
+]);
+
+// Weight-reduction phase 1: these scenarios stay readable in run history but
+// are never offered for new research creation.
+const FROZEN_SCENARIOS = new Set<ScenarioId>([
+  "fin_factor",
+  "fin_model",
+  "general_model",
+  "data_science",
+  "llm_finetune",
 ]);
 
 type Runtime = {
@@ -40,6 +48,7 @@ type Scenario = {
   description: string;
   category: "quant" | "lab";
   ready: boolean;
+  frozen?: boolean;
   blockers: string[];
   requires_dataset: boolean;
   requires_assets: boolean;
@@ -242,14 +251,9 @@ type StrategyRecipe = {
 };
 
 const fallbackScenarios: Scenario[] = [
-  { id: "fin_factor", label: "因子研究", description: "自主提出、实现并迭代因子", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, capital_eligible: true, gpu_required: false },
-  { id: "fin_model", label: "模型研究", description: "固定受治理特征集，研究预测模型", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: true, gpu_required: false },
   { id: "fin_quant", label: "联合研究", description: "把因子集与预测模型作为完整组合迭代", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: true, gpu_required: false },
   { id: "fin_strategy", label: "策略规则研究", description: "按长中短周期研究入场、退出、持有与风控规则", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: false, gpu_required: false },
   { id: "fin_factor_report", label: "研报因子", description: "从已验证研报 PDF 中提取因子", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: true, capital_eligible: true, gpu_required: false },
-  { id: "general_model", label: "论文模型实现", description: "从 arXiv 或手工 PDF 实现模型代码", category: "lab", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: false, requires_assets: true, capital_eligible: false, gpu_required: false },
-  { id: "data_science", label: "数据科学", description: "隔离运行通用数据科学实验", category: "lab", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: false, requires_assets: true, capital_eligible: false, gpu_required: false },
-  { id: "llm_finetune", label: "大模型微调", description: "在独立 GPU 队列中训练和评估 LLM", category: "lab", ready: false, blockers: ["正在读取 GPU 能力"], requires_dataset: false, requires_assets: true, capital_eligible: false, gpu_required: true },
 ];
 
 const statusText: Record<string, string> = {
@@ -266,12 +270,15 @@ function normalizeScenarios(value: unknown): Scenario[] {
   const body = value as { scenarios?: unknown };
   const rows = Array.isArray(value) ? value : Array.isArray(body?.scenarios) ? body.scenarios : [];
   if (!rows.length) return fallbackScenarios;
-  return rows.map((row) => {
-    const item = row as Partial<Scenario> & { scenario?: ScenarioId };
-    const id = (item.id ?? item.scenario) as ScenarioId;
-    const fallback = fallbackScenarios.find((entry) => entry.id === id) ?? fallbackScenarios[0];
-    return { ...fallback, ...item, id, blockers: Array.isArray(item.blockers) ? item.blockers : [] };
-  });
+  const active = rows
+    .map((row) => {
+      const item = row as Partial<Scenario> & { scenario?: ScenarioId };
+      const id = (item.id ?? item.scenario) as ScenarioId;
+      const fallback = fallbackScenarios.find((entry) => entry.id === id) ?? fallbackScenarios[0];
+      return { ...fallback, ...item, id, blockers: Array.isArray(item.blockers) ? item.blockers : [] };
+    })
+    .filter((item) => !FROZEN_SCENARIOS.has(item.id) && item.frozen !== true);
+  return active.length ? active : fallbackScenarios;
 }
 
 async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
@@ -348,7 +355,7 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [featureSets, setFeatureSets] = useState<FeatureSet[]>([]);
   const [researchAssets, setResearchAssets] = useState<ResearchAsset[]>([]);
   const [assetAcquisitions, setAssetAcquisitions] = useState<ResearchAssetAcquisition[]>([]);
-  const [scenarioId, setScenarioId] = useState<ScenarioId>("fin_factor");
+  const [scenarioId, setScenarioId] = useState<ScenarioId>("fin_quant");
   const [researchHorizon, setResearchHorizon] = useState<StrategyHorizon | "">("");
   const [recipeId, setRecipeId] = useState("index_enhancement");
   const [dataset, setDataset] = useState("");

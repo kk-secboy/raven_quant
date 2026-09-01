@@ -421,7 +421,7 @@ def test_model_research_uses_each_horizons_calendar_cadence() -> None:
         ) is True
 
 
-def test_factor_cadence_accepts_serialized_database_timestamp() -> None:
+def test_model_cadence_accepts_serialized_database_timestamp() -> None:
     class Store:
         @staticmethod
         def latest_branch(_scenario, *, horizon_profile):
@@ -440,7 +440,7 @@ def test_factor_cadence_accepts_serialized_database_timestamp() -> None:
     controller = AutopilotController.__new__(AutopilotController)
     controller.store = Store()
 
-    assert controller._factor_due(
+    assert controller._model_due(
         {"end_date": "2026-08-31"},
         datetime(2026, 8, 29, 12, tzinfo=UTC),
         normalize_autopilot_config(),
@@ -591,7 +591,6 @@ def test_new_daily_snapshot_continues_same_cadence_immutable_cycle(
     controller = AutopilotController.__new__(AutopilotController)
     controller.settings = SimpleNamespace(data_root="unused")
     controller.store = Store()
-    controller._factor_due = lambda *_args, **_kwargs: False
     controller._model_due = lambda *_args, **_kwargs: False
 
     def roll_forward(cycle, bound_dataset):
@@ -692,7 +691,6 @@ def test_same_cadence_dataset_contract_migration_supersedes_obsolete_cycle(
     controller = AutopilotController.__new__(AutopilotController)
     controller.settings = SimpleNamespace(data_root="unused")
     controller.store = Store()
-    controller._factor_due = lambda *_args, **_kwargs: False
     controller._model_due = lambda *_args, **_kwargs: False
 
     def roll_forward(cycle, bound_dataset):
@@ -727,7 +725,7 @@ def test_missing_factor_branch_is_not_retried() -> None:
     assert controller._retry_failed_branch(None) is False
 
 
-def test_factor_model_and_quant_runs_bind_each_horizons_primary_label(
+def test_quant_runs_bind_each_horizons_primary_label(
     tmp_path, monkeypatch
 ) -> None:
     calendar = tmp_path / "calendars"
@@ -852,7 +850,8 @@ def test_factor_model_and_quant_runs_bind_each_horizons_primary_label(
             "primary_label_policy_sha256": policy["policy_sha256"],
             "state": {"primary_label_policy": policy},
         }
-        for scenario in ("fin_factor", "fin_model", "fin_quant"):
+        # fin_factor/fin_model are frozen; only fin_quant keeps this binding.
+        for scenario in ("fin_quant",):
             controller._enqueue(
                 cycle,
                 dataset,

@@ -54,6 +54,7 @@ from .platform_config_store import PlatformConfigStore
 from .platform_model_tournament import PlatformModelTournamentService
 from .rdagent_runtime import expected_rdagent_runtime_identity, probe_rdagent
 from .rdagent_scenarios import (
+    FROZEN_RDAGENT_SCENARIOS,
     get_rdagent_scenario,
     require_ready_scenario,
     resolve_rdagent_assets,
@@ -1289,9 +1290,10 @@ class AutopilotController:
                 "branches": created,
                 "failed": failed + int(cycle.get("status") == "blocked"),
             }
-        factor_due = research_contract_migration or self._factor_due(
-            dataset, current, config, horizon_profile=horizon_profile
-        )
+        # The fin_factor/fin_model scenarios are frozen, so neither an RD-Agent
+        # factor branch nor an RD-Agent model challenger starts any more.  The
+        # platform model tournament cadence alone decides whether this
+        # immutable publication begins a new research event.
         model_due = research_contract_migration or self._model_due(
             dataset, current, config, horizon_profile=horizon_profile
         )
@@ -1299,7 +1301,7 @@ class AutopilotController:
         research_already_started = bool(cycle.get("branches")) or bool(
             (cycle.get("state") or {}).get("research_tournament_id")
         )
-        if not factor_due and not model_due and not research_already_started:
+        if not model_due and not research_already_started:
             self.store.set_cycle_state(
                 str(cycle["id"]),
                 state={
@@ -1365,15 +1367,6 @@ class AutopilotController:
             )
         except KeyError:
             tournament = None
-        factor_branch = self.store.branch_for_scope(cycle["id"], "fin_factor", "daily")
-        if factor_due and factor_branch is None:
-            try:
-                self._enqueue(cycle, dataset, "fin_factor", "daily", config=config)
-                created += 1
-            except ValueError:
-                failed += 1
-        elif factor_branch is not None and self._retry_failed_branch(factor_branch):
-            created += 1
         if tournament is not None:
             platform_created, platform_failed = self._ensure_platform_model_branches(
                 cycle,
@@ -1400,12 +1393,6 @@ class AutopilotController:
                 self._reconcile_model_tournament(
                     self.store.get_cycle(str(cycle["id"])),
                     self._active_model_tournament(cycle),
-                )
-                created += self._enqueue_next_rdagent_model_challenger(
-                    self.store.get_cycle(str(cycle["id"])),
-                    dataset,
-                    selected_feature_set_ids,
-                    config=config,
                 )
                 self._reconcile_dynamic_model_trials(
                     self.store.get_cycle(str(cycle["id"])),
@@ -1947,19 +1934,6 @@ class AutopilotController:
             candidates,
             key=lambda item: (str(item.get("end_date") or ""), str(item["name"])),
             default=None,
-        )
-
-    def _factor_due(
-        self,
-        dataset: dict[str, Any],
-        now: datetime,
-        config: dict[str, Any],
-        *,
-        horizon_profile: str = SHORT_1_5D,
-    ) -> bool:
-        del now, config
-        return self._horizon_branch_due(
-            "fin_factor", dataset, horizon_profile=horizon_profile
         )
 
     def _model_due(
@@ -3411,69 +3385,6 @@ class AutopilotController:
         )
         return selected_features
 
-    def _enqueue_next_rdagent_model_challenger(
-        self,
-        cycle: dict[str, Any],
-        dataset: dict[str, Any],
-        feature_set_ids: list[str],
-        *,
-        config: dict[str, Any],
-    ) -> int:
-        if not feature_set_ids:
-            return 0
-        tournament = self._active_model_tournament(cycle)
-        remediation = dict(
-            (tournament.get("manifest") or {}).get("operational_remediation") or {}
-        )
-        branches = self.store.get_cycle(str(cycle["id"]))["branches"]
-        rdagent_branches = [
-            item
-            for item in branches
-            if item["scenario"] == "fin_model"
-            and not str((item.get("details") or {}).get("branch_kind") or "").startswith(
-                "platform_model_"
-            )
-            and (
-                not remediation
-                or str(
-                    (item.get("details") or {}).get("research_tournament_id")
-                    or ""
-                )
-                == str(tournament["id"])
-            )
-        ]
-        active = next(
-            (
-                item
-                for item in rdagent_branches
-                if item["status"] in {"queued", "running", "evaluating"}
-            ),
-            None,
-        )
-        if active is not None:
-            return 0
-        for branch in rdagent_branches:
-            if branch["status"] == "failed" and self._retry_failed_branch(branch):
-                return 1
-        existing_scopes = {str(item["scope_key"]) for item in rdagent_branches}
-        for feature_set_id in feature_set_ids:
-            scope = f"monthly:{feature_set_id}"
-            if remediation:
-                scope += f":remediation:{str(tournament['id'])[:16]}"
-            if scope in existing_scopes:
-                continue
-            self._enqueue(
-                cycle,
-                dataset,
-                "fin_model",
-                scope,
-                config=config,
-                feature_set_id=feature_set_id,
-                tournament_id=str(tournament["id"]),
-            )
-            return 1
-        return 0
-
     def _model_champions(
         self,
         cycle: dict[str, Any],
@@ -3482,10 +3393,11 @@ class AutopilotController:
     ) -> list[dict[str, Any]]:
         """Freeze one pre-final champion per model family.
 
-        Platform models and RD-Agent challengers share this comparison.  The
-        function waits for both platform full lanes and the two bounded
-        RD-Agent lanes; failures remain counted trials and do not create an
-        opportunity to substitute an unregistered experiment.
+        The platform full lanes own this comparison now that the fin_model
+        scenario is frozen: no new RD-Agent challenger lane is expected or
+        waited for, and historical monthly challenger branches neither block
+        nor extend the gate.  Failures remain counted trials and do not
+        create an opportunity to substitute an unregistered experiment.
         """
 
         state = dict(cycle.get("state") or {})
@@ -3560,37 +3472,10 @@ class AutopilotController:
             item
             for item in branches
             if item["scenario"] == "fin_model"
-            and (
-                (item.get("details") or {}).get("branch_kind")
-                == "platform_model_model_full"
-                or str(item.get("scope_key") or "").startswith("monthly:")
-            )
-            and (
-                (
-                    str((item.get("details") or {}).get("branch_kind") or "").startswith(
-                        "platform_model_"
-                    )
-                    and str((item.get("details") or {}).get("tournament_id") or "")
-                    == str(tournament["id"])
-                )
-                or (
-                    not str(
-                        (item.get("details") or {}).get("branch_kind") or ""
-                    ).startswith("platform_model_")
-                    and (
-                        not (tournament.get("manifest") or {}).get(
-                            "operational_remediation"
-                        )
-                        or str(
-                            (item.get("details") or {}).get(
-                                "research_tournament_id"
-                            )
-                            or ""
-                        )
-                        == str(tournament["id"])
-                    )
-                )
-            )
+            and (item.get("details") or {}).get("branch_kind")
+            == "platform_model_model_full"
+            and str((item.get("details") or {}).get("tournament_id") or "")
+            == str(tournament["id"])
             and str((item.get("details") or {}).get("feature_set_id") or "")
             in selected_set
         ]
@@ -3600,11 +3485,7 @@ class AutopilotController:
             else ""
         )
         expected_scopes = {
-            *(
-                f"platform:model_full:{item}{remediation_suffix}"
-                for item in selected_set
-            ),
-            *(f"monthly:{item}{remediation_suffix}" for item in selected_set),
+            f"platform:model_full:{item}{remediation_suffix}" for item in selected_set
         }
         if {str(item["scope_key"]) for item in relevant} != expected_scopes:
             return []
@@ -4817,6 +4698,10 @@ class AutopilotController:
         branch_details: dict[str, Any] | None = None,
     ) -> None:
         scenario = get_rdagent_scenario(scenario_id)
+        if scenario.id in FROZEN_RDAGENT_SCENARIOS:
+            # Fail closed even if a future caller forgets the freeze: callers
+            # count this ValueError as a failed branch, never as new work.
+            raise ValueError(f"RD-Agent scenario {scenario.id} is frozen")
         runtime = probe_rdagent(self.settings, Path(__file__).resolve().parents[2])
         require_ready_scenario(runtime, self.settings, scenario_id)
         calendar = (

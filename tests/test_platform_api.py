@@ -477,6 +477,10 @@ def test_api_creates_bounded_rdagent_research_run(
         "RDAGENT_QLIB_SANDBOX_IMAGE",
         "registry.example/rdagent-qlib@sha256:" + "1" * 64,
     )
+    monkeypatch.setenv(
+        "MODEL_SANDBOX_IMAGE",
+        "registry.example/model-sandbox@sha256:" + "4" * 64,
+    )
     runtime_identity = {
         "name": "rdagent",
         "version": "test-runtime",
@@ -496,7 +500,15 @@ def test_api_creates_bounded_rdagent_research_run(
         "qlib_smoke_passed": True,
         "evaluation_worker": {
             "ready": True,
-            "job_kinds": ["factor_evaluate"],
+            "job_kinds": [
+                "factor_evaluate",
+                "model_evaluate",
+                "quant_bundle_evaluate",
+            ],
+            "model_sandbox_ready": True,
+            "model_sandbox_config_sha256": (
+                "71c2f13d9116c3749bf31344038ecfa02d9d905ef89fcf2ee6811aa26243690d"
+            ),
         },
         "runtime_identity": runtime_identity,
     }
@@ -510,12 +522,57 @@ def test_api_creates_bounded_rdagent_research_run(
             "/api/rdagent/runs",
             json={
                 "objective": "Find low-turnover quality factors for CSI 300 enhancement.",
+                "scenario": "fin_quant",
+                "dataset": "research-snapshot",
+                "feature_set_id": "governed-baseline",
+                "horizon": "short",
+                "loop_n": 1,
+                "duration": "30m",
+            },
+        )
+        frozen_run = client.post(
+            "/api/rdagent/runs",
+            json={
+                "objective": "Frozen scenarios must not accept new runs.",
                 "scenario": "fin_factor",
                 "dataset": "research-snapshot",
                 "feature_set_id": "governed-baseline",
                 "horizon": "short",
                 "loop_n": 1,
                 "duration": "30m",
+            },
+        )
+        frozen_model_run = client.post(
+            "/api/rdagent/runs",
+            json={
+                "objective": "Frozen scenarios must not accept new runs.",
+                "scenario": "fin_model",
+                "dataset": "research-snapshot",
+                "feature_set_id": "governed-baseline",
+                "horizon": "short",
+                "loop_n": 1,
+                "duration": "30m",
+            },
+        )
+        frozen_schedule = client.post(
+            "/api/schedules",
+            json={
+                "name": "frozen scenario schedule",
+                "kind": "rdagent_research",
+                "timezone": "Asia/Shanghai",
+                "run_time": "20:30",
+                "trading_days_only": True,
+                "payload": {
+                    "objective": "Frozen scenarios must not accept new schedules.",
+                    "scenario": "fin_factor",
+                    "dataset": "research-snapshot",
+                    "feature_set_id": "governed-baseline",
+                    "horizon": "short",
+                    "loop_n": 1,
+                    "duration": "30m",
+                },
+                "misfire_grace_seconds": 1800,
+                "actor": "operator",
             },
         )
         scheduled = client.post(
@@ -528,7 +585,7 @@ def test_api_creates_bounded_rdagent_research_run(
                 "trading_days_only": True,
                 "payload": {
                     "objective": "Find low-turnover quality factors for CSI 300 enhancement.",
-                    "scenario": "fin_factor",
+                    "scenario": "fin_quant",
                     "dataset": "research-snapshot",
                     "feature_set_id": "governed-baseline",
                     "horizon": "short",
@@ -560,6 +617,12 @@ def test_api_creates_bounded_rdagent_research_run(
     assert scheduled.status_code == 201
     assert scheduled.json()["kind"] == "rdagent_research"
     assert scheduled.json()["payload"]["requested_by"] == "local-admin"
+    assert frozen_run.status_code == 410
+    assert "frozen" in frozen_run.json()["detail"]
+    assert frozen_model_run.status_code == 410
+    assert "frozen" in frozen_model_run.json()["detail"]
+    assert frozen_schedule.status_code == 410
+    assert "frozen" in frozen_schedule.json()["detail"]
     assert program.status_code == 410
     assert "legacy research programs are retired" in program.json()["detail"]
     assert programs == []

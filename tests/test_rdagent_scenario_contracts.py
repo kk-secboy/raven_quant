@@ -221,9 +221,11 @@ def test_only_strategy_research_accepts_an_incumbent_binding() -> None:
         )
 
 
-def test_factor_worker_keeps_research_horizon_without_strategy_binding(
+def test_report_worker_keeps_research_horizon_without_strategy_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The legacy fin_factor lane is frozen, so this horizon-passthrough
+    # contract is exercised on the retained fin_factor_report scenario instead.
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
@@ -258,19 +260,21 @@ def test_factor_worker_keeps_research_horizon_without_strategy_binding(
         ]
     )
     payload = {
-        "scenario": "fin_factor",
-        "research_run_id": "factor-short-1",
+        "scenario": "fin_factor_report",
+        "research_run_id": "report-short-1",
         "dataset_path": str(tmp_path / "dataset"),
         "loop_n": 1,
         "duration": "1h",
         "periods": {},
-        "objective": "Research a governed short-horizon factor.",
+        "objective": "Extract governed report factors for the short horizon.",
         "feature_set": {"id": "governed-baseline"},
         "horizon_profile": "short_1_5d",
+        "asset_ids": ["governed-report-1"],
+        "asset_manifest_sha256": {"governed-report-1": "b" * 64},
     }
 
     command, _result_path, environment = worker._command(
-        {"kind": "rdagent_factor", "payload": payload}
+        {"kind": "rdagent_factor_report", "payload": payload}
     )
 
     assert command == ["rdagent"]

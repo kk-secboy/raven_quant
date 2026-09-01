@@ -32,6 +32,14 @@ RDAGENT_JOB_KINDS = frozenset(
     }
 )
 
+# Weight-reduction phase 1: these scenarios stay registered so historical
+# runs, governed assets, and the public catalog remain readable, but no new
+# run may be scheduled, created through the API, or executed by a worker.
+# A later phase physically deletes them; do not remove the registry entries.
+FROZEN_RDAGENT_SCENARIOS = frozenset(
+    {"fin_factor", "fin_model", "general_model", "data_science", "llm_finetune"}
+)
+
 _ASSET_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,95}$")
 _FEATURE_SET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -667,6 +675,7 @@ def rdagent_scenario_catalog(
                 "label": scenario.label,
                 "description": _DESCRIPTIONS[scenario.id],
                 "category": scenario.category,
+                "frozen": scenario.id in FROZEN_RDAGENT_SCENARIOS,
                 "ready": not blockers,
                 "blockers": blockers,
                 "requires_dataset": scenario.requires_dataset,
