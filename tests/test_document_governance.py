@@ -170,7 +170,7 @@ def test_readme_declares_the_document_and_technical_authorities() -> None:
     assert "区间不得早于成本制度首个有效交易日" in readme
     assert "唯一自动资本入口是受管 `fin_strategy` 的 settlement" in readme
     assert "`AutopilotCapitalPipeline`" in readme
-    assert "旧 `/api/research-programs` 与 `/api/research-campaigns` 只保留历史 GET 查询" in readme
+    assert "旧 `/api/research-programs` 与 `/api/research-campaigns` 端点已物理删除" in readme
     assert "Loop、Hypothesis、Feedback 和 Trace 摘要" in readme
     assert "本 README 只提供项目入口和" in readme
     assert "不定义另一套产品方案" in readme
@@ -221,15 +221,17 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "不得因为缺少已批准旧策略而形成“先有正式策略才能研究新策略”的循环等待",
         "`fin-strategy-signal-binding-v1`",
         "唯一自动资本入口是受管 `fin_strategy` settlement",
-        "旧 `AutopilotCapitalPipeline` 及既有 `capital_pipeline` 状态永久标记为 `legacy_readonly`",
+        "旧 `AutopilotCapitalPipeline` 代码已物理删除，既有 `capital_pipeline` "
+        "状态永久标记为 `legacy_readonly`",
         "LLM 不能替换分数源",
         "不得早于对应成本制度首个有效交易日",
         "`StrategyProposal`",
         "确定性编译",
         "`strategy-rule-ir-v1`",
         "`SOTA` 只表示官方研究 Trace 中的当前最好实验",
-        "旧 `research_program/research_campaign` 记录只保留 `legacy_readonly` 历史查询",
-        "创建、状态修改、重试和调度入口一律返回 410",
+        "旧 `research_program/research_campaign` 的创建、状态修改、重试、调度与历史查询 API "
+        "端点已物理删除",
+        "记录只在数据库表中保留 `legacy_readonly` 历史",
         "日常推荐只执行编译后的规则 IR，绝不运行 LLM 代码",
         "每个周期只冻结一份活动冠军因子包",
         "每个周期同一时点最多保留一个活动策略和两个隔离的 `paper_validating` 影子挑战者",

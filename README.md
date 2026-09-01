@@ -100,7 +100,7 @@ manifest、成功 work-unit ledger、原始单元 SHA/行数与封印投影全�
 
 平台在同一套不可变数据、作业、制品和审计框架中登记八个场景；其中三个保留场景照常
 自动调度、创建和执行，五个冻结场景不再调度、不能通过 API 创建、worker 拒绝执行，
-历史运行与制品全部保留只读（冻结是减重第一阶段，后续阶段才物理删除）。
+历史运行与制品全部保留只读。
 
 保留场景：
 
@@ -131,12 +131,12 @@ RD-Agent 因子组成的冠军因子包，并限制为一个活动策略和最�
 
 Autopilot 的现行权限到 `fin_factor/fin_model/fin_quant` 研究、独立准入和只读冠军选择
 为止；它不会创建 `StrategyVersion`、正式 OOS、批准或模拟账户。旧
-`AutopilotCapitalPipeline` 及数据库中已有的 `capital_pipeline` 状态统一标记为
-`legacy_readonly`，只保留历史查询和审计，不再由 API、scheduler 或 Autopilot 实例化、
-推进或补跑。唯一自动资本入口是受管 `fin_strategy` 的 settlement：规则候选依次完成
+`AutopilotCapitalPipeline` 代码已物理删除；数据库中已有的 `capital_pipeline` 状态统一
+标记为 `legacy_readonly`，只保留历史查询和审计，API、scheduler 和 Autopilot 不存在
+实例化、推进或补跑入口。唯一自动资本入口是受管 `fin_strategy` 的 settlement：规则候选依次完成
 `policy_only → full_stack → 正式 OOS → paper_validating`，任一步失败都保持现金且不会
-退回旧资本链。旧的 standalone transparent-baseline bootstrap 也不再由 scheduler 自动
-推进；三套公开基线只在同一个 `fin_strategy` 竞赛里充当对照组。
+退回旧资本链。旧的 standalone transparent-baseline bootstrap 已随退役线物理删除；
+三套公开基线只在同一个 `fin_strategy` 竞赛里充当对照组。
 简单模式先输出冲突净额后的唯一账户操作清单，三周期结果仅作为可折叠来源解释。
 平衡型个人账户的默认周期预算为短线 20%、中线 50%、长线 30%，再统一应用
 账户现金、单票、行业和总风险上限；缺失周期的预算保留现金，不向其他周期重分配。
@@ -144,10 +144,11 @@ Autopilot 的现行权限到 `fin_factor/fin_model/fin_quant` 研究、独立准
 Loop、Hypothesis、Feedback 和 Trace 摘要；原始 pickle、路径、代码和凭据不对 Web
 开放。诊断按钮也不替代生产 readiness。项目不连接真实券商，模拟结果不会自动触发实盘。
 
-旧 `/api/research-programs` 与 `/api/research-campaigns` 只保留历史 GET 查询，全部写入、
-状态修改、重试和调度入口返回 410；上游因子/模型/联合研究只由 `/api/autopilot` 编排，
-受管 `fin_strategy` 调度在同一主线中承接唯一策略资本结算，不另建控制面。配对交易算法
-只保留离线研究代码，生产 API、scheduler 和 worker 均不能创建配对回测、影子账户或订单。
+旧 `/api/research-programs` 与 `/api/research-campaigns` 端点已物理删除，历史记录只保留
+在数据库表中只读可查；上游因子/模型/联合研究只由 `/api/autopilot` 编排，
+受管 `fin_strategy` 调度在同一主线中承接唯一策略资本结算，不另建控制面。配对交易代码已
+物理删除，生产 API、scheduler 和 worker 不存在配对回测、影子账户或订单入口，数据库
+历史记录保留只读。
 
 ## Docker 部署
 
