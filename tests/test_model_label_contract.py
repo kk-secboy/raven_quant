@@ -176,6 +176,14 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
             "feature_set": feature_set,
             "evaluation_stage": "feature_screen",
             "evaluation_profiles": [{"id": "recent_3y"}],
+            "research_tournament_id": "tournament-1",
+            "candidate_bindings": [
+                {
+                    "candidate_id": "candidate-1",
+                    "model_family": "lightgbm",
+                    "trial_id": "trial-1",
+                }
+            ],
             "candidates": [
                 {
                     "id": "candidate-1",
@@ -206,3 +214,11 @@ def test_worker_freezes_research_window_and_selected_label_in_model_manifest(
     assert manifest["label_horizon_sessions"] == 63
     assert manifest["evaluation_stage"] == "feature_screen"
     assert manifest["evaluation_profiles"] == [{"id": "recent_3y"}]
+    assert manifest["research_tournament_id"] == "tournament-1"
+    assert manifest["candidate_bindings"] == [
+        {
+            "candidate_id": "candidate-1",
+            "model_family": "lightgbm",
+            "trial_id": "trial-1",
+        }
+    ]

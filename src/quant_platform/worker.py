@@ -3562,6 +3562,19 @@ class LocalJobWorker:
                         "label_horizon_sessions": payload[
                             "label_horizon_sessions"
                         ],
+                        **(
+                            {
+                                "research_tournament_id": payload[
+                                    "research_tournament_id"
+                                ],
+                                "candidate_bindings": payload[
+                                    "candidate_bindings"
+                                ],
+                            }
+                            if str(payload.get("evaluation_stage") or "")
+                            == "feature_screen"
+                            else {}
+                        ),
                     }
                     if job["kind"] == "model_evaluate"
                     else {}

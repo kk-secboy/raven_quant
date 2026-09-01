@@ -66,6 +66,32 @@ def main() -> None:
         str(item.get("id")) for item in profiles
     } != expected_profiles:
         raise ValueError("model evaluation profiles do not match its tournament stage")
+    if evaluation_stage == "feature_screen":
+        tournament_id = str(manifest.get("research_tournament_id") or "")
+        candidate_ids = {
+            str(item.get("id") or "") for item in manifest.get("candidates") or []
+        }
+        bindings = manifest.get("candidate_bindings") or []
+        bound_candidate_ids = {
+            str(item.get("candidate_id") or "")
+            for item in bindings
+            if isinstance(item, dict)
+        }
+        trial_ids = {
+            str(item.get("trial_id") or "")
+            for item in bindings
+            if isinstance(item, dict)
+        }
+        if (
+            not tournament_id
+            or not candidate_ids
+            or "" in candidate_ids
+            or len(bindings) != len(candidate_ids)
+            or bound_candidate_ids != candidate_ids
+            or len(trial_ids) != len(candidate_ids)
+            or "" in trial_ids
+        ):
+            raise ValueError("feature-screen tournament identity is missing or incomplete")
     valid_ends = {str(item["periods"]["valid_end"]) for item in profiles}
     test_windows = {
         (str(item["periods"]["test_start"]), str(item["periods"]["test_end"]))
