@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, insert, select, update
 
 from quant_data.config import Settings
 from quant_data.database import (
+    jobs,
     model_candidates,
     open_database,
+    research_events,
     research_run_artifacts,
     research_runs,
 )
@@ -44,6 +46,83 @@ class PlatformModelTournamentService:
         self.research = ResearchStore(settings.database_url)
         self.candidates = RDAGentCandidateStore(settings.database_url)
         self.project_root = Path(__file__).resolve().parents[2]
+
+    def fail_unattached_lane(
+        self,
+        *,
+        cycle_id: str,
+        dataset_name: str,
+        stage: str,
+        feature_set_id: str,
+        horizon_profile: str,
+        error: str,
+    ) -> bool:
+        """Terminalize a lane setup failure only before a job exists.
+
+        ``ensure_lane`` persists its ResearchRun before artifact and job setup.
+        A validation error in that gap used to leave a permanently active run
+        that blocked the same lane kind in future cycles.  The caller has the
+        exact exception, but this method still fails closed if any job was
+        created or attached concurrently.
+        """
+
+        run_kind = (
+            f"platform_model_{stage}_{_safe_scope_token(feature_set_id)}_"
+            f"{horizon_profile}"
+        )
+        requested_by = f"autopilot:{cycle_id}"
+        now = datetime.now(UTC)
+        with self.engine.begin() as connection:
+            run = connection.execute(
+                select(research_runs)
+                .where(
+                    research_runs.c.kind == run_kind,
+                    research_runs.c.dataset == dataset_name,
+                    research_runs.c.requested_by == requested_by,
+                )
+                .with_for_update()
+            ).first()
+            if (
+                run is None
+                or str(run.status) not in {"queued", "running", "evaluating"}
+                or run.job_id is not None
+            ):
+                return False
+            payload_jobs = connection.scalar(
+                select(func.count())
+                .select_from(jobs)
+                .where(jobs.c.payload_json["research_run_id"].as_string() == run.id)
+            )
+            if payload_jobs:
+                return False
+            result = connection.execute(
+                update(research_runs)
+                .where(
+                    research_runs.c.id == run.id,
+                    research_runs.c.status == run.status,
+                    research_runs.c.job_id.is_(None),
+                    research_runs.c.updated_at == run.updated_at,
+                )
+                .values(
+                    status="failed",
+                    error=error,
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                return False
+            connection.execute(
+                insert(research_events).values(
+                    research_run_id=str(run.id),
+                    factor_candidate_id=None,
+                    event_type="run.failed",
+                    actor="autopilot",
+                    payload_json={"error": error, "stage": "lane_initialization"},
+                    created_at=now,
+                )
+            )
+        return True
 
     def ensure_lane(
         self,

@@ -174,7 +174,6 @@ def test_scheduler_reconcile_lanes_are_throttled_and_isolated(monkeypatch) -> No
     current = datetime(2026, 8, 29, 2, 0, tzinfo=UTC)
     engine = object.__new__(SchedulerEngine)
     engine._last_fin_strategy_schedule_reconcile_at = None
-    engine._last_transparent_baseline_reconcile_at = None
     engine.schedules = object()
     engine.settings = SimpleNamespace(rdagent_enabled=True)
 
@@ -185,24 +184,18 @@ def test_scheduler_reconcile_lanes_are_throttled_and_isolated(monkeypatch) -> No
             self.records.append(values)
 
     engine.alerts = Alerts()
-    calls = {"schedules": 0, "baselines": 0}
+    calls = {"schedules": 0}
 
     def schedules(*_args, **_kwargs) -> list[dict]:
         calls["schedules"] += 1
         return [{}, {}, {}]
 
-    def baselines(_settings) -> dict:
-        calls["baselines"] += 1
-        return {"status": "no_op", "errors": [], "members": []}
-
     monkeypatch.setattr(module, "reconcile_managed_fin_strategy_schedules", schedules)
-    monkeypatch.setattr(module, "reconcile_transparent_baselines", baselines)
 
     assert engine._reconcile_default_fin_strategy_schedules(current) == 3
     assert engine._reconcile_default_fin_strategy_schedules(current) == 0
-    assert engine._reconcile_transparent_baselines(current) == (1, 0)
-    assert engine._reconcile_transparent_baselines(current) == (0, 0)
-    assert calls == {"schedules": 1, "baselines": 1}
+    assert not hasattr(SchedulerEngine, "_reconcile_transparent_baselines")
+    assert calls == {"schedules": 1}
     assert engine.alerts.records == []
 
 

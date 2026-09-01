@@ -8,6 +8,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .factor_score_champion import (
+    factor_score_champion_baseline_definition,
+    factor_score_champion_feature_set,
+    validate_factor_score_champion_contract,
+)
+
 CORE_BASELINE_RECIPE_IDS = frozenset(
     {"index_enhancement", "full_market_multifactor"}
 )
@@ -117,6 +123,39 @@ def bind_factor_source_config(
     recipe_id = str(bound.get("recipe_id") or "custom")
     mode = str(bound.get("factor_source_mode") or FACTOR_SOURCE_PROMOTED_ONLY)
     challenger_weight = float(bound.get("challenger_weight") or 0.0)
+
+    raw_factor_champion = bound.get("factor_score_champion_contract")
+    if raw_factor_champion is not None:
+        champion = validate_factor_score_champion_contract(raw_factor_champion)
+        champion_sha256 = str(champion["contract_sha256"])
+        definition = factor_score_champion_baseline_definition(champion)
+        feature_set = factor_score_champion_feature_set(champion)
+        expected_definition_sha256 = canonical_sha256(definition)
+        if (
+            mode != FACTOR_SOURCE_QLIB_BASELINE
+            or factor_count != 0
+            or challenger_weight != 0.0
+            or bound.get("factor_score_champion_contract_sha256")
+            != champion_sha256
+            or bound.get("feature_set_id") != feature_set["id"]
+            or bound.get("feature_set_definition_sha256")
+            != feature_set["definition_sha256"]
+            or bound.get("baseline_definition") != definition
+            or bound.get("baseline_definition_sha256")
+            != expected_definition_sha256
+        ):
+            raise ValueError("factor champion score configuration is not immutable")
+        bound.update(
+            {
+                "factor_source_mode": FACTOR_SOURCE_QLIB_BASELINE,
+                "challenger_weight": 0.0,
+                "baseline_definition": definition,
+                "baseline_definition_sha256": expected_definition_sha256,
+                "factor_score_champion_contract": champion,
+                "factor_score_champion_contract_sha256": champion_sha256,
+            }
+        )
+        return bound
 
     if recipe_id not in QLIB_BASELINE_RECIPE_IDS:
         if mode != FACTOR_SOURCE_PROMOTED_ONLY:

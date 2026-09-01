@@ -187,6 +187,7 @@ from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
 from .strategy_research_signal_binding import (
     build_strategy_research_signal_binding,
+    research_feature_set_for_champion_selection,
 )
 from .strategy_rule_compiler import validate_strategy_rule_binding
 from .strategy_store import StrategyStore
@@ -3538,12 +3539,27 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/autopilot")
     def get_autopilot() -> dict[str, Any]:
         config, revision = autopilot.config()
-        cycles = autopilot.store.list_cycles(limit=20)
-        # A long-running research/OOS cycle remains the operator's current
-        # object even if a newer terminal history row exists.  Showing the
-        # first row unconditionally made an active cycle appear to stop.
+        cycles = []
+        for stored_cycle in autopilot.store.list_cycles(limit=20):
+            cycle = dict(stored_cycle)
+            legacy_capital_state = isinstance(
+                dict(cycle.get("state") or {}).get("capital_pipeline"), dict
+            )
+            cycle["authority_scope"] = (
+                "legacy_readonly" if legacy_capital_state else "research_only"
+            )
+            cycle["capital_entry"] = "fin_strategy_settlement"
+            cycles.append(cycle)
+        # A long-running research cycle remains the operator's current object
+        # even if a newer terminal history row exists.  Old capital rows are
+        # visible but cannot become the current writable cycle.
         current_cycle = next(
-            (item for item in cycles if item["status"] in {"active", "paused"}),
+            (
+                item
+                for item in cycles
+                if item["status"] in {"active", "paused"}
+                and item["authority_scope"] != "legacy_readonly"
+            ),
             cycles[0] if cycles else None,
         )
         current_tournament = None
@@ -3554,20 +3570,24 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 )
             except KeyError:
                 pass
-        current_stage = str((current_cycle or {}).get("stage") or "waiting_for_data")
+        recorded_stage = str(
+            (current_cycle or {}).get("stage") or "waiting_for_data"
+        )
+        current_stage = (
+            "legacy_readonly"
+            if (current_cycle or {}).get("authority_scope") == "legacy_readonly"
+            else recorded_stage
+        )
         next_action = {
             "waiting_for_data": "等待新的已验证日线数据快照",
             "parallel_research": "并行完成因子、模型和研报研究",
             "feature_screen": "用固定 LightGBM 从四套因子库筛选前两套",
             "model_full": "四类 CPU 模型在前两套特征上完成三窗口验证",
             "ensemble": "比较跨家族等权 Rank 集成并冻结模型冠军",
-            "joint_optimization": "运行 fin_quant 三组消融并冻结唯一 bundle",
-            "portfolio_selection": "在预最终区间比较 TopK 与行业中性 QP",
-            "formal_backtest": "唯一冻结冠军一次性消费正式 OOS",
-            "final_oos": "唯一冻结冠军一次性消费正式 OOS",
-            "capital_gate_blocked": "检查组合、正式 OOS 或模拟账户的硬门禁阻断",
-            "paper": "自动更新模拟盘、模拟候选、目标仓位与 NAV",
-            "complete": "按新数据继续日常推理，按月滚动重训",
+            "joint_optimization": "运行 fin_quant 消融并冻结研究冠军",
+            "research_complete": "等待受管 fin_strategy 研究与资本门禁结算",
+            "complete": "等待下一研究周期；策略资本入口由 fin_strategy 结算",
+            "legacy_readonly": "旧 Autopilot 资本记录仅供查询；新资本工作只走 fin_strategy",
         }.get(current_stage, "处理当前阻断后继续自动驾驶")
         return _sanitize_public_value(
             {
@@ -3575,7 +3595,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "revision": revision,
                 "state": (
                     "running"
-                    if config["enabled"] and any(item["status"] == "active" for item in cycles)
+                    if config["enabled"]
+                    and any(
+                        item["status"] == "active"
+                        and item["authority_scope"] != "legacy_readonly"
+                        for item in cycles
+                    )
                     else "idle"
                     if config["enabled"]
                     else "paused"
@@ -3583,6 +3608,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "current_cycle": current_cycle,
                 "current_stage": current_stage,
                 "next_action": next_action,
+                "capital_authority": {
+                    "automatic_entry": "fin_strategy_settlement",
+                    "legacy_autopilot_capital_pipeline": "legacy_readonly",
+                    "autopilot_scope": "factor_model_fin_quant_research_and_champion_selection",
+                },
                 "tournament": current_tournament,
                 "cycles": cycles,
                 "report_backfill": research_report_backfill.summary(),
@@ -4459,7 +4489,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 raise HTTPException(409, "fin_strategy governed inputs are incomplete")
             try:
                 champion_selection = (
-                    autopilot.capital_pipeline.completion.select_champion(
+                    autopilot.champion_selector.select_champion(
                         dataset=str(dataset["name"]),
                         dataset_identity_sha256=str(
                             dataset["provenance"]["dataset_identity_sha256"]
@@ -4477,6 +4507,22 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     ) from exc
                 champion_selection = None
             try:
+                feature_set = research_feature_set_for_champion_selection(
+                    feature_set,
+                    champion_selection,
+                )
+                # The selected factor champion owns a different immutable
+                # expression grid than the public recipe. Re-resolve the
+                # research contract before launching RD-Agent so its YAML,
+                # rule allowlist and later score materialization all bind the
+                # same effective features.
+                periods, period_resolution = resolve_dataset_research_periods(
+                    dataset,
+                    periods=None,
+                    period_policy=payload.period_policy,
+                    horizon_profile=research_horizon_profile,
+                    feature_set=feature_set,
+                )
                 strategy_research_signal_binding = (
                     build_strategy_research_signal_binding(
                         horizon_profile=research_horizon_profile,

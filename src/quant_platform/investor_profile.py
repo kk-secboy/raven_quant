@@ -29,6 +29,7 @@ from quant_platform.market_rules import (
 from quant_platform.research_horizon import canonical_sha256
 
 INVESTOR_SIMULATION_PROFILE_VERSION = "investor-simulation-profile-v1"
+INVESTOR_PROFILE_BINDING_VERSION = "paper-investor-profile-binding-v1"
 RISK_PROFILES = frozenset({"conservative", "balanced", "aggressive", "custom"})
 MARKET_PERMISSION_KEYS = frozenset(
     {"main_board", "star_market", "chi_next", "beijing_exchange", "etf"}
@@ -41,6 +42,87 @@ _BOARD_PERMISSION_KEY = {
     BOARD_BSE: "beijing_exchange",
     BOARD_FUND: "etf",
 }
+
+
+def _binding_payload(binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the immutable investor fields carried by one paper account."""
+
+    permissions = binding.get("market_permissions")
+    if not isinstance(permissions, Mapping) or set(permissions) != MARKET_PERMISSION_KEYS:
+        raise ValueError("paper investor-profile binding has incomplete market permissions")
+    if any(not isinstance(value, bool) for value in permissions.values()):
+        raise ValueError("paper investor-profile permissions must be explicit booleans")
+    profile_id = str(binding.get("profile_id") or "").strip()
+    profile_key = str(binding.get("profile_key") or "").strip()
+    profile_sha256 = str(binding.get("profile_content_sha256") or "").lower()
+    try:
+        profile_version = int(binding.get("profile_version"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("paper investor-profile binding has no valid version") from exc
+    if (
+        not profile_id
+        or not profile_key
+        or profile_version < 1
+        or len(profile_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in profile_sha256)
+    ):
+        raise ValueError("paper investor-profile binding identity is invalid")
+    return {
+        "contract_version": INVESTOR_PROFILE_BINDING_VERSION,
+        "profile_id": profile_id,
+        "profile_key": profile_key,
+        "profile_version": profile_version,
+        "profile_content_sha256": profile_sha256,
+        "market_permissions": {
+            key: bool(permissions[key]) for key in sorted(MARKET_PERMISSION_KEYS)
+        },
+    }
+
+
+def bind_investor_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Freeze one validated profile version into an isolated paper account."""
+
+    payload = _binding_payload(
+        {
+            "profile_id": profile.get("id"),
+            "profile_key": profile.get("profile_key"),
+            "profile_version": profile.get("version"),
+            "profile_content_sha256": profile.get("content_sha256"),
+            "market_permissions": profile.get("market_permissions"),
+        }
+    )
+    return {**payload, "binding_sha256": canonical_sha256(payload)}
+
+
+def validate_investor_profile_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the profile binding stored in execution policy."""
+
+    payload = _binding_payload(binding)
+    if str(binding.get("contract_version") or "") != INVESTOR_PROFILE_BINDING_VERSION:
+        raise ValueError("paper investor-profile binding version is unsupported")
+    if str(binding.get("binding_sha256") or "").lower() != canonical_sha256(payload):
+        raise ValueError("paper investor-profile binding failed immutable verification")
+    return {**payload, "binding_sha256": canonical_sha256(payload)}
+
+
+def require_matching_active_profile_binding(
+    binding: Mapping[str, Any],
+    active_profile: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Fail closed when a paper account's investor profile is no longer active."""
+
+    frozen = validate_investor_profile_binding(binding)
+    if active_profile is None:
+        raise ValueError(
+            "paper investor profile is no longer active; forward evidence is blocked"
+        )
+    current = bind_investor_profile(active_profile)
+    if current != frozen:
+        raise ValueError(
+            "active investor profile changed; the existing paper account cannot "
+            "continue forward evidence"
+        )
+    return frozen
 
 
 def investor_profile_permission(
@@ -82,6 +164,55 @@ def investor_profile_permission(
         "permission_key": permission_key,
         "reason": None if allowed else f"investor_permission_disabled:{permission_key}",
     }
+
+
+def investor_profile_permission_map(
+    profile: Mapping[str, Any],
+    instruments: list[str] | set[str] | tuple[str, ...],
+    *,
+    on_date: date,
+) -> dict[str, dict[str, Any]]:
+    """Resolve deterministic permission evidence for a set of instruments."""
+
+    return {
+        instrument: investor_profile_permission(profile, instrument, on_date=on_date)
+        for instrument in sorted({str(item).upper() for item in instruments})
+    }
+
+
+def require_investor_profile_target_permissions(
+    binding: Mapping[str, Any],
+    target_weights: Mapping[str, float],
+    previous_weights: Mapping[str, float],
+    *,
+    on_date: date,
+) -> dict[str, dict[str, Any]]:
+    """Reject only prohibited exposure increases; reductions and exits stay valid."""
+
+    profile = validate_investor_profile_binding(binding)
+    normalized_targets = {
+        str(instrument).upper(): float(weight)
+        for instrument, weight in target_weights.items()
+    }
+    normalized_previous = {
+        str(instrument).upper(): float(weight)
+        for instrument, weight in previous_weights.items()
+    }
+    evidence = investor_profile_permission_map(
+        profile,
+        set(normalized_targets),
+        on_date=on_date,
+    )
+    for instrument, target_weight in normalized_targets.items():
+        if target_weight <= normalized_previous.get(instrument, 0.0) + 1e-12:
+            continue
+        permission = evidence[instrument]
+        if permission["allowed"] is not True:
+            raise ValueError(
+                "paper target attempted an exposure increase outside the frozen "
+                f"investor permissions: {instrument}:{permission['reason']}"
+            )
+    return evidence
 
 
 def _now() -> datetime:

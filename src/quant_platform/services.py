@@ -29,8 +29,8 @@ from quant_data.qlib_builder import verify_qlib_output_manifest
 _QLIB_OUTPUT_VERIFY_CACHE_LOCK = threading.Lock()
 _QLIB_OUTPUT_VERIFY_MEMORY_TTL_SECONDS = 60.0
 _QLIB_OUTPUT_VERIFY_CACHE_MAX_ENTRIES = 128
-_QLIB_OUTPUT_VERIFY_CACHE_VERSION = 1
-_QLIB_OUTPUT_VERIFY_CACHE_FILE = ".catalog-output-verification-v1.json"
+_QLIB_OUTPUT_VERIFY_CACHE_VERSION = 2
+_QLIB_OUTPUT_VERIFY_CACHE_FILE = ".catalog-output-verification-v2.json"
 _QLIB_PROVENANCE_PATH = "metadata/provenance.json"
 _QLIB_OUTPUT_VERIFY_MEMORY: dict[str, dict[str, Any]] = {}
 
@@ -41,8 +41,8 @@ _QLIB_OUTPUT_VERIFY_MEMORY: dict[str, dict[str, Any]] = {}
 # reads keep returning the previous good projection, and the data worker
 # replaces it after publication.  Formal consumers continue to call
 # ``list_qlib_datasets``.
-_QLIB_DISPLAY_CATALOG_CACHE_VERSION = 3
-_QLIB_DISPLAY_CATALOG_CACHE_FILE = ".catalog-display-v3.json"
+_QLIB_DISPLAY_CATALOG_CACHE_VERSION = 4
+_QLIB_DISPLAY_CATALOG_CACHE_FILE = ".catalog-display-v4.json"
 _QLIB_DISPLAY_CATALOG_CACHE_MAX_BYTES = 5_000_000
 _QLIB_DISPLAY_CATALOG_MAX_DATASETS = 5_000
 _QLIB_DISPLAY_CATALOG_CACHE_LOCK = threading.Lock()

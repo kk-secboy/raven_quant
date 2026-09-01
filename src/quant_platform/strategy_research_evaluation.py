@@ -34,6 +34,7 @@ STRATEGY_RESEARCH_COMPETITION_VERSION = "fin-strategy-fair-competition-v1"
 _SHA256_FIELDS = (
     "baseline_definition_sha256",
     "feature_set_definition_sha256",
+    "factor_score_champion_contract_sha256",
     "model_code_sha256",
     "model_recipe_sha256",
     "model_evidence_sha256",
@@ -153,6 +154,59 @@ def build_public_strategy_control_config(
     result.update(deepcopy(dict(recipe["config_overrides"])))
     result["recipe_id"] = recipe["id"]
     result["recipe_version"] = recipe["version"]
+    champion = candidate_config.get("factor_score_champion_contract")
+    if isinstance(champion, Mapping):
+        source_artifact_id = str(
+            candidate_config.get("source_research_artifact_id") or ""
+        ).strip()
+        if not source_artifact_id:
+            raise ValueError(
+                "factor champion control requires its fin_strategy source artifact"
+            )
+        result["source_research_artifact_id"] = source_artifact_id
+        members = champion.get("members")
+        if not isinstance(members, list) or not members:
+            raise ValueError("factor champion public control has no frozen score weights")
+        weights = {
+            str(item["feature_id"]): float(item["weight"])
+            for item in members
+            if isinstance(item, Mapping)
+        }
+        if len(weights) != len(members):
+            raise ValueError("factor champion public control score grid is incomplete")
+        public_rule_ir = deepcopy(dict(result["strategy_rule_ir"]))
+        slots = deepcopy(dict(public_rule_ir["slots"]))
+        alpha_components = slots["alpha_rank"].get("components") or []
+        weighted = next(
+            (
+                item
+                for item in alpha_components
+                if isinstance(item, dict)
+                and item.get("component") == "weighted_factor_rank"
+            ),
+            None,
+        )
+        if weighted is None:
+            raise ValueError("factor champion public control has no alpha-rank slot")
+        weighted["parameters"] = {"weights": weights}
+        rules = validate_strategy_rule_ir(
+            str(result.get("horizon_profile") or ""),
+            slots,
+            allowed_factor_ids=set(weights),
+        )
+        policy = compile_strategy_rule_policy(
+            str(result.get("horizon_profile") or ""),
+            rules,
+            allowed_factor_ids=set(weights),
+        )
+        result["strategy_rule_ir"] = rules
+        result["strategy_rules_sha256"] = rules["rules_sha256"]
+        result["strategy_rule_policy_sha256"] = policy["policy_sha256"]
+        for field in _POLICY_FIELDS:
+            if field in policy and policy[field] is not None:
+                result[field] = policy[field]
+            elif field in result and policy.get(field) is None:
+                result.pop(field)
     result["execution_contract_hash"] = strategy_execution_contract_hash(result)
     validate_strategy_rule_binding(result)
     return result
@@ -170,6 +224,9 @@ def build_transparent_full_stack_control_config(
     champion-signal + researched-policy stack.
     """
 
+    factor_champion = isinstance(
+        candidate_config.get("factor_score_champion_contract"), Mapping
+    )
     result = build_public_strategy_control_config(candidate_config)
     for field in {
         *_SCORE_ID_FIELDS,
@@ -187,8 +244,23 @@ def build_transparent_full_stack_control_config(
         "model_component_families",
         "strategy_research_signal_binding",
         "baseline_definition",
+        "factor_score_champion_contract",
     }:
         result.pop(field, None)
+    if factor_champion:
+        from .strategy_recipes import get_strategy_recipe
+
+        recipe = get_strategy_recipe(str(result.get("recipe_id") or ""))
+        public_config = dict(recipe["config_overrides"])
+        for field in (*_POLICY_FIELDS, "strategy_rule_ir", "strategy_rules_sha256"):
+            if field in public_config:
+                result[field] = deepcopy(public_config[field])
+            else:
+                result.pop(field, None)
+        result["strategy_rule_policy_sha256"] = public_config[
+            "strategy_rule_policy_sha256"
+        ]
+        result.pop("source_research_artifact_id", None)
     result.update(
         {
             "signal_source": "factor_score",

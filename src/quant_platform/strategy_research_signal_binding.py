@@ -4,6 +4,12 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
+from quant_platform.factor_score_champion import (
+    factor_score_champion_feature_set,
+    factor_score_champion_signal_config,
+    validate_factor_score_champion_contract,
+)
+from quant_platform.feature_set_registry import register_feature_set
 from quant_platform.model_strategy_contract import normalize_model_signal_config
 from quant_platform.strategy_rule_ir import canonical_sha256
 
@@ -79,6 +85,81 @@ def _project_model_signal_config(value: Mapping[str, Any]) -> dict[str, Any]:
     } | deepcopy(_MODEL_FACTOR_SOURCE_BINDING)
 
 
+def _validated_factor_champion_selection(
+    champion_selection: Mapping[str, Any],
+    *,
+    horizon_profile: str | None = None,
+    dataset: str | None = None,
+    dataset_identity_sha256: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    evidence = champion_selection.get("champion_selection_evidence")
+    selection_sha256 = _require_sha256(
+        champion_selection.get("champion_selection_evidence_sha256"),
+        field="fin_strategy factor champion selection evidence",
+    )
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("contract_version")
+        != "autopilot-factor-score-champion-selection-v1"
+        or evidence.get("selection_policy_version")
+        != "exact-dataset-horizon-sota-v1"
+        or canonical_sha256(dict(evidence)) != selection_sha256
+        or evidence.get("selected_kind") != "factor"
+        or evidence.get("final_oos_opened") is not False
+        or evidence.get("research_screening_only") is not True
+        or evidence.get("not_capital_confirmation") is not True
+        or evidence.get("cross_cycle_fwer_claimed") is not False
+        or (horizon_profile is not None and evidence.get("horizon_profile") != horizon_profile)
+        or (dataset is not None and evidence.get("dataset") != dataset)
+        or (
+            dataset_identity_sha256 is not None
+            and evidence.get("dataset_identity_sha256") != dataset_identity_sha256
+        )
+    ):
+        raise ValueError("fin_strategy factor champion selection evidence is invalid")
+    selected = evidence.get("selected_strategy_config")
+    contract = (
+        selected.get("factor_score_champion_contract")
+        if isinstance(selected, Mapping)
+        else None
+    )
+    frozen_contract = validate_factor_score_champion_contract(contract)
+    expected_config = factor_score_champion_signal_config(frozen_contract)
+    feature_set = factor_score_champion_feature_set(frozen_contract)
+    if (
+        not isinstance(selected, Mapping)
+        or dict(selected) != expected_config
+        or evidence.get("selected_candidate_id")
+        != frozen_contract["sota_version_id"]
+        or evidence.get("factor_score_champion_contract_sha256")
+        != frozen_contract["contract_sha256"]
+        or evidence.get("selected_research_feature_set") != feature_set
+        or evidence.get("dataset") != frozen_contract["dataset"]
+        or evidence.get("dataset_identity_sha256")
+        != frozen_contract["dataset_identity_sha256"]
+        or evidence.get("horizon_profile") != frozen_contract["horizon_profile"]
+    ):
+        raise ValueError("fin_strategy factor champion score config is invalid")
+    return expected_config, register_feature_set(feature_set), selection_sha256
+
+
+def research_feature_set_for_champion_selection(
+    research_feature_set: Mapping[str, Any],
+    champion_selection: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve the exact score grid that fin_strategy is allowed to modify."""
+
+    if champion_selection is None:
+        return deepcopy(dict(research_feature_set))
+    evidence = champion_selection.get("champion_selection_evidence")
+    if isinstance(evidence, Mapping) and evidence.get("selected_kind") == "factor":
+        _, feature_set, _ = _validated_factor_champion_selection(
+            champion_selection
+        )
+        return feature_set
+    return deepcopy(dict(research_feature_set))
+
+
 def build_strategy_research_signal_binding(
     *,
     horizon_profile: str,
@@ -90,7 +171,7 @@ def build_strategy_research_signal_binding(
     """Freeze the score source used by a fin_strategy proposal.
 
     The control remains the transparent recipe when no independently admitted
-    model/ensemble/fin_quant champion exists. A governed champion is accepted
+    factor/model/ensemble/fin_quant champion exists. A governed champion is accepted
     only through ``AutopilotCompletionService`` selection evidence; RD-Agent
     never supplies candidate ids or evidence hashes itself.
     """
@@ -122,42 +203,64 @@ def build_strategy_research_signal_binding(
         selection_sha256 = None
     else:
         evidence = champion_selection.get("champion_selection_evidence")
-        selection_sha256 = _require_sha256(
-            champion_selection.get("champion_selection_evidence_sha256"),
-            field="fin_strategy champion selection evidence",
-        )
-        if (
-            not isinstance(evidence, Mapping)
-            or evidence.get("contract_version") != "autopilot-completion-v1"
-            or evidence.get("selection_policy_version")
-            != "pre-final-incumbent-challenge-equal-profile-v2"
-            or canonical_sha256(dict(evidence)) != selection_sha256
-            or evidence.get("dataset") != dataset_name
-            or evidence.get("dataset_identity_sha256") != identity
-            or evidence.get("horizon_profile") != horizon_profile
-            or evidence.get("final_oos_opened") is not False
-            or evidence.get("research_screening_only") is not True
-            or evidence.get("not_capital_confirmation") is not True
-            or evidence.get("cross_cycle_fwer_claimed") is not False
-        ):
-            raise ValueError("fin_strategy champion selection evidence is invalid")
-        champion_kind = str(evidence.get("selected_kind") or "")
-        if champion_kind not in {"model", "ensemble", "joint"}:
-            raise ValueError("fin_strategy champion kind is unsupported")
-        champion_candidate_id = str(evidence.get("selected_candidate_id") or "").strip()
-        selected_config = evidence.get("selected_strategy_config")
-        if not champion_candidate_id or not isinstance(selected_config, Mapping):
-            raise ValueError("fin_strategy champion selection is incomplete")
-        signal_config = _project_model_signal_config(selected_config)
-        selected_signal_id = str(
-            signal_config.get("quant_bundle_candidate_id")
-            or signal_config.get("model_ensemble_candidate_id")
-            or signal_config.get("model_candidate_id")
-            or ""
-        )
-        if selected_signal_id != champion_candidate_id:
-            raise ValueError("fin_strategy champion signal identity was substituted")
-        source = "autopilot_governed_champion"
+        if isinstance(evidence, Mapping) and evidence.get("selected_kind") == "factor":
+            signal_config, selected_feature_set, selection_sha256 = (
+                _validated_factor_champion_selection(
+                    champion_selection,
+                    horizon_profile=horizon_profile,
+                    dataset=dataset_name,
+                    dataset_identity_sha256=identity,
+                )
+            )
+            if (
+                selected_feature_set["id"] != feature_set_id
+                or selected_feature_set["definition_sha256"] != feature_set_sha256
+            ):
+                raise ValueError(
+                    "fin_strategy factor champion differs from its research feature set"
+                )
+            champion_kind = "factor"
+            champion_candidate_id = str(evidence["selected_candidate_id"])
+            source = "autopilot_governed_champion"
+        else:
+            selection_sha256 = _require_sha256(
+                champion_selection.get("champion_selection_evidence_sha256"),
+                field="fin_strategy champion selection evidence",
+            )
+            if (
+                not isinstance(evidence, Mapping)
+                or evidence.get("contract_version") != "autopilot-completion-v1"
+                or evidence.get("selection_policy_version")
+                != "pre-final-incumbent-challenge-equal-profile-v2"
+                or canonical_sha256(dict(evidence)) != selection_sha256
+                or evidence.get("dataset") != dataset_name
+                or evidence.get("dataset_identity_sha256") != identity
+                or evidence.get("horizon_profile") != horizon_profile
+                or evidence.get("final_oos_opened") is not False
+                or evidence.get("research_screening_only") is not True
+                or evidence.get("not_capital_confirmation") is not True
+                or evidence.get("cross_cycle_fwer_claimed") is not False
+            ):
+                raise ValueError("fin_strategy champion selection evidence is invalid")
+            champion_kind = str(evidence.get("selected_kind") or "")
+            if champion_kind not in {"model", "ensemble", "joint"}:
+                raise ValueError("fin_strategy champion kind is unsupported")
+            champion_candidate_id = str(
+                evidence.get("selected_candidate_id") or ""
+            ).strip()
+            selected_config = evidence.get("selected_strategy_config")
+            if not champion_candidate_id or not isinstance(selected_config, Mapping):
+                raise ValueError("fin_strategy champion selection is incomplete")
+            signal_config = _project_model_signal_config(selected_config)
+            selected_signal_id = str(
+                signal_config.get("quant_bundle_candidate_id")
+                or signal_config.get("model_ensemble_candidate_id")
+                or signal_config.get("model_candidate_id")
+                or ""
+            )
+            if selected_signal_id != champion_candidate_id:
+                raise ValueError("fin_strategy champion signal identity was substituted")
+            source = "autopilot_governed_champion"
 
     binding = {
         "contract_version": STRATEGY_RESEARCH_SIGNAL_BINDING_VERSION,
@@ -237,26 +340,44 @@ def validate_strategy_research_signal_binding(value: Any) -> dict[str, Any]:
         ):
             raise ValueError("fin_strategy transparent signal binding is invalid")
     elif source == "autopilot_governed_champion":
-        projected = _project_model_signal_config(signal_config)
-        if (
-            projected != dict(signal_config)
-            or normalized.get("signal_source") != "model_prediction"
-            or normalized.get("champion_kind") not in {"model", "ensemble", "joint"}
-            or not str(normalized.get("champion_candidate_id") or "").strip()
-        ):
-            raise ValueError("fin_strategy governed champion binding is invalid")
         _require_sha256(
             normalized.get("champion_selection_evidence_sha256"),
             field="fin_strategy champion selection evidence",
         )
-        signal_id = str(
-            projected.get("quant_bundle_candidate_id")
-            or projected.get("model_ensemble_candidate_id")
-            or projected.get("model_candidate_id")
-            or ""
-        )
-        if signal_id != str(normalized["champion_candidate_id"]):
-            raise ValueError("fin_strategy governed champion identity changed")
+        if normalized.get("champion_kind") == "factor":
+            contract = signal_config.get("factor_score_champion_contract")
+            projected = factor_score_champion_signal_config(
+                validate_factor_score_champion_contract(contract)
+            )
+            if (
+                projected != dict(signal_config)
+                or normalized.get("signal_source") != "factor_score"
+                or normalized.get("champion_candidate_id")
+                != projected["factor_score_champion_contract"]["sota_version_id"]
+                or normalized.get("research_feature_set_id")
+                != projected["feature_set_id"]
+                or normalized.get("research_feature_set_definition_sha256")
+                != projected["feature_set_definition_sha256"]
+            ):
+                raise ValueError("fin_strategy governed factor champion is invalid")
+        else:
+            projected = _project_model_signal_config(signal_config)
+            if (
+                projected != dict(signal_config)
+                or normalized.get("signal_source") != "model_prediction"
+                or normalized.get("champion_kind")
+                not in {"model", "ensemble", "joint"}
+                or not str(normalized.get("champion_candidate_id") or "").strip()
+            ):
+                raise ValueError("fin_strategy governed champion binding is invalid")
+            signal_id = str(
+                projected.get("quant_bundle_candidate_id")
+                or projected.get("model_ensemble_candidate_id")
+                or projected.get("model_candidate_id")
+                or ""
+            )
+            if signal_id != str(normalized["champion_candidate_id"]):
+                raise ValueError("fin_strategy governed champion identity changed")
     else:
         raise ValueError("fin_strategy signal binding source is unsupported")
     normalized["binding_sha256"] = binding_sha256

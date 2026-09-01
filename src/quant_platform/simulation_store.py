@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from quant_data.database import (
     account_netting_plans,
     backtest_runs,
+    investor_simulation_profiles,
     jobs,
     open_database,
     recommendation_holdings,
@@ -78,6 +79,11 @@ from .cost_model import (
 )
 from .execution_algorithms import execution_time_slots, normalize_execution_policy
 from .forward_only_rehabilitation import EVIDENCE_MODE_REPLAY, require_qualification
+from .investor_profile import (
+    require_investor_profile_target_permissions,
+    require_matching_active_profile_binding,
+    validate_investor_profile_binding,
+)
 from .member_risk_gate import (
     load_allocation_risk_state,
     load_strategy_risk_state,
@@ -1872,6 +1878,7 @@ class SimulationStore:
         execution_dataset: dict[str, Any],
         policy: dict[str, Any],
         cost_model: CostModelConfig,
+        investor_profile_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         daily_provenance = dict(daily_dataset["provenance"])
         execution_provenance = dict(execution_dataset["provenance"])
@@ -1882,6 +1889,10 @@ class SimulationStore:
             "execution_frequency": frequency,
             "cost_model": cost_model.to_dict(),
         }
+        if investor_profile_binding is not None:
+            bound["investor_profile_binding"] = validate_investor_profile_binding(
+                investor_profile_binding
+            )
         payload = _simulation_semantics_payload(
             source_type=source_type,
             source_id=source_id,
@@ -1931,6 +1942,7 @@ class SimulationStore:
         daily_roll_policy: str = "pinned",
         execution_roll_policy: str = "pinned",
         promotion_stage_id: str | None = None,
+        investor_profile_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.safe_mode.assert_inactive(action="simulation account creation")
         if not isfinite(float(initial_cash)) or float(initial_cash) <= 0:
@@ -2047,6 +2059,7 @@ class SimulationStore:
             execution_dataset=execution_dataset,
             policy=policy,
             cost_model=source_cost_model,
+            investor_profile_binding=investor_profile_binding,
         )
         portfolio_id = uuid.uuid4().hex
         now = _now()
@@ -2851,6 +2864,42 @@ class SimulationStore:
                 raise ValueError(
                     "simulation cost parameters no longer match the approved source contract"
                 )
+        horizon_profile = str(
+            dict(source.get("config") or {}).get("horizon_profile") or ""
+        )
+        if (
+            portfolio.promotion_stage_id is not None
+            and horizon_profile in {"short_1_5d", "swing_1_6m", "long_1_3y"}
+        ):
+            raw_binding = policy.get("investor_profile_binding")
+            if not isinstance(raw_binding, dict):
+                raise ValueError(
+                    "paper account has no immutable investor-profile permission binding"
+                )
+            binding = validate_investor_profile_binding(raw_binding)
+            active_profile = connection.execute(
+                select(investor_simulation_profiles).where(
+                    investor_simulation_profiles.c.profile_key
+                    == binding["profile_key"],
+                    investor_simulation_profiles.c.status == "active",
+                )
+            ).first()
+            require_matching_active_profile_binding(
+                binding,
+                (
+                    {
+                        "id": str(active_profile.id),
+                        "profile_key": str(active_profile.profile_key),
+                        "version": int(active_profile.version),
+                        "content_sha256": str(active_profile.content_sha256),
+                        "market_permissions": dict(
+                            active_profile.market_permissions_json or {}
+                        ),
+                    }
+                    if active_profile is not None
+                    else None
+                ),
+            )
         semantics = _simulation_semantics_payload(
             source_type=str(portfolio.source_type),
             source_id=str(portfolio.source_id),
@@ -4366,6 +4415,53 @@ class SimulationStore:
                     "Qlib order-plan does not match the simulation source contract "
                     "or immutable snapshot"
                 )
+            raw_profile_binding = dict(portfolio.execution_policy_json or {}).get(
+                "investor_profile_binding"
+            )
+            explicit_horizon = str(version.horizon_profile or "") in {
+                "short_1_5d",
+                "swing_1_6m",
+                "long_1_3y",
+            }
+            if explicit_horizon and not isinstance(raw_profile_binding, dict):
+                raise ValueError(
+                    "Qlib paper order-plan account has no investor-profile binding"
+                )
+            profile_binding = (
+                validate_investor_profile_binding(raw_profile_binding)
+                if isinstance(raw_profile_binding, dict)
+                else None
+            )
+            if profile_binding is not None:
+                if manifest.get("investor_profile_binding") != profile_binding:
+                    raise ValueError(
+                        "Qlib order-plan changed its immutable investor-profile binding"
+                    )
+                portfolio_nav = float(portfolio.nav)
+                if not isfinite(portfolio_nav) or portfolio_nav <= 0:
+                    raise ValueError(
+                        "paper account NAV is invalid for permission enforcement"
+                    )
+                previous_weights = {
+                    str(row.instrument).upper(): max(0.0, float(row.market_value))
+                    / portfolio_nav
+                    for row in connection.execute(
+                        select(
+                            simulation_positions.c.instrument,
+                            simulation_positions.c.market_value,
+                        ).where(
+                            simulation_positions.c.portfolio_id == portfolio.id,
+                            simulation_positions.c.position_side == "long",
+                            simulation_positions.c.quantity > 0,
+                        )
+                    )
+                }
+                require_investor_profile_target_permissions(
+                    profile_binding,
+                    normalized_targets["target_weights"],
+                    previous_weights,
+                    on_date=trade_date,
+                )
             dataset_bindings = self._strategy_order_plan_dataset_bindings(
                 portfolio=portfolio,
                 daily_dataset=str(manifest.get("daily_dataset") or ""),
@@ -4439,6 +4535,8 @@ class SimulationStore:
                     manifest.get("qlib_workflow")
                 ),
             }
+            if profile_binding is not None:
+                plan["investor_profile_binding"] = profile_binding
             if horizon_review is not None:
                 plan["horizon_review"] = dict(horizon_review)
             if settlement_calendar_binding is not None:
@@ -5963,6 +6061,8 @@ class SimulationStore:
             ).first()
             if portfolio is None:
                 raise KeyError(portfolio_id)
+            if portfolio.promotion_stage_id is not None:
+                self._require_current_source_contract(connection, portfolio)
             latest_nav = connection.execute(
                 select(simulation_nav)
                 .where(simulation_nav.c.portfolio_id == portfolio_id)

@@ -96,7 +96,7 @@ Bootstrap、Qlib 转换、RD-Agent 研究和回测也可以从 Web 控制台创�
 
 - `fin_factor`：因子提出、实现和迭代；候选仍须独立复算、PIT 检查和三窗口准入。
 - `fin_model`：在固定特征集上研究预测模型；使用固定随机种子重新训练并独立验证。
-- `fin_quant`：联合研究完整的因子集与模型 bundle，并强制因子、模型、联合三组消融。
+- `fin_quant`：联合研究完整的因子集与模型 bundle；每次运行先保证因子、模型两臂各有一次真实尝试，再交回官方 bandit。只有两臂都被接受并通过因子单独、模型单独、联合及联合相对 incumbent 四项独立消融，才形成可准入的联合候选；否则记录为无资本权限的研究负结果。
 - `fin_strategy`：研究股票资格、市场状态、排名、入场、退出、持有期、组合和风险规则；输出 `StrategyProposal` 与确定性编译的规则 IR，仅有研究权限。
 - `fin_factor_report`：只读取已验签且满足可用时点的研报 PDF，提取因子后复用因子门禁。
 - `general_model`：从论文实现模型，初始状态仅为 `implementation_ready`；兼容实现可人工送入模型门禁。
@@ -115,6 +115,15 @@ RD-Agent 因子组成的冠军因子包，并限制为一个活动策略和最�
 `full_stack` 将完整冠军信号加新规则与透明公开基线比较。冠军不存在时才回退透明基线，
 任何身份不一致都失败关闭。历史训练上下文可以早于权威成本表，但产生模拟成交的比较
 区间不得早于成本制度首个有效交易日。
+
+Autopilot 的现行权限到 `fin_factor/fin_model/fin_quant` 研究、独立准入和只读冠军选择
+为止；它不会创建 `StrategyVersion`、正式 OOS、批准或模拟账户。旧
+`AutopilotCapitalPipeline` 及数据库中已有的 `capital_pipeline` 状态统一标记为
+`legacy_readonly`，只保留历史查询和审计，不再由 API、scheduler 或 Autopilot 实例化、
+推进或补跑。唯一自动资本入口是受管 `fin_strategy` 的 settlement：规则候选依次完成
+`policy_only → full_stack → 正式 OOS → paper_validating`，任一步失败都保持现金且不会
+退回旧资本链。旧的 standalone transparent-baseline bootstrap 也不再由 scheduler 自动
+推进；三套公开基线只在同一个 `fin_strategy` 竞赛里充当对照组。
 简单模式先输出冲突净额后的唯一账户操作清单，三周期结果仅作为可折叠来源解释。
 平衡型个人账户的默认周期预算为短线 20%、中线 50%、长线 30%，再统一应用
 账户现金、单票、行业和总风险上限；缺失周期的预算保留现金，不向其他周期重分配。
@@ -123,7 +132,8 @@ Loop、Hypothesis、Feedback 和 Trace 摘要；原始 pickle、路径、代码�
 开放。诊断按钮也不替代生产 readiness。项目不连接真实券商，模拟结果不会自动触发实盘。
 
 旧 `/api/research-programs` 与 `/api/research-campaigns` 只保留历史 GET 查询，全部写入、
-状态修改、重试和调度入口返回 410；唯一自动研究入口是 `/api/autopilot`。配对交易算法
+状态修改、重试和调度入口返回 410；上游因子/模型/联合研究只由 `/api/autopilot` 编排，
+受管 `fin_strategy` 调度在同一主线中承接唯一策略资本结算，不另建控制面。配对交易算法
 只保留离线研究代码，生产 API、scheduler 和 worker 均不能创建配对回测、影子账户或订单。
 
 ## Docker 部署

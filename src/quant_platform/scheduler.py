@@ -107,12 +107,10 @@ from .strategy_health import resolve_feature_drift_episode
 from .strategy_health_collector import StrategyHealthCollector
 from .strategy_research_signal_binding import (
     build_strategy_research_signal_binding,
+    research_feature_set_for_champion_selection,
 )
 from .strategy_store import StrategyStore
 from .three_horizon_account import ThreeHorizonAccountService
-from .transparent_baseline_bootstrap import (
-    reconcile as reconcile_transparent_baselines,
-)
 
 AUTOMATED_DATA_BUNDLES = (
     "cn_extended_daily",
@@ -386,7 +384,6 @@ class SchedulerEngine:
         self.autopilot = AutopilotController(settings)
         self.three_horizon_account = ThreeHorizonAccountService(settings)
         self._last_fin_strategy_schedule_reconcile_at: datetime | None = None
-        self._last_transparent_baseline_reconcile_at: datetime | None = None
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or datetime.now(UTC)
@@ -456,10 +453,13 @@ class SchedulerEngine:
             )
         self._settle_activation_cutovers(three_horizon_result, now=current)
         horizon_recommendations_enqueued = self._enqueue_due_horizon_recommendations(current)
-        (
-            transparent_baseline_reconciles,
-            transparent_baseline_reconcile_failures,
-        ) = self._reconcile_transparent_baselines(current)
+        # Transparent public recipes are controls inside the managed
+        # ``fin_strategy`` competition.  The retired standalone bootstrap used
+        # to create StrategyVersion/OOS/paper state here every 30 minutes,
+        # which was a second automatic capital path.  Keep the counters for
+        # response compatibility, but never advance that historical workflow.
+        transparent_baseline_reconciles = 0
+        transparent_baseline_reconcile_failures = 0
         # Pair trading requires short sales and borrow-cost assumptions.  The
         # single Autopilot capital line is deliberately long-only, so legacy
         # pair records remain readable but are never scheduled or traded.
@@ -538,36 +538,6 @@ class SchedulerEngine:
             )
             return 0
         return len(records)
-
-    def _reconcile_transparent_baselines(self, now: datetime) -> tuple[int, int]:
-        """Periodically advance baseline bootstrap after daily lanes are queued."""
-
-        previous = self._last_transparent_baseline_reconcile_at
-        if previous is not None and now - previous < timedelta(minutes=30):
-            return 0, 0
-        self._last_transparent_baseline_reconcile_at = now
-        try:
-            result = reconcile_transparent_baselines(self.settings)
-        except Exception as exc:  # noqa: BLE001 - isolate baseline research
-            result = {"status": "failed", "errors": [str(exc)]}
-        if result.get("status") == "failed":
-            errors = [str(item) for item in result.get("errors") or []]
-            for member in result.get("members") or []:
-                errors.extend(str(item) for item in member.get("errors") or [])
-            self.alerts.create(
-                source_type="platform",
-                source_id="transparent-baseline-bootstrap",
-                severity="warning",
-                category="transparent_baseline_reconcile_waiting",
-                title="三周期透明基线仍在等待合规数据或回测",
-                message="; ".join(errors[:3]) or "transparent baseline reconcile failed closed",
-                dedupe_key=(
-                    "platform:transparent-baseline-bootstrap:"
-                    f"{now.astimezone(ZoneInfo('Asia/Shanghai')).date()}:waiting"
-                ),
-            )
-            return 1, 1
-        return 1, 0
 
     def _auto_promote_ready_horizons(self, now: datetime) -> list[dict[str, Any]]:
         """Advance paper strategies only through their immutable horizon gates."""
@@ -2994,7 +2964,7 @@ class SchedulerEngine:
                 raise ValueError("scheduled fin_strategy governed inputs are incomplete")
             try:
                 champion_selection = (
-                    self.autopilot.capital_pipeline.completion.select_champion(
+                    self.autopilot.champion_selector.select_champion(
                         dataset=str(dataset["name"]),
                         dataset_identity_sha256=str(
                             dataset["provenance"]["dataset_identity_sha256"]
@@ -3005,9 +2975,21 @@ class SchedulerEngine:
             except ValueError as exc:
                 if str(exc) != (
                     "no independently admitted signal matches this dataset identity"
-                ):
+                    ):
                     raise
                 champion_selection = None
+            payload["feature_set"] = research_feature_set_for_champion_selection(
+                dict(payload["feature_set"]),
+                champion_selection,
+            )
+            periods, period_resolution = resolve_research_window_contract(
+                dataset,
+                calendar,
+                periods=payload.get("periods"),
+                period_policy=payload.get("period_policy"),
+                horizon_profile=payload.get("horizon_profile"),
+                feature_set=payload["feature_set"],
+            )
             strategy_research_signal_binding = build_strategy_research_signal_binding(
                 horizon_profile=str(payload["horizon_profile"]),
                 dataset=str(dataset["name"]),

@@ -7,9 +7,14 @@ import time
 from pathlib import Path
 
 import pytest
+from governance_fixtures import governed_etf_ready_evidence
 
 import quant_platform.services as services
-from quant_data.execution_contract import QLIB_OUTPUT_MANIFEST_VERSION
+from quant_data.execution_contract import (
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
+    QLIB_OUTPUT_MANIFEST_VERSION,
+)
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 
 pytestmark = pytest.mark.no_database
 
@@ -42,6 +47,18 @@ def _seed_dataset(data_root: Path) -> tuple[Path, Path]:
         json.dumps(
             {
                 "frequency": "day",
+                "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                "source_volume_unit": "hand",
+                "qlib_volume_unit": "share",
+                "source_amount_unit": "thousand_cny",
+                "qlib_amount_unit": "cny",
+                "source_hand_size": 100,
+                "index_volume_policy": "excluded_non_tradable_benchmark",
+                "lineage_verified": True,
+                "governed_etf_whitelist": governed_etf_ready_evidence(),
+                "execution_controls": {
+                    "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+                },
                 "dataset_identity_sha256": "a" * 64,
                 "snapshot_manifest_sha256": "b" * 64,
                 "output_manifest": {

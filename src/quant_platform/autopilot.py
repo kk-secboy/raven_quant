@@ -27,11 +27,7 @@ from quant_data.database import (
     row_dict,
 )
 
-from .autopilot_capital_pipeline import (
-    CAPITAL_PIPELINE_STATE_KEY,
-    AutopilotCapitalBlocked,
-    AutopilotCapitalPipeline,
-)
+from .autopilot_champion_selection import AutopilotResearchChampionSelector
 from .autopilot_completion import aggregate_pre_final_grid
 from .factor_autopilot import FactorAutopilotService
 from .factor_library_store import FactorLibraryStore
@@ -111,7 +107,10 @@ DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "report_loop_n": 1,
     "report_duration": "30m",
     "report_daily_limit": 20,
-    "quant_loop_n": 1,
+    # Two rounds are the semantic minimum for the governed fin_quant coverage
+    # policy: upstream starts with factor, then the thin host adapter guarantees
+    # one model attempt before returning subsequent choices to the bandit.
+    "quant_loop_n": 2,
     "quant_duration": "1h",
     "quant_feature_set_id": "qlib-alpha158",
     "quant_cooldown_days": 7,
@@ -129,6 +128,10 @@ def normalize_autopilot_config(value: Any = None) -> dict[str, Any]:
         if unknown:
             raise ValueError(f"unsupported autopilot settings: {unknown}")
         raw.update(value)
+    # Transparently upgrade the persisted v1 default.  Rejecting the historical
+    # value here would make existing managed schedules unreadable after deploy.
+    if raw["quant_loop_n"] == 1:
+        raw["quant_loop_n"] = 2
     if raw["contract_version"] != AUTOPILOT_CONTRACT_VERSION:
         raise ValueError("autopilot contract version is invalid")
     if not isinstance(raw["enabled"], bool):
@@ -387,14 +390,14 @@ def _cycle_terminal_resolution(
     if not branches or not all(status in _TERMINAL_BRANCH_STATUSES for _, status in branches):
         return None
     quant_statuses = [status for scenario, status in branches if scenario == "fin_quant"]
-    # A successful fin_quant branch is not the end of the capital pipeline.
-    # Portfolio selection, the one-shot final OOS, formal approval and paper
-    # creation still have to run.  Ordinary failed research hypotheses are
-    # retained in the trial ledger and must not block a cycle that still has a
-    # valid champion.  Only a terminal joint-optimization failure is terminal
-    # at the branch layer; later stages are resolved by the completion service.
+    # Autopilot owns research screening only.  A successful fin_quant branch
+    # closes this cycle after freezing its admitted research evidence;
+    # StrategyVersion creation, formal OOS, approval and paper admission belong
+    # exclusively to the separately managed fin_strategy settlement.
     if quant_statuses and all(status in {"failed", "blocked"} for status in quant_statuses):
         return "blocked", "joint_optimization_blocked"
+    if any(status == "succeeded" for status in quant_statuses):
+        return "succeeded", "research_complete"
     return None
 
 
@@ -434,13 +437,10 @@ def _prediction_champion_identity_error(
 
 
 def _cycle_has_capital_commitment(cycle: dict[str, Any]) -> bool:
-    """Return whether a cycle has crossed from research into capital validation.
+    """Classify historical cycles that reached the retired capital workflow.
 
-    A publication from a later cadence bucket may supersede ordinary research,
-    but it must never orphan a joint winner after the formal capital pipeline
-    has started.  The old immutable dataset remains available to finish that
-    one-shot OOS attempt while a new research cycle consumes the latest
-    publication.
+    This compatibility helper is for read-only history and audit projections.
+    The scheduler must never use it to resume the old Autopilot capital path.
     """
 
     branches = list(cycle.get("branches") or [])
@@ -449,8 +449,14 @@ def _cycle_has_capital_commitment(cycle: dict[str, Any]) -> bool:
         and str(item.get("status") or "") == "succeeded"
         for item in branches
     )
-    capital_state = (cycle.get("state") or {}).get(CAPITAL_PIPELINE_STATE_KEY)
+    capital_state = (cycle.get("state") or {}).get("capital_pipeline")
     return quant_succeeded or isinstance(capital_state, dict)
+
+
+def _cycle_has_legacy_capital_state(cycle: dict[str, Any]) -> bool:
+    """Return whether a persisted cycle contains old capital-pipeline state."""
+
+    return isinstance((cycle.get("state") or {}).get("capital_pipeline"), dict)
 
 
 class AutopilotStore:
@@ -976,6 +982,13 @@ class AutopilotStore:
                 select(autopilot_cycles).where(autopilot_cycles.c.status == "active")
             ).all()
             for cycle in cycles:
+                # Historical capital-pipeline rows remain queryable exactly as
+                # recorded.  The retired lane is never resumed or rewritten by
+                # current reconciliation.
+                if isinstance(
+                    dict(cycle.state_json or {}).get("capital_pipeline"), dict
+                ):
+                    continue
                 branches = list(
                     connection.execute(
                         select(
@@ -1081,7 +1094,9 @@ class AutopilotController:
         self.factor_autopilot = FactorAutopilotService(settings)
         self.tournaments = ResearchTournamentStore(settings.database_url)
         self.platform_models = PlatformModelTournamentService(settings)
-        self.capital_pipeline = AutopilotCapitalPipeline(settings)
+        self.champion_selector = AutopilotResearchChampionSelector(
+            settings.database_url
+        )
         self.model_ensembles = ModelEnsemblePipelineService(settings)
 
     def config(self) -> tuple[dict[str, Any], int]:
@@ -1132,6 +1147,7 @@ class AutopilotController:
         listed_cycles = self.store.list_cycles(limit=500)
         latest_cycle_is_active = any(
             item.get("status") == "active"
+            and not _cycle_has_legacy_capital_state(item)
             and item.get("horizon_profile") == horizon_profile
             and str(item.get("dataset_identity_sha256") or "") == latest_identity
             for item in listed_cycles
@@ -1146,11 +1162,12 @@ class AutopilotController:
         # Each weekly/monthly/quarterly event stays on the immutable publication
         # that started it.  A newer daily snapshot in that same bucket waits for
         # the in-flight event to finish; a later bucket supersedes ordinary work.
-        # A cycle that already produced a joint winner is different: its one-shot
-        # capital OOS remains bound to the old vintage and advances independently.
+        # Rows carrying the retired capital-pipeline state are historical only;
+        # this scheduler neither supersedes nor resumes them.
         for stale_cycle in listed_cycles:
             if (
                 stale_cycle.get("status") != "active"
+                or _cycle_has_legacy_capital_state(stale_cycle)
                 or stale_cycle.get("horizon_profile") != horizon_profile
                 or str(stale_cycle.get("dataset_identity_sha256") or "")
                 == latest_identity
@@ -1173,14 +1190,7 @@ class AutopilotController:
                 )
                 failed += 1
                 continue
-            if _cycle_has_capital_commitment(stale_cycle):
-                capital_created, capital_failed = self._advance_capital_cycle(
-                    stale_cycle,
-                    stale_dataset,
-                )
-                created += capital_created
-                failed += capital_failed
-            elif (
+            if (
                 not latest_cycle_is_active
                 and continuing_cycle is None
                 and horizon_research_cadence_bucket(
@@ -1214,6 +1224,10 @@ class AutopilotController:
                 config_revision=revision,
                 horizon_profile=horizon_profile,
             )
+        if _cycle_has_legacy_capital_state(cycle):
+            # The row is historical evidence only.  Managed fin_strategy owns
+            # all new strategy/capital work, including cold-start research.
+            return {"cycles": 1, "branches": created, "failed": failed}
         if cycle.get("status") != "active":
             return {
                 "cycles": 1,
@@ -1519,18 +1533,6 @@ class AutopilotController:
                 failed += 1
         elif quant_branch is not None and self._retry_failed_branch(quant_branch):
             created += 1
-        refreshed_cycle = self.store.get_cycle(str(cycle["id"]))
-        refreshed_quant = self.store.branch_for_scope(
-            str(cycle["id"]), "fin_quant", "joint"
-        )
-        if refreshed_quant is not None and refreshed_quant["status"] == "succeeded":
-            capital_created, capital_failed = self._advance_capital_cycle(
-                refreshed_cycle,
-                dataset,
-            )
-            created += capital_created
-            failed += capital_failed
-            refreshed_cycle = self.store.get_cycle(str(cycle["id"]))
         # A daily data publication must not remain the global active cycle
         # merely because no monthly model tournament was due.  Once every
         # research branch for this immutable vintage is terminal and no new
@@ -1572,7 +1574,6 @@ class AutopilotController:
         if (
             current_cycle.get("status") == "active"
             and no_active_branch
-            and current_quant is None
             and tournament_is_terminal
             and created == 0
         ):
@@ -1587,13 +1588,21 @@ class AutopilotController:
                 in {"blocked", "failed", "cancelled"}
             )
             blocked = bool(branch_failures or failed or tournament_blocked)
+            quant_succeeded = bool(
+                current_quant is not None
+                and str(current_quant.get("status") or "") == "succeeded"
+            )
             state = {
                 **dict(current_cycle.get("state") or {}),
                 "result": (
                     "research_execution_blocked"
                     if blocked
+                    else "research_complete_for_fin_strategy"
+                    if quant_succeeded
                     else "research_complete_no_joint_update"
                 ),
+                "capital_authority": "fin_strategy_settlement",
+                "legacy_autopilot_capital_pipeline": "legacy_readonly",
                 "runner_up_allowed": False,
             }
             if branch_failures:
@@ -1614,75 +1623,18 @@ class AutopilotController:
             self.store.set_cycle_state(
                 str(cycle["id"]),
                 state=state,
-                stage="research_blocked" if blocked else "complete",
+                stage=(
+                    "research_blocked"
+                    if blocked
+                    else "research_complete"
+                    if quant_succeeded
+                    else "complete"
+                ),
                 status="blocked" if blocked else "succeeded",
                 error=("one or more research branches failed" if blocked else None),
                 finished=True,
             )
         return {"cycles": 1, "branches": created, "failed": failed}
-
-    def _advance_capital_cycle(
-        self,
-        cycle: dict[str, Any],
-        dataset: dict[str, Any],
-    ) -> tuple[int, int]:
-        """Advance one immutable capital attempt without reopening research."""
-
-        if str(cycle.get("dataset_identity_sha256") or "") != str(
-            (dataset.get("provenance") or {}).get("dataset_identity_sha256") or ""
-        ):
-            raise ValueError("capital cycle and bound Qlib dataset identities differ")
-        quant_branch = next(
-            (
-                item
-                for item in list(cycle.get("branches") or [])
-                if item.get("scenario") == "fin_quant"
-                and item.get("status") == "succeeded"
-            ),
-            None,
-        )
-        if quant_branch is None or cycle.get("status") == "succeeded":
-            return 0, 0
-        try:
-            capital_progress = self.capital_pipeline.advance(
-                cycle=cycle,
-                dataset=dataset,
-                quant_branch=quant_branch,
-            )
-        except (AutopilotCapitalBlocked, ValueError) as exc:
-            root_state = dict(cycle.get("state") or {})
-            blockers = list(root_state.get("blockers") or [])
-            message = str(exc)
-            if message not in blockers:
-                blockers.append(message)
-            root_state.update(
-                {
-                    "blockers": blockers,
-                    "capital_pipeline_error": message,
-                    "runner_up_allowed": False,
-                }
-            )
-            self.store.set_cycle_state(
-                str(cycle["id"]),
-                state=root_state,
-                stage="capital_gate_blocked",
-                status="blocked",
-                error=message,
-                finished=True,
-            )
-            return 0, 1
-        root_state = {
-            **dict(cycle.get("state") or {}),
-            CAPITAL_PIPELINE_STATE_KEY: capital_progress.state,
-        }
-        self.store.set_cycle_state(
-            str(cycle["id"]),
-            state=root_state,
-            stage=capital_progress.stage,
-            status="succeeded" if capital_progress.complete else "active",
-            finished=capital_progress.complete,
-        )
-        return int(capital_progress.created_jobs), 0
 
     def _retry_failed_branch(self, branch: dict[str, Any]) -> bool:
         if branch.get("status") != "failed":
@@ -1861,7 +1813,15 @@ class AutopilotController:
                     },
                 )
                 created += 1
-            except ValueError:
+            except ValueError as exc:
+                self.platform_models.fail_unattached_lane(
+                    cycle_id=str(cycle["id"]),
+                    dataset_name=str(dataset["name"]),
+                    stage=stage,
+                    feature_set_id=feature_set_id,
+                    horizon_profile=horizon_profile,
+                    error=f"platform model lane setup failed: {exc}",
+                )
                 failed += 1
         return created, failed
 

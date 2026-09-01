@@ -34,6 +34,10 @@ from quant_platform.horizon_review import (
     validate_financial_review_scope,
     validate_financial_review_trigger,
 )
+from quant_platform.investor_profile import (
+    investor_profile_permission_map,
+    validate_investor_profile_binding,
+)
 from quant_platform.paper_policy_state import seal_paper_policy_state
 from quant_platform.portfolio_policy import (
     PortfolioPolicy,
@@ -72,6 +76,46 @@ from quant_platform.strategy_rule_runtime import (
 _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS = frozenset(
     {"benchmark_relative_qp", "industry_neutral_qp"}
 )
+
+
+def _apply_investor_profile_permissions(
+    risk_projection: pd.DataFrame,
+    binding: dict[str, Any],
+    *,
+    on_date: date,
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    """Block exposure increases outside the paper account's frozen permissions."""
+
+    profile = validate_investor_profile_binding(binding)
+    projection = risk_projection.copy()
+    permissions = investor_profile_permission_map(
+        profile,
+        set(projection.index.astype(str)),
+        on_date=on_date,
+    )
+    for instrument, evidence in permissions.items():
+        if evidence["allowed"] is True:
+            continue
+        current_state = str(projection.loc[instrument, "risk_state"])
+        if current_state not in {"reduce", "exit"}:
+            projection.loc[instrument, "risk_state"] = "restricted"
+        projection.loc[instrument, "allow_new_risk"] = False
+        raw_reasons = projection.loc[instrument, "risk_reasons"]
+        try:
+            reasons = json.loads(str(raw_reasons))
+        except json.JSONDecodeError:
+            reasons = []
+        if not isinstance(reasons, list):
+            reasons = []
+        reason = str(evidence.get("reason") or "investor_permission_denied")
+        if reason not in reasons:
+            reasons.append(reason)
+        projection.loc[instrument, "risk_reasons"] = json.dumps(
+            reasons,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    return projection, permissions
 
 
 def _load(path: str) -> pd.DataFrame:
@@ -423,6 +467,19 @@ def _write_qlib_order_plan(
         "target_weights_file_sha256": target_file_sha256,
         "target_weights_sha256": target_weights_sha256,
     }
+    raw_profile_binding = manifest.get("investor_profile_binding")
+    if isinstance(raw_profile_binding, dict):
+        plan["investor_profile_binding"] = validate_investor_profile_binding(
+            raw_profile_binding
+        )
+    elif str((manifest.get("config") or {}).get("horizon_profile") or "") in {
+        "short_1_5d",
+        "swing_1_6m",
+        "long_1_3y",
+    }:
+        raise ValueError(
+            "explicit-horizon paper order-plan has no investor-profile binding"
+        )
     if signal_at is not None:
         plan["signal_at"] = str(signal_at)
     if manifest.get("execution_not_before") is not None:
@@ -911,6 +968,24 @@ def main() -> None:
         as_of=market_as_of,
         instruments=required_instruments,
     ).set_index("instrument")
+    investor_permission_evidence: dict[str, dict[str, Any]] = {}
+    if manifest.get("artifact_kind") == "simulation_order_plan":
+        raw_profile_binding = manifest.get("investor_profile_binding")
+        explicit_horizon = str(
+            (manifest.get("config") or {}).get("horizon_profile") or ""
+        ) in {"short_1_5d", "swing_1_6m", "long_1_3y"}
+        if explicit_horizon and not isinstance(raw_profile_binding, dict):
+            raise ValueError(
+                "simulation order-plan has no frozen investor-profile binding"
+            )
+        if isinstance(raw_profile_binding, dict):
+            risk_projection, investor_permission_evidence = (
+                _apply_investor_profile_permissions(
+                    risk_projection,
+                    raw_profile_binding,
+                    on_date=market_as_of.date(),
+                )
+            )
     # A positive current close is part of the recommendation evidence contract.
     # Without it, an existing position may be frozen and marked from the latest
     # PIT close, but a new instrument must not become an order.
@@ -1013,6 +1088,7 @@ def main() -> None:
             "member_risk_state": dict(manifest.get("member_risk_state") or {}),
             "account_risk_state": dict(manifest.get("account_risk_state") or {}),
             "instrument_risk_states": instrument_risk_evidence,
+            "investor_profile_permissions": investor_permission_evidence,
             "frozen_instruments": sorted(frozen_instruments),
             "reference_price_sources": reference_price_sources,
             "eligibility": eligibility_evidence,

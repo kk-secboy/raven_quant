@@ -45,6 +45,9 @@ from quant_platform.transparent_baseline_runner import (
     STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION,
     STRATEGY_RESEARCH_V20_TARGET_RUNNER_SHA256,
     STRATEGY_RESEARCH_V20_TARGET_RUNTIME_BUNDLE_SHA256,
+    STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION,
+    STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256,
+    STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
@@ -166,6 +169,13 @@ def _config(
     if recipe_version == STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION:
         bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             STRATEGY_RESEARCH_V20_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            _WORKER_IMAGE_DIGEST
+        )
+    if recipe_version == STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256
         )
         bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
             _WORKER_IMAGE_DIGEST
@@ -370,7 +380,7 @@ def test_historical_v17_identity_is_not_rebound_to_current_v18_runtime() -> None
         )
 
 
-def test_historical_v18_identity_is_not_rebound_to_current_v21_runtime() -> None:
+def test_historical_v18_identity_is_not_rebound_to_current_v22_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     with pytest.raises(ValueError, match="transparent v18 runtime bundle differs"):
@@ -394,7 +404,7 @@ def test_historical_v18_identity_is_not_rebound_to_current_v21_runtime() -> None
         )
 
 
-def test_historical_v20_identity_is_not_rebound_to_current_v21_runtime() -> None:
+def test_historical_v20_identity_is_not_rebound_to_current_v22_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     assert target_runner_for_recipe(
@@ -424,7 +434,37 @@ def test_historical_v20_identity_is_not_rebound_to_current_v21_runtime() -> None
         )
 
 
-def test_current_v21_identity_is_bound_and_executable() -> None:
+def test_historical_v21_identity_is_not_rebound_to_current_v22_runtime() -> None:
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    assert target_runner_for_recipe(
+        "short_relative_strength", STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION
+    ) == STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256
+    assert target_runtime_bundle_for_recipe(
+        "short_relative_strength", STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION
+    ) == STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256
+    with pytest.raises(ValueError, match="transparent v21 runtime bundle differs"):
+        require_transparent_baseline_runner(
+            config=_config(
+                STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION,
+                STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
+            runner_path=runner,
+        )
+
+
+def test_current_v22_identity_is_bound_and_executable() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
     config = _config(
         STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
@@ -452,7 +492,7 @@ def test_current_v21_identity_is_bound_and_executable() -> None:
     ) == STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
 
 
-def test_current_v21_job_identity_cannot_be_changed() -> None:
+def test_current_v22_job_identity_cannot_be_changed() -> None:
     config = _config(
         STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
@@ -736,6 +776,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0092_strategy_runtime_v21.py"
     ).read_text(encoding="utf-8")
+    v22_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0093_strategy_runtime_v22.py"
+    ).read_text(encoding="utf-8")
     database_metadata = (
         Path(__file__).parents[1] / "src" / "quant_data" / "database.py"
     ).read_text(encoding="utf-8")
@@ -778,11 +824,16 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     assert STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 in v19_migration
     assert STRATEGY_RESEARCH_V20_TARGET_RUNNER_SHA256 in v20_migration
     assert STRATEGY_RESEARCH_V20_TARGET_RUNTIME_BUNDLE_SHA256 in v20_migration
-    assert STRATEGY_RESEARCH_TARGET_RECIPE_VERSION in v21_migration
-    assert STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 in v21_migration
-    assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in v21_migration
+    assert STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION in v21_migration
+    assert STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256 in v21_migration
+    assert STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256 in v21_migration
     assert "down_revision: str | None = \"0091_strategy_runtime_v20\"" in v21_migration
+    assert STRATEGY_RESEARCH_TARGET_RECIPE_VERSION in v22_migration
+    assert STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 in v22_migration
+    assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in v22_migration
+    assert "down_revision: str | None = \"0092_strategy_runtime_v21\"" in v22_migration
     assert STRATEGY_RESEARCH_V20_TARGET_RUNTIME_BUNDLE_SHA256 in database_metadata
+    assert STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256 in database_metadata
     assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in database_metadata
 
 

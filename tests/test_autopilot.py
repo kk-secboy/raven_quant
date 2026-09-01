@@ -14,6 +14,7 @@ from quant_platform.autopilot import (
     AutopilotController,
     _asset_available_on,
     _cycle_has_capital_commitment,
+    _cycle_has_legacy_capital_state,
     _cycle_terminal_resolution,
     _derived_branch_status,
     _profile_family_multiple_testing,
@@ -44,7 +45,9 @@ def test_autopilot_defaults_to_safe_automatic_paper_only() -> None:
     assert config["paper_min_calendar_days"] == 183
     assert config["report_daily_limit"] == 20
     assert config["quant_cooldown_days"] == 7
+    assert config["quant_loop_n"] == 2
     assert config["factor_research_interval_days"] == 1
+    assert normalize_autopilot_config({"quant_loop_n": 1})["quant_loop_n"] == 2
 
 
 def test_autopilot_never_allows_a_shorter_real_money_observation_window() -> None:
@@ -88,7 +91,10 @@ def test_autopilot_distinguishes_completed_jobs_from_blocked_research() -> None:
     assert _derived_branch_status("blocked", "succeeded") == "blocked"
     assert _derived_branch_status("blocked", "failed") == "blocked"
     assert _derived_branch_status("succeeded", "succeeded") == "succeeded"
-    assert _derived_branch_status("running", "failed") == "running"
+    # A terminal current evaluator is authoritative when the parent run
+    # projection is stale; otherwise the cycle looks active forever even
+    # though no job can be claimed.
+    assert _derived_branch_status("running", "failed") == "failed"
     assert _derived_branch_status("unknown", "failed") == "failed"
 
 
@@ -105,15 +111,15 @@ def test_autopilot_cycles_do_not_remain_active_after_terminal_failures() -> None
     assert _cycle_terminal_resolution(
         [("fin_factor", "succeeded"), ("fin_quant", "failed")]
     ) == ("blocked", "joint_optimization_blocked")
-    assert (
-        _cycle_terminal_resolution(
-            [("fin_factor", "succeeded"), ("fin_quant", "succeeded")]
-        )
-        is None
+    assert _cycle_terminal_resolution(
+        [("fin_factor", "succeeded"), ("fin_quant", "succeeded")]
+    ) == (
+        "succeeded",
+        "research_complete",
     )
 
 
-def test_only_joint_winners_are_protected_from_daily_research_supersession() -> None:
+def test_historical_capital_commitment_classifier_remains_for_audit() -> None:
     assert not _cycle_has_capital_commitment(
         {
             "state": {},
@@ -128,6 +134,18 @@ def test_only_joint_winners_are_protected_from_daily_research_supersession() -> 
             "state": {},
             "branches": [{"scenario": "fin_quant", "status": "succeeded"}],
         }
+    )
+
+
+def test_only_persisted_old_capital_state_is_legacy_readonly() -> None:
+    assert not _cycle_has_legacy_capital_state(
+        {
+            "state": {},
+            "branches": [{"scenario": "fin_quant", "status": "succeeded"}],
+        }
+    )
+    assert _cycle_has_legacy_capital_state(
+        {"state": {"capital_pipeline": {"phase": "formal_backtest"}}}
     )
     assert _cycle_has_capital_commitment(
         {

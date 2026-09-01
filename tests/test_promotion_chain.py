@@ -47,6 +47,7 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
+from quant_platform.investor_profile import InvestorSimulationProfileStore
 from quant_platform.member_risk_gate import load_strategy_risk_state
 from quant_platform.promotion import (
     ForwardGateThresholds,
@@ -205,6 +206,24 @@ def _short_version(
 
 
 def _attach_simulation(store: PromotionStore, version_id: str) -> dict:
+    profiles = InvestorSimulationProfileStore(store.database_url)
+    if profiles.get_active("primary") is None:
+        profiles.create_version(
+            profile_key="primary",
+            initial_capital="100000",
+            risk_profile="balanced",
+            min_cash_weight=0.10,
+            max_gross_exposure=0.90,
+            market_permissions={
+                "main_board": True,
+                "star_market": True,
+                "chi_next": True,
+                "beijing_exchange": False,
+                "etf": True,
+            },
+            actor=ACTOR,
+            activate=True,
+        )
     store.open_paper_stage(version_id, actor=ACTOR)
     stage = store.attach_paper_simulation(
         version_id,

@@ -6,7 +6,11 @@ import pytest
 
 from quant_platform.investor_profile import (
     InvestorSimulationProfileStore,
+    bind_investor_profile,
     investor_profile_permission,
+    require_investor_profile_target_permissions,
+    require_matching_active_profile_binding,
+    validate_investor_profile_binding,
 )
 
 
@@ -51,6 +55,79 @@ def test_first_run_permissions_fail_closed_for_new_risk_by_board() -> None:
         "permission_key": None,
         "reason": "instrument_permission_scope_unknown",
     }
+
+
+@pytest.mark.no_database
+def test_paper_binding_freezes_profile_identity_and_all_five_permissions() -> None:
+    binding = bind_investor_profile(
+        {
+            "id": "profile-200k-v1",
+            "profile_key": "primary",
+            "version": 1,
+            "content_sha256": "a" * 64,
+            "market_permissions": {
+                "main_board": True,
+                "star_market": True,
+                "chi_next": True,
+                "beijing_exchange": False,
+                "etf": True,
+            },
+        }
+    )
+
+    assert validate_investor_profile_binding(binding) == binding
+    assert binding["profile_id"] == "profile-200k-v1"
+    assert binding["profile_version"] == 1
+    assert binding["profile_content_sha256"] == "a" * 64
+    assert binding["market_permissions"] == {
+        "beijing_exchange": False,
+        "chi_next": True,
+        "etf": True,
+        "main_board": True,
+        "star_market": True,
+    }
+
+    tampered = {
+        **binding,
+        "market_permissions": {
+            **binding["market_permissions"],
+            "beijing_exchange": True,
+        },
+    }
+    with pytest.raises(ValueError, match="immutable verification"):
+        validate_investor_profile_binding(tampered)
+
+    changed = {
+        "id": "profile-200k-v2",
+        "profile_key": "primary",
+        "version": 2,
+        "content_sha256": "b" * 64,
+        "market_permissions": binding["market_permissions"],
+    }
+    with pytest.raises(ValueError, match="cannot continue forward evidence"):
+        require_matching_active_profile_binding(binding, changed)
+
+    with pytest.raises(ValueError, match="exposure increase"):
+        require_investor_profile_target_permissions(
+            binding,
+            {"830001.BJ": 0.10},
+            {},
+            on_date=date(2026, 8, 31),
+        )
+    # A disabled market can always be reduced or exited; permission is a buy
+    # boundary, not a trap that makes an existing position impossible to sell.
+    require_investor_profile_target_permissions(
+        binding,
+        {"830001.BJ": 0.05},
+        {"830001.BJ": 0.10},
+        on_date=date(2026, 8, 31),
+    )
+    require_investor_profile_target_permissions(
+        binding,
+        {},
+        {"830001.BJ": 0.10},
+        on_date=date(2026, 8, 31),
+    )
 
 
 def test_investor_simulation_profile_requires_explicit_capital_and_versions_changes(

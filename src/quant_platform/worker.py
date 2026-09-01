@@ -72,6 +72,7 @@ from .forward_only_rehabilitation import (
     require_replay_markers,
 )
 from .horizon_review import resolve_financial_review_trigger
+from .investor_profile import validate_investor_profile_binding
 from .job_store import (
     INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
     MAX_NUMERICAL_THREADS_PER_JOB,
@@ -178,6 +179,91 @@ from .transparent_baseline_runner import (
 
 _DATABASE_RETRY_INITIAL_SECONDS = 0.5
 _DATABASE_RETRY_MAX_SECONDS = 5.0
+_FIN_QUANT_REQUIRED_ABLATIONS = (
+    "factor_only",
+    "model_only",
+    "joint",
+    "joint_vs_incumbent",
+)
+
+
+def _paper_settlement_status(stage: dict[str, Any] | None) -> str:
+    """Report paper validation only after the isolated account is active."""
+
+    if (
+        stage
+        and str(stage.get("status") or "") == "active"
+        and str(stage.get("simulation_portfolio_id") or "").strip()
+    ):
+        return "paper_validating"
+    return "awaiting_paper_account"
+
+
+def _validate_fin_quant_research_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate the non-capital fin_quant proposal/negative-result boundary."""
+
+    coverage = result.get("fin_quant_coverage")
+    outcome = result.get("fin_quant_outcome")
+    bundles = result.get("quant_bundles")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("contract_version") != "fin-quant-arm-coverage-v2"
+        or not isinstance(outcome, dict)
+        or outcome.get("contract_version") != "fin-quant-research-outcome-v1"
+        or not isinstance(bundles, list)
+    ):
+        raise ValueError("fin_quant arm-coverage result contract is invalid")
+    attempted = list(coverage.get("attempted_arms") or [])
+    accepted = list(coverage.get("accepted_arms") or [])
+    if (
+        len(attempted) != len(set(attempted))
+        or len(accepted) != len(set(accepted))
+        or not set(accepted).issubset(attempted)
+        or not set(attempted).issubset({"factor", "model"})
+        or coverage.get("attempted_complete")
+        != (set(attempted) == {"factor", "model"})
+        or coverage.get("complete") != (set(accepted) == {"factor", "model"})
+        or coverage.get("single_arm") != (len(accepted) == 1)
+        or outcome.get("attempted_arms") != attempted
+        or outcome.get("accepted_arms") != accepted
+        or outcome.get("required_independent_ablations")
+        != list(_FIN_QUANT_REQUIRED_ABLATIONS)
+        or outcome.get("joint_ablation_completed") is not False
+        or outcome.get("capital_authority") is not False
+    ):
+        raise ValueError("fin_quant arm-coverage evidence is inconsistent")
+    if bundles:
+        if (
+            coverage.get("complete") is not True
+            or set(accepted) != {"factor", "model"}
+            or outcome.get("status") != "joint_proposal_ready"
+            or outcome.get("reason_code") is not None
+        ):
+            raise ValueError("fin_quant joint proposal lacks complete accepted arms")
+        for bundle in bundles:
+            if (
+                not isinstance(bundle, dict)
+                or bundle.get("delivery_status") != "research_only"
+                or bundle.get("required_independent_ablations")
+                != list(_FIN_QUANT_REQUIRED_ABLATIONS)
+                or bundle.get("joint_ablation_completed") is not False
+                or bundle.get("capital_authority") is not False
+                or bundle.get("arm_coverage") != {"factor": True, "model": True}
+            ):
+                raise ValueError("fin_quant joint proposal crossed its research boundary")
+    else:
+        expected_reason = (
+            "arm_acceptance_incomplete"
+            if coverage.get("attempted_complete") is True
+            else "arm_attempt_coverage_incomplete"
+        )
+        if (
+            coverage.get("complete") is True
+            or outcome.get("status") != "governed_negative"
+            or outcome.get("reason_code") != expected_reason
+        ):
+            raise ValueError("fin_quant empty result is not a governed negative")
+    return outcome
 
 
 def _frozen_model_label_contract(model_signal: dict[str, Any] | None) -> tuple[dict, str] | None:
@@ -899,9 +985,11 @@ class LocalJobWorker:
                 )
             return settlement
         stage = self.promotions.current_stage(version_id)
+        settlement_status = _paper_settlement_status(stage)
+        paper_ready = settlement_status == "paper_validating"
         settlement.update(
             {
-                "status": "paper_validating",
+                "status": settlement_status,
                 "promotion_stage": str(approved.get("promotion_stage") or "paper"),
                 "paper_stage_id": str((stage or {}).get("id") or "") or None,
                 "paper_portfolio_id": str(
@@ -911,6 +999,10 @@ class LocalJobWorker:
                 "forward_evidence_reset": True,
             }
         )
+        if not paper_ready:
+            settlement["reason"] = (
+                "approved strategy is waiting for an active isolated paper account"
+            )
         runtime["fin_strategy_formal_settlement"] = settlement
         if str(run.get("status") or "") in {"queued", "running", "evaluating"}:
             self.research.mark_run(
@@ -1248,10 +1340,8 @@ class LocalJobWorker:
                         raise ValueError(
                             "general_model produced no implementation-ready model artifact"
                         )
-                    if scenario.id == "fin_quant" and not result.get("quant_bundles"):
-                        raise ValueError(
-                            "fin_quant produced no accepted executable factor-model bundle"
-                        )
+                    if scenario.id == "fin_quant":
+                        _validate_fin_quant_research_result(result)
                 except (TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
@@ -1611,12 +1701,39 @@ class LocalJobWorker:
                                 runtime={**runtime, "model_candidates": len(candidates)},
                             )
                         elif scenario.id == "fin_quant":
-                            bundles = self._queue_quant_bundle_evaluation(job, result or {})
-                            self.research.mark_run(
-                                research_run_id,
-                                "evaluating",
-                                runtime={**runtime, "quant_bundles": bundles},
+                            quant_result = result or {}
+                            outcome = _validate_fin_quant_research_result(
+                                quant_result
                             )
+                            if quant_result.get("quant_bundles"):
+                                bundles = self._queue_quant_bundle_evaluation(
+                                    job, quant_result
+                                )
+                                self.research.mark_run(
+                                    research_run_id,
+                                    "evaluating",
+                                    runtime={
+                                        **runtime,
+                                        "quant_bundles": bundles,
+                                        "fin_quant_outcome": outcome,
+                                    },
+                                )
+                            else:
+                                # Executing both governed research arms does not
+                                # guarantee that both are accepted.  Preserve a
+                                # clean negative result instead of retrying it as
+                                # an infrastructure failure; it has no capital
+                                # authority and queues no independent evaluator.
+                                self.research.mark_run(
+                                    research_run_id,
+                                    "succeeded",
+                                    runtime={
+                                        **runtime,
+                                        "quant_bundles": 0,
+                                        "negative_result": outcome["reason_code"],
+                                        "fin_quant_outcome": outcome,
+                                    },
+                                )
                         elif scenario.id == "fin_strategy":
                             strategy_archive = self._archive_fin_strategy_artifacts(
                                 research_run_id,
@@ -4882,6 +4999,21 @@ class LocalJobWorker:
                 or strategy_config.get("horizon_profile")
                 or "legacy_ambiguous"
             )
+            raw_investor_profile_binding = dict(
+                portfolio.get("execution_policy") or {}
+            ).get("investor_profile_binding")
+            investor_profile_binding = (
+                validate_investor_profile_binding(raw_investor_profile_binding)
+                if isinstance(raw_investor_profile_binding, dict)
+                else None
+            )
+            if (
+                horizon_profile in {"short_1_5d", "swing_1_6m", "long_1_3y"}
+                and investor_profile_binding is None
+            ):
+                raise ValueError(
+                    "paper order-plan account has no frozen investor-profile binding"
+                )
             requires_complete_holding_age = (
                 horizon_profile in {"short_1_5d", "swing_1_6m", "long_1_3y"}
                 or strategy_config.get("max_holding_sessions") is not None
@@ -4983,6 +5115,7 @@ class LocalJobWorker:
                 "dataset_lineage_id": provenance["dataset_lineage_id"],
                 "promotion_stage_id": promotion_stage["id"],
                 "promotion_stage_opened_at": promotion_stage["opened_at"],
+                "investor_profile_binding": investor_profile_binding,
                 "signal_date": payload["signal_date"],
                 "signal_at": signal_at,
                 "execution_not_before": execution_not_before,
@@ -7790,6 +7923,7 @@ class LocalJobWorker:
             raise ValueError("fin_quant incumbent has no frozen model label evidence")
 
     def _queue_quant_bundle_evaluation(self, job: dict, result: dict) -> int:
+        _validate_fin_quant_research_result(result)
         payload = job["payload"]
         feature_set = payload.get("feature_set") or {}
         periods = payload.get("periods") or {}

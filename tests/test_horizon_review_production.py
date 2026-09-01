@@ -23,6 +23,7 @@ from quant_platform.horizon_review import (
     resolve_financial_review_trigger,
     validate_financial_review_scope,
 )
+from quant_platform.investor_profile import bind_investor_profile
 from quant_platform.promotion import (
     PromotionStore,
     build_horizon_review_evidence,
@@ -30,6 +31,24 @@ from quant_platform.promotion import (
 )
 from quant_platform.research_horizon import LONG_1_3Y, SWING_1_6M
 from scripts import run_recommendation_refresh
+
+
+def _paper_binding() -> dict:
+    return bind_investor_profile(
+        {
+            "id": "profile-1",
+            "profile_key": "primary",
+            "version": 1,
+            "content_sha256": "f" * 64,
+            "market_permissions": {
+                "main_board": True,
+                "star_market": True,
+                "chi_next": True,
+                "beijing_exchange": False,
+                "etf": True,
+            },
+        }
+    )
 
 
 def _completed_at(value: date) -> datetime:
@@ -190,6 +209,7 @@ def test_order_plan_writes_only_an_actual_swing_decision_review(
         "promotion_stage_opened_at": "2026-08-01T00:00:00+00:00",
         "dataset": "daily-1",
         "dataset_identity_sha256": "a" * 64,
+        "investor_profile_binding": _paper_binding(),
         "signal_date": "2026-08-31",
         "config": {
             "execution_contract_hash": "e" * 64,
@@ -277,6 +297,7 @@ def test_long_order_plan_persists_new_pit_financial_review_binding(
         "promotion_stage_opened_at": "2026-08-01T00:00:00+00:00",
         "dataset": "daily-1",
         "dataset_identity_sha256": "a" * 64,
+        "investor_profile_binding": _paper_binding(),
         "signal_date": "2026-08-31",
         "financial_review_trigger": trigger,
         "config": {
@@ -375,6 +396,7 @@ def test_unrelated_financial_batch_does_not_claim_an_off_cadence_review(
         "promotion_stage_opened_at": "2026-08-01T00:00:00+00:00",
         "dataset": "daily-1",
         "dataset_identity_sha256": "a" * 64,
+        "investor_profile_binding": _paper_binding(),
         "signal_date": "2026-08-31",
         "financial_review_trigger": trigger,
         "config": {

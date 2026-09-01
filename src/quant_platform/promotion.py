@@ -43,7 +43,6 @@ from sqlalchemy import func, insert, select, text, update
 from quant_data.database import (
     account_netting_plans,
     backtest_runs,
-    investor_simulation_profiles,
     open_database,
     recommendation_portfolios,
     recommendation_snapshots,
@@ -72,6 +71,11 @@ from quant_platform.forward_only_rehabilitation import (
 )
 from quant_platform.forward_only_rehabilitation import (
     canonical_sha256 as rehabilitation_canonical_sha256,
+)
+from quant_platform.investor_profile import (
+    InvestorSimulationProfileStore,
+    bind_investor_profile,
+    validate_investor_profile_binding,
 )
 from quant_platform.research_horizon import (
     LEGACY_AMBIGUOUS,
@@ -1269,19 +1273,22 @@ class PromotionStore:
                 select(strategy_versions).where(strategy_versions.c.id == version_id)
             ).one()
         config = dict(version.config_json or {})
-        if initial_cash is None and str(version.horizon_profile) != "legacy_ambiguous":
-            with self.engine.connect() as connection:
-                profile_cash = connection.scalar(
-                    select(investor_simulation_profiles.c.initial_capital).where(
-                        investor_simulation_profiles.c.profile_key == "primary",
-                        investor_simulation_profiles.c.status == "active",
-                    )
-                )
-            if profile_cash is None:
+        profile_binding: dict[str, Any] | None = None
+        if str(version.horizon_profile) != "legacy_ambiguous":
+            active_profile = InvestorSimulationProfileStore(
+                self.database_url
+            ).get_active("primary")
+            if active_profile is None:
                 raise ValueError(
                     "paper account awaits explicit investor capital and market permissions"
                 )
-            initial_cash = float(profile_cash)
+            profile_binding = bind_investor_profile(active_profile)
+            profile_cash = float(active_profile["initial_capital"])
+            if initial_cash is not None and abs(float(initial_cash) - profile_cash) > 1e-6:
+                raise ValueError(
+                    "paper account capital must equal the active investor-profile version"
+                )
+            initial_cash = profile_cash
         # Capacity remains in the research contract; the paper principal is
         # the explicit investor-owned account input for all new horizons.
         cash = resolve_paper_initial_cash(
@@ -1322,6 +1329,7 @@ class PromotionStore:
                     # account while each batch records the exact rolled snapshots.
                     daily_roll_policy="latest_compatible",
                     execution_roll_policy="latest_compatible",
+                    investor_profile_binding=profile_binding,
                 )
             except ValueError:
                 # A crash/concurrent retry may have committed the account but
@@ -1367,6 +1375,19 @@ class PromotionStore:
             raise ValueError(
                 "paper stage account notional differs from the frozen formal contract"
             )
+        if profile_binding is not None:
+            raw_portfolio_binding = dict(
+                portfolio.get("execution_policy") or {}
+            ).get("investor_profile_binding")
+            if (
+                not isinstance(raw_portfolio_binding, dict)
+                or validate_investor_profile_binding(raw_portfolio_binding)
+                != profile_binding
+            ):
+                raise ValueError(
+                    "paper stage account investor-profile binding differs from "
+                    "the active immutable profile version"
+                )
         with self.engine.begin() as connection:
             current_portfolio = connection.execute(
                 select(simulation_portfolios)

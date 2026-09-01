@@ -26,6 +26,7 @@ from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.promotion import PromotionStore
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
+from quant_platform.simulation_store import SimulationStore
 from quant_platform.strategy_store import StrategyStore
 from scripts.run_recommendation_refresh import _next_known_trading_date
 
@@ -166,6 +167,19 @@ def test_three_horizon_research_to_recommendation_snapshot(
         daily_dataset={**_governed_daily_dataset(), "name": "synthetic-qlib"},
         execution_dataset={**_governed_daily_dataset(), "name": "synthetic-qlib"},
     )
+    paper = SimulationStore(database_url).get(stage["simulation_portfolio_id"])
+    binding = paper["execution_policy"]["investor_profile_binding"]
+    assert float(paper["initial_cash"]) == 5_000_000.0
+    assert binding["profile_id"]
+    assert binding["profile_version"] == 1
+    assert len(binding["profile_content_sha256"]) == 64
+    assert binding["market_permissions"] == {
+        "beijing_exchange": False,
+        "chi_next": False,
+        "etf": True,
+        "main_board": True,
+        "star_market": False,
+    }
     _seed_evidence(
         promotion,
         stage["simulation_portfolio_id"],

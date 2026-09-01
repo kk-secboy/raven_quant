@@ -25,6 +25,7 @@ from quant_data.database import (
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.api import StrategyConfigRequest
+from quant_platform.investor_profile import InvestorSimulationProfileStore
 from quant_platform.promotion import PromotionStore
 from quant_platform.research_automation import ResearchWindowUnavailableError
 from quant_platform.research_horizon import research_horizon_contract
@@ -2185,6 +2186,22 @@ def test_three_daily_baseline_artifacts_load_and_attach_paper_simulations(
     }
     promotion = PromotionStore(database_url)
     engine = open_database(database_url)
+    InvestorSimulationProfileStore(database_url).create_version(
+        profile_key="primary",
+        initial_capital="100000",
+        risk_profile="balanced",
+        min_cash_weight=0.10,
+        max_gross_exposure=0.90,
+        market_permissions={
+            "main_board": True,
+            "star_market": True,
+            "chi_next": True,
+            "beijing_exchange": False,
+            "etf": True,
+        },
+        actor="test-investor",
+        activate=True,
+    )
 
     for plan, version in zip(plans, versions, strict=True):
         recipe = plan["recipe"]

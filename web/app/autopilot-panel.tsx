@@ -7,6 +7,8 @@ import { usePolling } from "./use-polling";
 type Branch = { id: string; scenario: string; status: string; error?: string | null };
 type Cycle = {
   id: string; dataset: string; status: string; stage: string; updated_at: string; branches: Branch[];
+  authority_scope?: "research_only" | "legacy_readonly";
+  capital_entry?: "fin_strategy_settlement";
   state?: { blockers?: string[]; [key: string]: unknown };
 };
 type Trial = {
@@ -21,6 +23,11 @@ type AutopilotState = {
   config: { enabled: boolean; paper_min_calendar_days: number; [key: string]: unknown };
   revision: number; state: "running" | "idle" | "paused";
   current_cycle?: Cycle | null; current_stage?: string; next_action?: string;
+  capital_authority?: {
+    automatic_entry: "fin_strategy_settlement";
+    legacy_autopilot_capital_pipeline: "legacy_readonly";
+    autopilot_scope: string;
+  };
   tournament?: Tournament | null; cycles: Cycle[];
   report_backfill: { counts: Record<string, number>; selected: number; published: number; bytes_downloaded: number; complete: boolean };
   real_trading: { connected: false; automatic: false; minimum_paper_calendar_days: number; decision: "manual_only" };
@@ -228,6 +235,7 @@ const STAGE_LABELS: Record<string, string> = {
   joint_optimization: "联合优化", portfolio_selection: "组合方案选择",
   formal_backtest: "正式 OOS", final_oos: "正式 OOS",
   paper: "模拟运行", complete: "日常运行", research_blocked: "研究阻断",
+  research_complete: "研究冠军已冻结", legacy_readonly: "旧资本记录（只读）",
   joint_optimization_blocked: "联合优化阻断", dataset_unavailable: "数据版本不可用",
   capital_gate_blocked: "组合与模拟门禁阻断",
 };
@@ -745,6 +753,8 @@ function AdvancedAutopilotPanel({
   const enabled = autopilot?.config.enabled === true;
   const autopilotUnavailable = !autopilot && autopilotLoadState === "error";
   const cycleBlocked = cycle?.status === "blocked";
+  const cycleLegacyReadonly = cycle?.authority_scope === "legacy_readonly";
+  const autopilotRunning = autopilot?.state === "running";
   const stage = autopilot?.current_stage ?? cycle?.stage ?? "waiting_for_data";
   const nextAction = autopilot?.next_action ?? "等待系统确定下一步动作";
   const tournament = autopilot?.tournament ?? null;
@@ -796,10 +806,10 @@ function AdvancedAutopilotPanel({
   return <div className="autopilot-page">
     {loadWarning ? <div className="notice">{loadWarning}</div> : null}
     {message ? <div className="notice">{message}</div> : null}
-    <section className={`autopilot-hero ${autopilot && enabled && !cycleBlocked ? "is-on" : ""}`}>
+    <section className={`autopilot-hero ${autopilotRunning && !cycleBlocked ? "is-on" : ""}`}>
       <div>
         <span className="status-chip">SINGLE AUTOPILOT CYCLE</span>
-        <h2>{autopilotUnavailable ? "自动驾驶状态暂不可用" : !autopilot ? "正在读取自动驾驶状态" : !enabled ? "自动驾驶已暂停" : cycleBlocked ? "本轮研究已阻断" : "唯一主线正在运行"}</h2>
+        <h2>{autopilotUnavailable ? "自动驾驶状态暂不可用" : !autopilot ? "正在读取自动驾驶状态" : !enabled ? "自动驾驶已暂停" : cycleBlocked ? "本轮研究已阻断" : cycleLegacyReadonly ? "旧资本记录仅供查询" : autopilotRunning ? "唯一主线正在运行" : "研究周期已完成"}</h2>
         <p>{!autopilot ? (autopilotUnavailable ? "无法读取当前周期；页面不会把未知状态误报为已暂停。" : "正在读取当前周期和研究分支。") : cycle ? `当前数据版本 ${cycle.dataset}，当前阶段：${STAGE_LABELS[stage] ?? stage}。` : "等待下一份通过血缘校验的 Qlib 日频数据，之后自动开始研究。"}</p>
         <div className="autopilot-next"><span>系统下一步</span><strong>{nextAction}</strong></div>
         <div className="autopilot-actions">
@@ -808,22 +818,22 @@ function AdvancedAutopilotPanel({
           <button className="action-button action-primary" onClick={() => onNavigate(8)}>查看模拟盘</button>
         </div>
       </div>
-      <div className="autopilot-state-panel"><span className={autopilot && enabled && !cycleBlocked ? "live" : ""}><i />{STAGE_LABELS[stage] ?? "自动驾驶"}</span><strong>{!autopilot ? (autopilotUnavailable ? "状态未知" : "检查中") : !enabled ? "已暂停" : cycleBlocked ? "已阻断" : statusText(cycle?.status)}</strong><small>权限边界：仅研究与模拟盘<br />不连接真实券商</small></div>
+      <div className="autopilot-state-panel"><span className={autopilotRunning && !cycleBlocked ? "live" : ""}><i />{STAGE_LABELS[stage] ?? "自动驾驶"}</span><strong>{!autopilot ? (autopilotUnavailable ? "状态未知" : "检查中") : !enabled ? "已暂停" : cycleBlocked ? "已阻断" : cycleLegacyReadonly ? "历史只读" : statusText(cycle?.status)}</strong><small>Autopilot：只做因子/模型/联合研究<br />资本入口：fin_strategy 结算<br />不连接真实券商</small></div>
     </section>
 
     <section className="autopilot-flow autopilot-flow-six" aria-label="唯一自动驾驶流水线">
       <article className={automation?.coverage.ready ? "ready" : automationLoadState === "error" ? "blocked" : "waiting"}><span>01</span><div><strong>每日数据</strong><small>{automation ? `${automation.coverage.covered}/${automation.coverage.total}项 · ${timeText(nextRun)}` : automationLoadState === "error" ? "状态暂不可用" : "读取中"}</small></div></article>
       <article className={branchClass(researchStatus)}><span>02</span><div><strong>并行研究</strong><small>{["fin_factor", "fin_model", "fin_factor_report"].map((id) => `${SCENARIO_LABELS[id]}：${statusText(branchByScenario[id]?.status)}`).join(" · ")}</small></div></article>
       <article className={branchClass(tournament?.status)}><span>03</span><div><strong>因子 / 模型竞赛</strong><small>{tournament ? `${completedTrials}/${tournament.max_trials}项已有结论` : "等待研究候选"}</small></div></article>
-      <article className={branchClass(latestStrategyRun?.status ?? branchByScenario.fin_quant?.status)}><span>04</span><div><strong>联合优化与策略规则</strong><small>因子/模型：{statusText(branchByScenario.fin_quant?.status)} · 策略规则：{statusText(latestStrategyRun?.status)}</small></div></article>
-      <article className={["paper", "complete"].includes(stage) ? "ready" : ["portfolio_selection", "formal_backtest", "final_oos"].includes(stage) ? "running" : "waiting"}><span>05</span><div><strong>风险与一次 OOS</strong><small>{["formal_backtest", "final_oos"].includes(stage) ? "唯一冻结冠军正在消费最终样本" : stage === "portfolio_selection" ? "预最终区间比较 TopK 与行业中性 QP" : "前置验证通过后只打开一次"}</small></div></article>
+      <article className={branchClass(branchByScenario.fin_quant?.status)}><span>04</span><div><strong>联合优化与研究冠军</strong><small>fin_quant：{statusText(branchByScenario.fin_quant?.status)} · 只冻结研究分数源，不创建策略或账户</small></div></article>
+      <article className={branchClass(latestStrategyRun?.status)}><span>05</span><div><strong>策略规则与资本门禁</strong><small>{latestStrategyRun ? `fin_strategy：${statusText(latestStrategyRun.status)} · 由其结算唯一 StrategyVersion、正式 OOS 与模拟准入` : "等待受管 fin_strategy 研究；旧 Autopilot 资本链不会启动"}</small></div></article>
       <article className={latestSimulation ? "ready" : stage === "paper" ? "running" : "waiting"}><span>06</span><div><strong>模拟与每日候选</strong><small>{latestSimulation ? `${latestSimulation.name} · ${statusText(latestSimulation.status)}` : "硬门禁通过后自动创建"}</small></div></article>
     </section>
 
     <section className="autopilot-summary autopilot-summary-six">
       <article><span>当前阶段</span><strong>{STAGE_LABELS[stage] ?? stage}</strong><small>{timeText(cycle?.updated_at)}</small></article>
       <article><span>竞赛进度</span><strong>{tournament ? `${completedTrials}/${tournament.max_trials}` : "—/—"}</strong><small>{(trialCounts.running ?? 0) + (trialCounts.queued ?? 0)} 项执行中 · {trialCounts.rejected ?? 0} 项未晋级</small></article>
-      <article><span>当前冠军</span><strong className="autopilot-summary-name">{selectedTrial ? selectedTrial.model_family ?? selectedTrial.feature_set_id ?? selectedTrial.name : "等待产生"}</strong><small>{selectedTrial?.feature_set_id ?? "预最终验证后冻结"}</small></article>
+      <article><span>研究冠军</span><strong className="autopilot-summary-name">{selectedTrial ? selectedTrial.model_family ?? selectedTrial.feature_set_id ?? selectedTrial.name : "等待产生"}</strong><small>{selectedTrial ? `${selectedTrial.feature_set_id ?? "联合信号"} · 尚无资本权限` : "由 fin_strategy 读取后再做策略竞赛"}</small></article>
       <article><span>模拟盘 NAV</span><strong>{latestSimulation?.latest_nav?.nav?.toFixed(4) ?? latestSimulation?.nav?.toFixed(4) ?? "—"}</strong><small>{latestSimulation?.latest_nav ? `${latestSimulation.latest_nav.trade_date} · ${pct(latestSimulation.latest_nav.daily_return)}` : "尚未建立合格账户"}</small></article>
       <article><span>模拟持仓</span><strong>{candidateCount || "—"}</strong><small>{latestSimulation?.latest_batch?.trade_date ?? latestSimulation?.latest_batch?.signal_date ?? "模拟盘建立后生成；不代表实盘建议"}</small></article>
       <article><span>需要你处理</span><strong>{blockers.length}</strong><small>{blockers.length ? "只处理真正异常" : "当前无需操作"}</small></article>
@@ -840,6 +850,6 @@ function AdvancedAutopilotPanel({
       </> : <div className="empty">{paperTarget?.blocker ? `订单计划校验失败：${paperTarget.blocker}` : "没有合格的模拟账户或订单计划时，系统保持等待，不生成示例股票。"}</div>}
     </section>
 
-    <section className="autopilot-help"><div><h3>无需每天点按钮</h3><p>系统自动更新数据、研究因子、模型和策略规则，生成模拟候选与目标仓位，并执行 T+1 模拟成交、费用和 NAV。只有 PIT、独立复算、统计、多重检验、成本、风险和最终 OOS 全部通过后才进入隔离模拟。前向证据达标后自动晋级：短线至少 90 个交易日、60 次决策和 30 个闭环；中线至少 252 个交易日、24 次复核和 6 个周期；长线至少 252 个交易日、12 次月度及 4 次财报复核。长线运行满 3 年只增加成熟度标识，不阻断已达门槛的推荐。</p></div><div className="autopilot-help-actions"><button className="action-button action-ghost" onClick={() => onOpenAdvanced(2)}>查看竞赛试验</button><button className="action-button action-ghost" onClick={() => onOpenAdvanced(5)}>查看因子库</button></div></section>
+    <section className="autopilot-help"><div><h3>无需每天点按钮</h3><p>Autopilot 自动更新数据并完成因子、模型、fin_quant 研究和冠军选择，但不会创建 StrategyVersion、正式 OOS、批准或模拟账户。受管 fin_strategy 读取冻结冠军，完成规则竞赛并作为唯一资本结算入口；只有 PIT、独立复算、统计、多重检验、成本、风险和最终 OOS 全部通过后才进入隔离模拟。前向证据达标后自动晋级：短线至少 90 个交易日、60 次决策和 30 个闭环；中线至少 252 个交易日、24 次复核和 6 个周期；长线至少 252 个交易日、12 次月度及 4 次财报复核。长线运行满 3 年只增加成熟度标识，不阻断已达门槛的推荐。</p></div><div className="autopilot-help-actions"><button className="action-button action-ghost" onClick={() => onOpenAdvanced(2)}>查看竞赛试验</button><button className="action-button action-ghost" onClick={() => onOpenAdvanced(5)}>查看因子库</button></div></section>
   </div>;
 }

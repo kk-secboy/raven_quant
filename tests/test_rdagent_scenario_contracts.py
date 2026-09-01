@@ -723,8 +723,29 @@ def test_quant_exporter_accumulates_alternating_accepted_factor_model_rounds(
     assert bundles[1]["model"]["code_sha256"] == model["code_sha256"]
     coverage = bridge._fin_quant_arm_coverage(rounds)
     assert coverage["complete"] is True
+    assert coverage["attempted_complete"] is True
     assert coverage["single_arm"] is False
+    assert coverage["attempted_arms"] == ["factor", "model"]
     assert bundles[0]["arm_coverage"] == {"factor": True, "model": True}
+    assert bundles[0]["delivery_status"] == "research_only"
+    assert bundles[0]["capital_authority"] is False
+    assert bundles[0]["joint_ablation_completed"] is False
+    assert bundles[0]["required_independent_ablations"] == [
+        "factor_only",
+        "model_only",
+        "joint",
+        "joint_vs_incumbent",
+    ]
+    outcome = bridge._fin_quant_research_outcome(coverage, bundles)
+    assert outcome["status"] == "joint_proposal_ready"
+    assert outcome["capital_authority"] is False
+    assert worker_module._validate_fin_quant_research_result(
+        {
+            "fin_quant_coverage": coverage,
+            "fin_quant_outcome": outcome,
+            "quant_bundles": bundles,
+        }
+    ) == outcome
 
 
 def test_quant_exporter_rejects_based_counterpart_as_arm_coverage(
@@ -778,8 +799,28 @@ def test_quant_exporter_rejects_based_counterpart_as_arm_coverage(
     coverage = bridge._fin_quant_arm_coverage(rounds)
     assert coverage["complete"] is False
     assert coverage["single_arm"] is True
+    assert coverage["attempted_arms"] == ["factor"]
     assert coverage["accepted_arms"] == ["factor"]
     assert coverage["based_artifacts_count_as_arm_coverage"] is False
+    outcome = bridge._fin_quant_research_outcome(coverage, [])
+    assert outcome["status"] == "governed_negative"
+    assert outcome["reason_code"] == "arm_attempt_coverage_incomplete"
+    assert outcome["capital_authority"] is False
+    assert worker_module._validate_fin_quant_research_result(
+        {
+            "fin_quant_coverage": coverage,
+            "fin_quant_outcome": outcome,
+            "quant_bundles": [],
+        }
+    ) == outcome
+    with pytest.raises(ValueError, match="arm-coverage evidence is inconsistent"):
+        worker_module._validate_fin_quant_research_result(
+            {
+                "fin_quant_coverage": coverage,
+                "fin_quant_outcome": {**outcome, "capital_authority": True},
+                "quant_bundles": [],
+            }
+        )
 
 
 def test_quant_exporter_does_not_count_an_empty_current_factor_arm(
@@ -839,3 +880,7 @@ def test_quant_exporter_does_not_count_an_empty_current_factor_arm(
     coverage = bridge._fin_quant_arm_coverage(rounds)
     assert coverage["accepted_arms"] == ["model"]
     assert coverage["single_arm"] is True
+    assert coverage["attempted_arms"] == ["factor", "model"]
+    outcome = bridge._fin_quant_research_outcome(coverage, [])
+    assert outcome["status"] == "governed_negative"
+    assert outcome["reason_code"] == "arm_acceptance_incomplete"

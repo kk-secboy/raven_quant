@@ -14,8 +14,11 @@ from .universe import (
 LEGACY_DAILY_QLIB_FIELD_CONTRACT_VERSION = (
     "daily-qlib-field-v5-governed-domestic-etf"
 )
-DAILY_QLIB_FIELD_CONTRACT_VERSION = (
+PREVIOUS_DAILY_QLIB_FIELD_CONTRACT_VERSION = (
     "daily-qlib-field-v6-fail-closed-missing-controls"
+)
+DAILY_QLIB_FIELD_CONTRACT_VERSION = (
+    "daily-qlib-field-v7-pit-financial-revisions"
 )
 DAILY_MISSING_EXECUTION_CONTROL_POLICY = (
     "formal-nontradable-instrument-day-v1"
@@ -280,10 +283,15 @@ def require_next_bar_execution(
 def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
     if provenance.get("frequency") != "day":
         raise ValueError("daily Qlib dataset provenance frequency is invalid")
-    if provenance.get("field_contract_version") not in {
-        LEGACY_DAILY_QLIB_FIELD_CONTRACT_VERSION,
-        DAILY_QLIB_FIELD_CONTRACT_VERSION,
-    }:
+    # Do not retain backward compatibility here.  v5 lacks the current
+    # execution-control policy and v6 globally selected later financial
+    # revisions before their final/actual disclosure date.  Both remain
+    # readable as forensic artifacts, but neither may feed governed research,
+    # backtests, simulations, or recommendations after the PIT repair.
+    if (
+        provenance.get("field_contract_version")
+        != DAILY_QLIB_FIELD_CONTRACT_VERSION
+    ):
         raise ValueError("daily Qlib dataset uses an obsolete field contract; rebuild it")
     if (
         provenance.get("source_volume_unit") != TUSHARE_DAILY_VOLUME_UNIT

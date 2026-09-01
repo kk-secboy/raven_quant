@@ -5,10 +5,10 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v17, the narrowly scoped v18 consumed-history rehabilitation, and v20 remain
-# historical identities.  v21 is the current ordinary three-horizon recipe
-# and binds the governed factor/model signal hand-off into strategy research.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-01-v21"
+# v17, the narrowly scoped v18 consumed-history rehabilitation, v20, and v21
+# remain historical identities.  v22 is the current ordinary three-horizon
+# recipe and seals the complete governed research-to-paper economic closure.
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-01-v22"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

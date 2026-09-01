@@ -102,6 +102,83 @@ def _enable_qlib_file_tracking_compatibility() -> None:
     DockerEnv._run = governed_run  # type: ignore[method-assign]
 
 
+_FIN_QUANT_ARMS = ("factor", "model")
+
+
+def _next_missing_fin_quant_arm(attempted: set[str]) -> str | None:
+    """Return the next required arm in the deterministic coverage order."""
+
+    return next((arm for arm in _FIN_QUANT_ARMS if arm not in attempted), None)
+
+
+def _enable_fin_quant_arm_coverage() -> None:
+    """Give both official fin_quant arms one attempt before normal bandit choice.
+
+    The pinned upstream loop starts with ``factor`` and subsequently delegates
+    to its Thompson-sampling controller.  With the platform's former one-loop
+    budget that made a factor/model joint experiment impossible; even with a
+    larger budget the bandit was free to keep selecting the same arm.  This
+    adapter leaves the upstream loop, Trace, reward updates and bandit draw in
+    place.  It only overrides a draw while one arm has never been attempted in
+    this run, then returns control to the official choice.
+    """
+
+    from rdagent.app.qlib_rd_loop.conf import QUANT_PROP_SETTING
+    from rdagent.scenarios.qlib.proposal.bandit import EnvController
+    from rdagent.scenarios.qlib.proposal.quant_proposal import (
+        QlibQuantHypothesisGen,
+    )
+
+    if QUANT_PROP_SETTING.action_selection != "bandit":
+        raise RuntimeError(
+            "governed fin_quant arm coverage requires the pinned official bandit"
+        )
+    if getattr(EnvController, "_quantlab_arm_coverage_enabled", False):
+        return
+
+    original_record = EnvController.record
+    original_decide = EnvController.decide
+    original_convert_response = QlibQuantHypothesisGen.convert_response
+
+    def governed_record(self: Any, metric: Any, arm: str) -> None:
+        if arm not in _FIN_QUANT_ARMS:
+            raise RuntimeError(f"official fin_quant selected an unsupported arm: {arm}")
+        attempted = set(getattr(self, "_quantlab_attempted_arms", set()))
+        attempted.add(arm)
+        self._quantlab_attempted_arms = attempted
+        original_record(self, metric, arm)
+
+    def governed_decide(self: Any, metric: Any) -> str:
+        # Always execute the official draw so controller/RNG behavior resumes
+        # from the state it would have had without this bounded coverage rule.
+        official_action = original_decide(self, metric)
+        if official_action not in _FIN_QUANT_ARMS:
+            raise RuntimeError(
+                f"official fin_quant bandit selected an unsupported arm: {official_action}"
+            )
+        attempted = set(getattr(self, "_quantlab_attempted_arms", set()))
+        forced_action = _next_missing_fin_quant_arm(attempted)
+        self._quantlab_last_action_source = (
+            "coverage_policy" if forced_action is not None else "official_bandit"
+        )
+        return forced_action or official_action
+
+    def governed_convert_response(self: Any, response: str) -> Any:
+        hypothesis = original_convert_response(self, response)
+        selected_action = str(getattr(self, "targets", ""))
+        if selected_action not in _FIN_QUANT_ARMS:
+            raise RuntimeError("fin_quant hypothesis generator lost its selected arm")
+        # Upstream asks the LLM to echo the action, but does not verify the echo.
+        # The host-owned action choice must remain authoritative.
+        hypothesis.action = selected_action
+        return hypothesis
+
+    EnvController.record = governed_record  # type: ignore[method-assign]
+    EnvController.decide = governed_decide  # type: ignore[method-assign]
+    EnvController._quantlab_arm_coverage_enabled = True
+    QlibQuantHypothesisGen.convert_response = governed_convert_response  # type: ignore[method-assign]
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2 or not (
         argv[1].startswith("rdagent.app.")
@@ -119,6 +196,8 @@ def main(argv: list[str]) -> int:
     if not _embedding_is_configured(dict(os.environ)):
         _disable_optional_costeer_embeddings()
     target = importlib.import_module(module)
+    if module == "rdagent.app.qlib_rd_loop.quant":
+        _enable_fin_quant_arm_coverage()
     entry = getattr(target, "main", None)
     if not callable(entry):
         raise RuntimeError(f"RD-Agent module has no callable main: {module}")

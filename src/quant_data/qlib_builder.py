@@ -41,6 +41,7 @@ from .execution_contract import (
     TUSHARE_DAILY_AMOUNT_UNIT,
     TUSHARE_DAILY_VOLUME_UNIT,
     TUSHARE_HAND_SIZE,
+    require_daily_qlib_contract,
 )
 from .history_bounds import (
     BSE_GOVERNED_HISTORY_START,
@@ -176,10 +177,14 @@ _CAPITAL_FLOW_FIELD_UNITS = {
 
 # Fundamental research fields dumped into the Qlib binaries, grouped by the
 # source statement table. Every table feeds the same point-in-time channel:
-# an ASOF join keyed on the announcement date (trade_date > ann_date), never
-# on the report period (end_date), so no field here can leak an unpublished
-# report. Fundamentals are never price-normalized: absolute amounts stay in
-# CNY yuan and per-share values in yuan per share.
+# an ASOF join keyed on the row's effective disclosure date
+# (trade_date > max(ann_date, f_ann_date when present)), never on the report
+# period (end_date).  A later final/revision announcement therefore cannot
+# replace the value visible between the original and revised disclosures. An
+# undated conflicting revision is delayed to ingested_at; if that upper bound
+# is missing too, publication fails closed.
+# Fundamentals are never price-normalized: absolute amounts stay in CNY yuan
+# and per-share values in yuan per share.
 #
 # q_profit_yoy, inv_turn, ocf_to_or, ocf_to_profit and salescash_to_or are
 # documented Tushare fina_indicator output columns (doc_id=79) but flagged
@@ -2838,11 +2843,11 @@ class QlibBuilder:
         )
         if balancesheet is None or audit is None:
             raise ValueError("eligibility financial source schema changed during publication")
-        balancesheet = _select_latest_fundamental_revisions(
+        balancesheet = _select_fundamental_revision_events(
             balancesheet,
             value_columns=[equity_column],
         )
-        audit = _select_latest_fundamental_revisions(
+        audit = _select_fundamental_revision_events(
             audit,
             value_columns=[opinion_column],
         )
@@ -2884,14 +2889,14 @@ class QlibBuilder:
         financials = pd.DataFrame(
             {
                 "instrument": balancesheet["ts_code"].map(_qlib_symbol),
-                "announcement_date": balancesheet["ann_date"],
+                "announcement_date": balancesheet["available_at"],
                 "equity": pd.to_numeric(balancesheet[equity_column], errors="coerce"),
             }
         )
         audits = pd.DataFrame(
             {
                 "instrument": audit["ts_code"].map(_qlib_symbol),
-                "announcement_date": audit["ann_date"],
+                "announcement_date": audit["available_at"],
                 "audit_opinion": audit[opinion_column].astype(str),
             }
         )
@@ -3417,24 +3422,48 @@ class QlibBuilder:
                 for source, target in features.items()
             )
             projected_columns = ["ts_code", "ann_date", "end_date", *features]
-            projected = ", ".join(projected_columns)
+            source_columns = self._parquet_columns(dataset)
+            revision_rows = _fundamental_revision_rows_sql(
+                (
+                    "SELECT * FROM read_parquet("
+                    f"{statement}, hive_partitioning=true, union_by_name=true)"
+                ),
+                payload_columns=projected_columns,
+                source_columns=source_columns,
+            )
+            candidate_projection = ", ".join(
+                f"candidate.{_sql_identifier(column)}" for column in projected_columns
+            )
             revision_order = _fundamental_revision_order(
-                projected_columns, self._parquet_columns(dataset)
+                projected_columns,
+                source_columns,
+                table="candidate",
+                available_at_column="available_at",
             )
             fundamental_join += f"""
                 ASOF LEFT JOIN (
-                    SELECT {projected}
-                    FROM read_parquet(
-                        {statement}, hive_partitioning=true, union_by_name=true
+                    WITH normalized AS (
+                        SELECT * FROM ({revision_rows})
+                        WHERE ts_code IS NOT NULL
+                    ), events AS (
+                        SELECT DISTINCT
+                            ts_code AS event_ts_code,
+                            available_at AS event_available_at
+                        FROM normalized
+                        WHERE available_at IS NOT NULL
                     )
-                    WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
+                    SELECT {candidate_projection}, event_available_at AS available_at
+                    FROM events
+                    INNER JOIN normalized candidate
+                      ON candidate.ts_code = event_ts_code
+                     AND candidate.available_at <= event_available_at
                     QUALIFY row_number() OVER (
-                        PARTITION BY ts_code, try_cast(ann_date AS DATE)
+                        PARTITION BY event_ts_code, event_available_at
                         ORDER BY {revision_order}
                     ) = 1
                 ) {dataset}
                   ON d.ts_code = {dataset}.ts_code
-                 AND try_cast(d.trade_date AS DATE) > try_cast({dataset}.ann_date AS DATE)
+                 AND {_as_date_sql("trade_date", table="d")} > {dataset}.available_at
             """
         return f"""
             WITH {scale_relation},
@@ -3657,6 +3686,9 @@ class QlibBuilder:
         # Version 6: non-default fina_indicator columns are sourced from a
         # narrow companion dataset because the relay rejects an all-field
         # cross-section request; both use the same announcement-date policy.
+        # Version 7: financial revisions retain their own effective disclosure
+        # date (max of ann_date and an explicit final/actual announcement date)
+        # instead of replacing the original row retroactively.
         availability_datasets = (
             "daily_basic",
             "moneyflow",
@@ -3669,7 +3701,7 @@ class QlibBuilder:
             "index_member_all",
         )
         return {
-            "version": 6,
+            "version": 7,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
             "capital_flow_fields": capital_flow_fields,
@@ -3688,6 +3720,14 @@ class QlibBuilder:
             "availability_policy": {
                 dataset: availability_contract_label(dataset)
                 for dataset in availability_datasets
+            },
+            "fundamental_revision_availability": {
+                "version": 1,
+                "explicit_boundary": "max_ann_date_and_valid_final_or_actual_date",
+                "undated_revision_fallback": "ingested_at_upper_bound",
+                "fallback_visibility": "strictly_after_ingestion_date",
+                "unsequenced_conflict": "fail_closed",
+                "row_source_column": "available_at_source",
             },
             "recoverability": {
                 dataset: recoverability_level(dataset)
@@ -3823,6 +3863,11 @@ class QlibBuilder:
                     issues.append(f"{dataset} has no usable rows")
 
         if not issues:
+            revision_issue = self._fundamental_revision_conflict_issue()
+            if revision_issue:
+                issues.append(revision_issue)
+
+        if not issues:
             conflict_issue = self._industry_membership_conflict_issue(
                 industry_columns
             )
@@ -3838,6 +3883,53 @@ class QlibBuilder:
 
         if issues:
             raise RuntimeError("Qlib research inputs are incomplete: " + "; ".join(issues))
+
+    def _fundamental_revision_conflict_issue(self) -> str | None:
+        """Report financial versions that have no defensible PIT sequence."""
+
+        for dataset, features in self.research_feature_contract[
+            "fundamental_fields"
+        ].items():
+            source_columns = self._parquet_columns(dataset)
+            if not source_columns:
+                continue
+            projected_columns = ["ts_code", "ann_date", "end_date", *features]
+            statement = _sql_string(
+                str(
+                    (
+                        self.snapshot_path
+                        / "parquet"
+                        / dataset
+                        / "**"
+                        / "*.parquet"
+                    ).resolve()
+                )
+            )
+            revision_rows = _fundamental_revision_rows_sql(
+                (
+                    "SELECT * FROM read_parquet("
+                    f"{statement}, hive_partitioning=true, union_by_name=true)"
+                ),
+                payload_columns=projected_columns,
+                source_columns=source_columns,
+            )
+            connection = self._duckdb_connection()
+            try:
+                unresolved = int(
+                    connection.execute(
+                        "SELECT count(*) FROM ("
+                        + revision_rows
+                        + ") WHERE available_at_source = 'unresolved_conflict'"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+            if unresolved:
+                return (
+                    f"{dataset} has {unresolved} conflicting financial revision rows "
+                    "without a reliable disclosure or ingestion timestamp"
+                )
+        return None
 
     def _industry_membership_conflict_issue(
         self, industry_columns: set[str]
@@ -4169,8 +4261,10 @@ def _read_parquet_columns(
         return None
     return pd.concat(frames, ignore_index=True)
 
-def _as_date_sql(column: str) -> str:
+def _as_date_sql(column: str, *, table: str | None = None) -> str:
     identifier = '"' + column.replace('"', '""') + '"'
+    if table is not None:
+        identifier = '"' + table.replace('"', '""') + '".' + identifier
     return (
         f"coalesce(try_cast({identifier} AS DATE), "
         f"try_strptime(CAST({identifier} AS VARCHAR), '%Y%m%d')::DATE)"
@@ -4185,50 +4279,229 @@ def _nonblank_text_sql(column: str) -> str:
     )
 
 
+def _fundamental_available_at_sql(source_columns: set[str]) -> str:
+    """Return the effective disclosure date for one financial source row.
+
+    Tushare statement endpoints distinguish ``ann_date`` (announcement date)
+    from ``f_ann_date`` (actual/final announcement date).  Both can be present
+    on rows with the same business key.  The latter is a revision visibility
+    boundary, not a selector that may be applied retroactively at
+    ``ann_date``.  Invalid or absent optional dates conservatively fall back to
+    ``ann_date``; a provider date earlier than ``ann_date`` can never make the
+    row visible sooner.
+
+    ``actual_date`` is accepted for schema-compatible financial sources that
+    carry that explicit disclosure timestamp.  Acquisition lineage such as
+    ``ingested_at`` is deliberately excluded from this *explicit* boundary;
+    ``_fundamental_revision_rows_sql`` may use it only as a conservative upper
+    bound for an otherwise undated conflicting revision.
+    """
+
+    announced = _as_date_sql("ann_date")
+    candidates = [announced]
+    for column in ("f_ann_date", "actual_date"):
+        if column in source_columns:
+            candidates.append(f"coalesce({_as_date_sql(column)}, {announced})")
+    return (
+        f"CASE WHEN {announced} IS NULL THEN NULL "
+        f"ELSE greatest({', '.join(candidates)}) END"
+    )
+
+
+def _fundamental_revision_rows_sql(
+    source_sql: str,
+    *,
+    payload_columns: list[str],
+    source_columns: set[str],
+) -> str:
+    """Classify every financial version with a non-retroactive PIT boundary.
+
+    Explicit issuer disclosure dates win.  When conflicting payloads share a
+    business key but a later version has no explicit revision date, the first
+    evidenced payload remains the announcement-date baseline and every other
+    version is delayed to its row-level ``ingested_at`` date.  That timestamp
+    is only a conservative upper bound on visibility, never evidence that the
+    revision existed at the old announcement date.  An unsequenced conflict is
+    returned as ``unresolved_conflict`` with a null ``available_at`` so callers
+    can fail closed instead of selecting by update_flag or row order.
+    """
+
+    announced = _as_date_sql("ann_date")
+    report_end = (
+        _as_date_sql("end_date")
+        if "end_date" in source_columns
+        else "NULL::DATE"
+    )
+    explicit_available = _fundamental_available_at_sql(source_columns)
+    explicit_dates = [
+        _as_date_sql(column)
+        for column in ("f_ann_date", "actual_date")
+        if column in source_columns
+    ]
+    has_explicit = (
+        " OR ".join(f"({value}) IS NOT NULL" for value in explicit_dates)
+        if explicit_dates
+        else "false"
+    )
+    ingested = (
+        _as_date_sql("ingested_at")
+        if "ingested_at" in source_columns
+        else "NULL::DATE"
+    )
+    update_order = (
+        "try_cast(update_flag AS DOUBLE)"
+        if "update_flag" in source_columns
+        else "NULL::DOUBLE"
+    )
+    hashed = ", ".join(
+        f"coalesce(CAST({_sql_identifier(column)} AS VARCHAR), '<NULL>')"
+        for column in payload_columns
+    )
+    payload_hash = f"md5(concat_ws('|', {hashed}))"
+    group = "ts_code, _pit_announced_at, _pit_report_end"
+    available_at = """
+        CASE
+            WHEN _pit_announced_at IS NULL THEN NULL
+            WHEN _pit_payload_versions <= 1 THEN _pit_explicit_available_at
+            WHEN _pit_has_explicit THEN _pit_explicit_available_at
+            WHEN _pit_has_explicit_baseline = 0
+                 AND _pit_payload_hash = _pit_nonexplicit_baseline
+                THEN _pit_announced_at
+            WHEN _pit_ingested_at IS NOT NULL
+                THEN greatest(_pit_announced_at, _pit_ingested_at)
+            ELSE NULL
+        END
+    """
+    availability_source = """
+        CASE
+            WHEN _pit_announced_at IS NULL THEN 'invalid_announcement_date'
+            WHEN _pit_payload_versions <= 1 AND _pit_has_explicit
+                THEN 'explicit_disclosure'
+            WHEN _pit_payload_versions <= 1 THEN 'announcement_date'
+            WHEN _pit_has_explicit THEN 'explicit_disclosure'
+            WHEN _pit_has_explicit_baseline = 0
+                 AND _pit_payload_hash = _pit_nonexplicit_baseline
+                THEN 'announcement_date_baseline'
+            WHEN _pit_ingested_at IS NOT NULL THEN 'ingested_at_upper_bound'
+            ELSE 'unresolved_conflict'
+        END
+    """
+    return f"""
+        WITH raw AS (
+            SELECT
+                *,
+                {announced} AS _pit_announced_at,
+                {report_end} AS _pit_report_end,
+                {explicit_available} AS _pit_explicit_available_at,
+                ({has_explicit}) AS _pit_has_explicit,
+                {ingested} AS _pit_ingested_at,
+                {update_order} AS _pit_update_order,
+                {payload_hash} AS _pit_payload_hash
+            FROM ({source_sql})
+        ), ranked AS (
+            SELECT
+                *,
+                count(DISTINCT _pit_payload_hash) OVER (
+                    PARTITION BY {group}
+                ) AS _pit_payload_versions,
+                max(
+                    CASE
+                        WHEN _pit_has_explicit
+                         AND _pit_explicit_available_at = _pit_announced_at
+                            THEN 1 ELSE 0
+                    END
+                ) OVER (PARTITION BY {group}) AS _pit_has_explicit_baseline,
+                first_value(_pit_payload_hash) OVER (
+                    PARTITION BY {group}
+                    ORDER BY
+                        CASE WHEN _pit_has_explicit THEN 1 ELSE 0 END,
+                        _pit_update_order ASC NULLS LAST,
+                        _pit_ingested_at ASC NULLS LAST,
+                        _pit_payload_hash ASC
+                ) AS _pit_nonexplicit_baseline
+            FROM raw
+        )
+        SELECT
+            * EXCLUDE (
+                _pit_announced_at,
+                _pit_report_end,
+                _pit_explicit_available_at,
+                _pit_has_explicit,
+                _pit_ingested_at,
+                _pit_update_order,
+                _pit_payload_hash,
+                _pit_payload_versions,
+                _pit_has_explicit_baseline,
+                _pit_nonexplicit_baseline
+            ),
+            {available_at} AS available_at,
+            {availability_source} AS available_at_source
+        FROM ranked
+    """
+
+
 def _fundamental_revision_order(
-    projected_columns: list[str], source_columns: set[str]
+    projected_columns: list[str],
+    source_columns: set[str],
+    *,
+    table: str | None = None,
+    available_at_column: str | None = None,
 ) -> str:
     """Deterministic total order for conflicting financial revision rows.
 
-    Rows sharing (ts_code, ann_date, end_date) conflict when a report is
-    re-announced or silently revised and both versions survive in the snapshot.
-    Resolve them deterministically: newest f_ann_date / update_flag when the
-    source provides them, then the newest row-level ingested_at, and finally a
-    content hash over the projected columns so the chosen row never depends on
-    parquet file or row order.
+    Rows sharing (ts_code, available_at) can contain several report periods or
+    conflicting copies of one revision.  Resolve only that *same-visibility*
+    conflict deterministically: newest report period, then revision metadata,
+    and finally a content hash.  Rows with different availability dates are
+    intentionally retained for the per-session ASOF join.
     """
 
-    ordering = ["try_cast(end_date AS DATE) DESC NULLS LAST"]
+    def identifier(column: str) -> str:
+        quoted = _sql_identifier(column)
+        return f"{_sql_identifier(table)}.{quoted}" if table is not None else quoted
+
+    ordering = [f"{_as_date_sql('end_date', table=table)} DESC NULLS LAST"]
+    if available_at_column is not None:
+        ordering.append(f"{identifier(available_at_column)} DESC NULLS LAST")
     if "f_ann_date" in source_columns:
-        ordering.append("try_cast(f_ann_date AS DATE) DESC NULLS LAST")
+        ordering.append(
+            f"{_as_date_sql('f_ann_date', table=table)} DESC NULLS LAST"
+        )
     if "update_flag" in source_columns:
-        ordering.append("try_cast(update_flag AS DOUBLE) DESC NULLS LAST")
+        ordering.append(
+            f"try_cast({identifier('update_flag')} AS DOUBLE) DESC NULLS LAST"
+        )
     if "ingested_at" in source_columns:
-        ordering.append("ingested_at DESC NULLS LAST")
+        ordering.append(f"{identifier('ingested_at')} DESC NULLS LAST")
     hashed = ", ".join(
-        f'coalesce(CAST("{column}" AS VARCHAR), \'\')' for column in projected_columns
+        f"coalesce(CAST({identifier(column)} AS VARCHAR), '')"
+        for column in projected_columns
     )
     ordering.append(f"md5(concat_ws('|', {hashed})) ASC")
     return ", ".join(ordering)
 
 
-def _select_latest_fundamental_revisions(
+def _select_fundamental_revision_events(
     values: pd.DataFrame,
     *,
     value_columns: list[str],
 ) -> pd.DataFrame:
-    """Resolve one deterministic financial row per instrument/announcement.
+    """Keep one deterministic financial state change per availability date.
 
     Eligibility consumes the same point-in-time statement surface as the
     formal factor join.  In particular, one announcement date can contain
-    multiple report periods and multiple revisions of the newest period.  Use
-    the shared SQL ordering contract rather than allowing pandas/parquet row
-    order to decide which equity or audit value reaches the eligibility gate.
+    multiple report periods and later ``f_ann_date`` revisions.  Preserve the
+    original and revised disclosures as separate events; collapse only rows
+    visible on the same date with the shared SQL ordering contract rather than
+    allowing pandas/parquet row order to decide which value reaches the gate.
 
     Older snapshots may not contain ``end_date``.  They remain readable, but a
     null synthetic report period sorts behind any evidenced report period.
-    Visibility is still governed solely by ``ann_date`` in
-    ``build_point_in_time_eligibility`` (strictly after the announcement day).
+    ``available_at`` is the later of ``ann_date`` and a valid explicit final or
+    actual disclosure date. An otherwise undated conflicting revision uses
+    ``ingested_at`` only as a conservative upper bound and exposes that choice
+    in ``available_at_source``. Eligibility still applies the conservative
+    strictly-after rule to the derived date.
     """
 
     required = {"ts_code", "ann_date", *value_columns}
@@ -4251,24 +4524,70 @@ def _select_latest_fundamental_revisions(
     ]
     payload_columns = ["ts_code", "ann_date", "end_date", *value_columns]
     projected_columns = list(dict.fromkeys([*payload_columns, *revision_columns]))
-    projection = ", ".join(_sql_identifier(column) for column in projected_columns)
-    revision_order = _fundamental_revision_order(payload_columns, source_columns)
+    projection = ", ".join(
+        f"candidate.{_sql_identifier(column)}" for column in projected_columns
+    )
+    revision_order = _fundamental_revision_order(
+        payload_columns,
+        source_columns,
+        table="candidate",
+        available_at_column="available_at",
+    )
+    revision_rows = _fundamental_revision_rows_sql(
+        "SELECT * FROM fundamental_revision_source",
+        payload_columns=payload_columns,
+        source_columns=source_columns,
+    )
 
     connection = duckdb.connect()
     try:
         connection.register("fundamental_revision_source", source)
-        return connection.execute(
+        unresolved = int(
+            connection.execute(
+                "SELECT count(*) FROM ("
+                + revision_rows
+                + ") WHERE available_at_source = 'unresolved_conflict'"
+            ).fetchone()[0]
+        )
+        if unresolved:
+            raise ValueError(
+                f"{unresolved} financial revision rows have conflicting payloads "
+                "without a reliable disclosure or ingestion timestamp"
+            )
+        selected = connection.execute(
             f"""
-            SELECT {projection}
-            FROM fundamental_revision_source
-            WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
+            WITH normalized AS (
+                SELECT * FROM ({revision_rows})
+                WHERE ts_code IS NOT NULL
+            ), events AS (
+                SELECT DISTINCT
+                    ts_code AS event_ts_code,
+                    available_at AS event_available_at
+                FROM normalized
+                WHERE available_at IS NOT NULL
+            )
+            SELECT
+                {projection},
+                event_available_at AS available_at,
+                candidate.available_at_source
+            FROM events
+            INNER JOIN normalized candidate
+              ON candidate.ts_code = event_ts_code
+             AND candidate.available_at <= event_available_at
             QUALIFY row_number() OVER (
-                PARTITION BY ts_code, try_cast(ann_date AS DATE)
+                PARTITION BY event_ts_code, event_available_at
                 ORDER BY {revision_order}
             ) = 1
-            ORDER BY ts_code, try_cast(ann_date AS DATE)
+            ORDER BY candidate.ts_code, event_available_at
             """
         ).fetch_df()
+        # DuckDB exposes DATE projections to pandas at microsecond precision,
+        # while the market calendar is nanosecond-normalized.  Keep the public
+        # eligibility frame dtype-stable for merge_asof.
+        selected["available_at"] = pd.to_datetime(
+            selected["available_at"], errors="coerce"
+        ).astype("datetime64[ns]")
+        return selected
     finally:
         connection.close()
 
@@ -4322,7 +4641,18 @@ def build_qlib_output_manifest(qlib_dir: Path) -> dict[str, Any]:
 
 
 def verify_qlib_output_manifest(qlib_dir: Path, provenance: dict[str, Any]) -> None:
-    """Fail closed if any sealed Qlib output was added, removed, or changed."""
+    """Fail closed if a governed dataset is obsolete or its files changed.
+
+    This verifier is the shared boundary used by RD-Agent and the independent
+    factor/model/backtest runners.  A daily provider therefore has to satisfy
+    the *current* semantic contract before file-integrity verification.  This
+    prevents an intact but PIT-obsolete provider from remaining researchable.
+    Minute providers retain their frequency-specific validation at their
+    callers; manifest-only fixtures have no declared frequency.
+    """
+
+    if provenance.get("frequency") == "day":
+        require_daily_qlib_contract(provenance)
 
     recorded = provenance.get("output_manifest")
     if not isinstance(recorded, dict) or recorded.get("version") != QLIB_OUTPUT_MANIFEST_VERSION:

@@ -19,6 +19,12 @@ from pathlib import Path
 from typing import Any
 
 RDAGENT_COMMIT = "4f9ecb005881cddc08df0124a2e894c018007679"
+FIN_QUANT_REQUIRED_ABLATIONS = (
+    "factor_only",
+    "model_only",
+    "joint",
+    "joint_vs_incumbent",
+)
 
 
 def _version() -> str:
@@ -826,11 +832,13 @@ def _fin_quant_arm_coverage(rounds: dict[int, dict[str, Any]]) -> dict[str, Any]
     arms = {
         "factor": {
             "proposed_rounds": [],
+            "attempted_rounds": [],
             "executable_rounds": [],
             "accepted_executable_rounds": [],
         },
         "model": {
             "proposed_rounds": [],
+            "attempted_rounds": [],
             "executable_rounds": [],
             "accepted_executable_rounds": [],
         },
@@ -838,12 +846,19 @@ def _fin_quant_arm_coverage(rounds: dict[int, dict[str, Any]]) -> dict[str, Any]
     for loop_id, round_item in sorted(rounds.items()):
         hypothesis = round_item.get("hypothesis") or {}
         action = hypothesis.get("action")
+        if action is not None and action not in arms:
+            raise RuntimeError(f"fin_quant trace contains unsupported action: {action}")
         if action in arms:
             arms[action]["proposed_rounds"].append(loop_id)
+            arms[action]["attempted_rounds"].append(loop_id)
         snapshot = round_item.get("runner_snapshot")
         if not isinstance(snapshot, dict) or snapshot.get("kind") not in arms:
             continue
         kind = str(snapshot["kind"])
+        if action in arms and kind != action:
+            raise RuntimeError("fin_quant selected arm and runner artifact disagree")
+        if loop_id not in arms[kind]["attempted_rounds"]:
+            arms[kind]["attempted_rounds"].append(loop_id)
         artifacts = snapshot.get("artifacts")
         executable = isinstance(artifacts, list) and bool(artifacts)
         if executable:
@@ -853,20 +868,58 @@ def _fin_quant_arm_coverage(rounds: dict[int, dict[str, Any]]) -> dict[str, Any]
     accepted_arms = [
         name for name, values in arms.items() if values["accepted_executable_rounds"]
     ]
+    attempted_arms = [name for name, values in arms.items() if values["attempted_rounds"]]
     result_arms = {
         name: {
             **values,
+            "attempted_in_this_run": bool(values["attempted_rounds"]),
             "accepted_in_this_run": bool(values["accepted_executable_rounds"]),
         }
         for name, values in arms.items()
     }
     return {
-        "contract_version": "fin-quant-arm-coverage-v1",
+        "contract_version": "fin-quant-arm-coverage-v2",
         "arms": result_arms,
+        "attempted_complete": len(attempted_arms) == 2,
         "complete": len(accepted_arms) == 2,
         "single_arm": len(accepted_arms) == 1,
+        "attempted_arms": attempted_arms,
         "accepted_arms": accepted_arms,
         "based_artifacts_count_as_arm_coverage": False,
+    }
+
+
+def _fin_quant_research_outcome(
+    coverage: dict[str, Any], bundles: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Classify joint research without granting it any capital authority."""
+
+    if bundles:
+        if coverage.get("complete") is not True:
+            raise RuntimeError("fin_quant bundle escaped complete accepted arm coverage")
+        status = "joint_proposal_ready"
+        reason_code = None
+    elif coverage.get("complete") is True:
+        # Both accepted executable arms should always materialize an atomic
+        # proposal.  Treat missing code/state as an engineering failure, not a
+        # statistical negative.
+        raise RuntimeError("fin_quant accepted both arms but materialized no joint proposal")
+    else:
+        status = "governed_negative"
+        reason_code = (
+            "arm_acceptance_incomplete"
+            if coverage.get("attempted_complete") is True
+            else "arm_attempt_coverage_incomplete"
+        )
+    return {
+        "contract_version": "fin-quant-research-outcome-v1",
+        "status": status,
+        "reason_code": reason_code,
+        "attempted_arms": list(coverage.get("attempted_arms") or []),
+        "accepted_arms": list(coverage.get("accepted_arms") or []),
+        "required_independent_ablations": list(FIN_QUANT_REQUIRED_ABLATIONS),
+        "joint_ablation_completed": False,
+        "capital_authority": False,
     }
 
 
@@ -990,6 +1043,12 @@ def _materialize_quant_bundles(
                 or feedback.get("reason"),
                 "arm_coverage": {"factor": True, "model": True},
                 "single_arm": False,
+                "delivery_status": "research_only",
+                "required_independent_ablations": list(
+                    FIN_QUANT_REQUIRED_ABLATIONS
+                ),
+                "joint_ablation_completed": False,
+                "capital_authority": False,
             }
         )
     return bundles
@@ -1286,6 +1345,11 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
         if args.scenario == "fin_quant"
         else []
     )
+    fin_quant_outcome = (
+        _fin_quant_research_outcome(fin_quant_coverage, quant_bundles)
+        if fin_quant_coverage is not None
+        else None
+    )
     costeer_knowledge = _costeer_knowledge_status()
     if args.scenario == "fin_strategy" and not strategy_proposals:
         raise RuntimeError("fin_strategy produced no governed strategy proposal")
@@ -1323,6 +1387,7 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
         "model_candidates": model_candidates,
         "quant_bundles": quant_bundles,
         "fin_quant_coverage": fin_quant_coverage,
+        "fin_quant_outcome": fin_quant_outcome,
         "single_arm": bool(fin_quant_coverage and fin_quant_coverage["single_arm"]),
         "costeer_knowledge": costeer_knowledge,
         "strategy_proposals": strategy_proposals,

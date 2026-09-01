@@ -38,6 +38,7 @@ from .strategy_store import StrategyStore
 
 CAPITAL_PIPELINE_STATE_KEY = "capital_pipeline"
 CAPITAL_PIPELINE_CONTRACT_VERSION = "autopilot-capital-pipeline-v1"
+CAPITAL_PIPELINE_LIFECYCLE = "legacy_readonly"
 
 
 class AutopilotCapitalBlocked(ValueError):
@@ -68,12 +69,14 @@ def _selection_state(state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class AutopilotCapitalPipeline:
-    """Advance the one-way pre-final portfolio -> OOS -> paper boundary.
+    """Historical Autopilot capital implementation retained for audit only.
 
-    Research retries may produce many immutable candidates.  Once this service
-    freezes one champion, every later operation is idempotently bound to that
-    evidence hash.  A failed portfolio gate or formal OOS is terminal for the
-    cycle: this class deliberately has no runner-up branch.
+    ``CAPITAL_PIPELINE_LIFECYCLE`` is permanently ``legacy_readonly``.  Current
+    API, scheduler and Autopilot code must not instantiate or call this class;
+    only fin_strategy settlement may create StrategyVersion/formal-OOS/approval/
+    paper state.  The implementation remains importable so old records and
+    their deterministic historical behavior can still be audited without a
+    destructive database rewrite.
     """
 
     def __init__(

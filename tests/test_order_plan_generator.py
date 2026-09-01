@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from qlib_test_doubles import qlib_workflow_identity
+
+from quant_platform.investor_profile import bind_investor_profile
 
 pytestmark = pytest.mark.no_database
 
@@ -20,6 +24,52 @@ def _script_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _profile_binding() -> dict:
+    return bind_investor_profile(
+        {
+            "id": "profile-1",
+            "profile_key": "primary",
+            "version": 1,
+            "content_sha256": "a" * 64,
+            "market_permissions": {
+                "main_board": True,
+                "star_market": True,
+                "chi_next": True,
+                "beijing_exchange": False,
+                "etf": True,
+            },
+        }
+    )
+
+
+def test_paper_permission_overlay_blocks_new_bse_risk_but_keeps_exit() -> None:
+    script = _script_module()
+    projection = pd.DataFrame(
+        {
+            "risk_state": ["normal", "normal", "exit"],
+            "allow_new_risk": [True, True, False],
+            "risk_reasons": ["[]", "[]", '["hard_risk"]'],
+        },
+        index=["600000.SH", "830001.BJ", "920001.BJ"],
+    )
+
+    governed, evidence = script._apply_investor_profile_permissions(
+        projection,
+        _profile_binding(),
+        on_date=date(2026, 8, 31),
+    )
+
+    assert governed.loc["600000.SH", "risk_state"] == "normal"
+    assert governed.loc["830001.BJ", "risk_state"] == "restricted"
+    assert governed.loc["920001.BJ", "risk_state"] == "exit"
+    assert bool(governed.loc["830001.BJ", "allow_new_risk"]) is False
+    assert evidence["830001.BJ"] == {
+        "allowed": False,
+        "permission_key": "beijing_exchange",
+        "reason": "investor_permission_disabled:beijing_exchange",
+    }
 
 
 def test_production_order_plan_generator_records_and_hashes_qlib_artifact(

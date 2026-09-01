@@ -11,6 +11,7 @@ from quant_data.execution_contract import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
+    PREVIOUS_DAILY_QLIB_FIELD_CONTRACT_VERSION,
     build_strategy_execution_contract,
     require_daily_qlib_contract,
     require_minute_execution_contract,
@@ -45,6 +46,13 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
 
     with pytest.raises(ValueError, match="obsolete field contract"):
         require_daily_qlib_contract({**valid, "field_contract_version": "v1"})
+    with pytest.raises(ValueError, match="obsolete field contract"):
+        require_daily_qlib_contract(
+            {
+                **valid,
+                "field_contract_version": PREVIOUS_DAILY_QLIB_FIELD_CONTRACT_VERSION,
+            }
+        )
     with pytest.raises(ValueError, match="lineage is not verified"):
         require_daily_qlib_contract({**valid, "lineage_verified": False})
     with pytest.raises(ValueError, match="ETF whitelist"):
