@@ -45,6 +45,20 @@ def test_resolver_uses_verified_wheel_resource_without_checkout(tmp_path: Path) 
     assert resolved == stub.resolve()
 
 
+def test_resolver_accepts_exported_crlf_resource(tmp_path: Path) -> None:
+    package_root = tmp_path / "site-packages" / "quant_platform"
+    stub = package_root / "_artifacts" / "baseline_model_stub.py"
+    stub.parent.mkdir(parents=True)
+    stub.write_bytes(_canonical_stub().read_bytes().replace(b"\n", b"\r\n"))
+
+    resolved = resolve_governed_baseline_model_stub(
+        tmp_path / "missing-checkout",
+        package_root=package_root,
+    )
+
+    assert resolved == stub.resolve()
+
+
 def test_resolver_rejects_modified_governed_stub(tmp_path: Path) -> None:
     project_root = tmp_path / "checkout"
     stub = project_root / "scripts" / "baseline_model_stub.py"

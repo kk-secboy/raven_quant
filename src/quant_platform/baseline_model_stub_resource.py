@@ -11,11 +11,11 @@ _PACKAGED_RELATIVE_PATH = Path("_artifacts") / "baseline_model_stub.py"
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # Git archive may materialize text files with the export platform's line
+    # endings.  Hash the canonical LF representation so the same governed
+    # Python source has one identity in Windows checkouts and Linux wheels.
+    source = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(source).hexdigest()
 
 
 def resolve_governed_baseline_model_stub(
