@@ -102,6 +102,7 @@ DAILY_QLIB_DUCKDB_THREADS = 8
 DAILY_QLIB_DUMP_WORKERS = 4
 DAILY_QLIB_STYLE_SYMBOL_BATCH = 128
 DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH = 128
+_PIT_INGESTION_TIMEZONE = "Asia/Shanghai"
 
 _ETF_DAILY_REQUIRED_FIELDS = frozenset(
     {
@@ -412,6 +413,9 @@ class QlibBuilder:
             )
             connection.execute(f"SET threads={DAILY_QLIB_DUCKDB_THREADS}")
             connection.execute("SET preserve_insertion_order=false")
+            connection.execute(
+                f"SET TimeZone={_sql_string(_PIT_INGESTION_TIMEZONE)}"
+            )
             if spill_dir is not None:
                 spill_dir.mkdir(parents=True, exist_ok=True)
                 connection.execute(
@@ -3689,6 +3693,10 @@ class QlibBuilder:
         # Version 7: financial revisions retain their own effective disclosure
         # date (max of ann_date and an explicit final/actual announcement date)
         # instead of replacing the original row retroactively.
+        # Version 8: singleton revised/unmarked financial payloads no longer
+        # inherit an old announcement date.  They require an explicit
+        # disclosure or a row-level ingestion timestamp, interpreted on the
+        # Asia/Shanghai calendar, and otherwise fail closed.
         availability_datasets = (
             "daily_basic",
             "moneyflow",
@@ -3701,7 +3709,7 @@ class QlibBuilder:
             "index_member_all",
         )
         return {
-            "version": 7,
+            "version": 8,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
             "capital_flow_fields": capital_flow_fields,
@@ -3722,10 +3730,15 @@ class QlibBuilder:
                 for dataset in availability_datasets
             },
             "fundamental_revision_availability": {
-                "version": 1,
+                "version": 2,
                 "explicit_boundary": "max_ann_date_and_valid_final_or_actual_date",
+                "announcement_date_initial": "unique_update_flag_zero_payload",
                 "undated_revision_fallback": "ingested_at_upper_bound",
                 "fallback_visibility": "strictly_after_ingestion_date",
+                "ingestion_calendar_timezone": _PIT_INGESTION_TIMEZONE,
+                "singleton_revised_or_unmarked": (
+                    "explicit_disclosure_then_ingestion_upper_bound_or_fail_closed"
+                ),
                 "unsequenced_conflict": "fail_closed",
                 "row_source_column": "available_at_source",
             },
@@ -4271,6 +4284,27 @@ def _as_date_sql(column: str, *, table: str | None = None) -> str:
     )
 
 
+def _as_ingestion_date_sql(column: str, *, table: str | None = None) -> str:
+    """Return one deterministic mainland-China acquisition calendar date.
+
+    ``ingested_at`` is an acquisition timestamp, not a provider business date.
+    DuckDB casts TIMESTAMPTZ values to DATE in the connection's current
+    timezone, so a host/session setting could otherwise move a revision across
+    the PIT boundary.  Convert the instant explicitly before truncating it.
+    Missing or malformed lineage remains NULL and therefore fails closed.
+    """
+
+    identifier = _sql_identifier(column)
+    if table is not None:
+        identifier = f"{_sql_identifier(table)}.{identifier}"
+    timestamp = f"try_cast({identifier} AS TIMESTAMPTZ)"
+    timezone_name = _sql_string(_PIT_INGESTION_TIMEZONE)
+    return (
+        f"CASE WHEN {timestamp} IS NULL THEN NULL "
+        f"ELSE CAST(timezone({timezone_name}, {timestamp}) AS DATE) END"
+    )
+
+
 def _nonblank_text_sql(column: str) -> str:
     identifier = '"' + column.replace('"', '""') + '"'
     return (
@@ -4316,14 +4350,17 @@ def _fundamental_revision_rows_sql(
 ) -> str:
     """Classify every financial version with a non-retroactive PIT boundary.
 
-    Explicit issuer disclosure dates win.  When conflicting payloads share a
-    business key but a later version has no explicit revision date, the first
-    evidenced payload remains the announcement-date baseline and every other
-    version is delayed to its row-level ``ingested_at`` date.  That timestamp
-    is only a conservative upper bound on visibility, never evidence that the
-    revision existed at the old announcement date.  An unsequenced conflict is
-    returned as ``unresolved_conflict`` with a null ``available_at`` so callers
-    can fail closed instead of selecting by update_flag or row order.
+    Explicit issuer disclosure dates win.  In a conflicting business-key
+    group, an undated payload may be visible at ``ann_date`` only when exactly
+    one distinct payload is explicitly marked by the provider as the initial
+    version (``update_flag=0``).  This rule also applies when the provider
+    retained only one payload: a lone revised or unmarked row is not evidence
+    that its values existed on the old announcement date.  Such rows are
+    delayed to their row-level ``ingested_at`` date.  That timestamp is only a
+    conservative upper bound on visibility, never evidence that the revision
+    existed at the old announcement date.  An unsequenced row is returned as
+    ``unresolved_conflict`` with a null ``available_at`` so callers can fail
+    closed.
     """
 
     announced = _as_date_sql("ann_date")
@@ -4344,14 +4381,14 @@ def _fundamental_revision_rows_sql(
         else "false"
     )
     ingested = (
-        _as_date_sql("ingested_at")
+        _as_ingestion_date_sql("ingested_at")
         if "ingested_at" in source_columns
         else "NULL::DATE"
     )
-    update_order = (
-        "try_cast(update_flag AS DOUBLE)"
+    is_initial = (
+        "coalesce(try_cast(update_flag AS DOUBLE) = 0, false)"
         if "update_flag" in source_columns
-        else "NULL::DOUBLE"
+        else "false"
     )
     hashed = ", ".join(
         f"coalesce(CAST({_sql_identifier(column)} AS VARCHAR), '<NULL>')"
@@ -4362,10 +4399,9 @@ def _fundamental_revision_rows_sql(
     available_at = """
         CASE
             WHEN _pit_announced_at IS NULL THEN NULL
-            WHEN _pit_payload_versions <= 1 THEN _pit_explicit_available_at
             WHEN _pit_has_explicit THEN _pit_explicit_available_at
-            WHEN _pit_has_explicit_baseline = 0
-                 AND _pit_payload_hash = _pit_nonexplicit_baseline
+            WHEN _pit_initial_payload_versions = 1
+                 AND _pit_payload_hash = _pit_initial_payload_hash
                 THEN _pit_announced_at
             WHEN _pit_ingested_at IS NOT NULL
                 THEN greatest(_pit_announced_at, _pit_ingested_at)
@@ -4375,13 +4411,10 @@ def _fundamental_revision_rows_sql(
     availability_source = """
         CASE
             WHEN _pit_announced_at IS NULL THEN 'invalid_announcement_date'
-            WHEN _pit_payload_versions <= 1 AND _pit_has_explicit
-                THEN 'explicit_disclosure'
-            WHEN _pit_payload_versions <= 1 THEN 'announcement_date'
             WHEN _pit_has_explicit THEN 'explicit_disclosure'
-            WHEN _pit_has_explicit_baseline = 0
-                 AND _pit_payload_hash = _pit_nonexplicit_baseline
-                THEN 'announcement_date_baseline'
+            WHEN _pit_initial_payload_versions = 1
+                 AND _pit_payload_hash = _pit_initial_payload_hash
+                THEN 'announcement_date_initial'
             WHEN _pit_ingested_at IS NOT NULL THEN 'ingested_at_upper_bound'
             ELSE 'unresolved_conflict'
         END
@@ -4395,7 +4428,7 @@ def _fundamental_revision_rows_sql(
                 {explicit_available} AS _pit_explicit_available_at,
                 ({has_explicit}) AS _pit_has_explicit,
                 {ingested} AS _pit_ingested_at,
-                {update_order} AS _pit_update_order,
+                {is_initial} AS _pit_is_initial,
                 {payload_hash} AS _pit_payload_hash
             FROM ({source_sql})
         ), ranked AS (
@@ -4404,21 +4437,16 @@ def _fundamental_revision_rows_sql(
                 count(DISTINCT _pit_payload_hash) OVER (
                     PARTITION BY {group}
                 ) AS _pit_payload_versions,
-                max(
-                    CASE
-                        WHEN _pit_has_explicit
-                         AND _pit_explicit_available_at = _pit_announced_at
-                            THEN 1 ELSE 0
-                    END
-                ) OVER (PARTITION BY {group}) AS _pit_has_explicit_baseline,
-                first_value(_pit_payload_hash) OVER (
+                count(DISTINCT CASE
+                    WHEN _pit_is_initial THEN _pit_payload_hash
+                END) OVER (
                     PARTITION BY {group}
-                    ORDER BY
-                        CASE WHEN _pit_has_explicit THEN 1 ELSE 0 END,
-                        _pit_update_order ASC NULLS LAST,
-                        _pit_ingested_at ASC NULLS LAST,
-                        _pit_payload_hash ASC
-                ) AS _pit_nonexplicit_baseline
+                ) AS _pit_initial_payload_versions,
+                min(CASE
+                    WHEN _pit_is_initial THEN _pit_payload_hash
+                END) OVER (
+                    PARTITION BY {group}
+                ) AS _pit_initial_payload_hash
             FROM raw
         )
         SELECT
@@ -4428,11 +4456,11 @@ def _fundamental_revision_rows_sql(
                 _pit_explicit_available_at,
                 _pit_has_explicit,
                 _pit_ingested_at,
-                _pit_update_order,
+                _pit_is_initial,
                 _pit_payload_hash,
                 _pit_payload_versions,
-                _pit_has_explicit_baseline,
-                _pit_nonexplicit_baseline
+                _pit_initial_payload_versions,
+                _pit_initial_payload_hash
             ),
             {available_at} AS available_at,
             {availability_source} AS available_at_source
@@ -4472,7 +4500,9 @@ def _fundamental_revision_order(
             f"try_cast({identifier('update_flag')} AS DOUBLE) DESC NULLS LAST"
         )
     if "ingested_at" in source_columns:
-        ordering.append(f"{identifier('ingested_at')} DESC NULLS LAST")
+        ordering.append(
+            f"try_cast({identifier('ingested_at')} AS TIMESTAMPTZ) DESC NULLS LAST"
+        )
     hashed = ", ".join(
         f"coalesce(CAST({identifier(column)} AS VARCHAR), '')"
         for column in projected_columns
@@ -4541,6 +4571,7 @@ def _select_fundamental_revision_events(
 
     connection = duckdb.connect()
     try:
+        connection.execute(f"SET TimeZone={_sql_string(_PIT_INGESTION_TIMEZONE)}")
         connection.register("fundamental_revision_source", source)
         unresolved = int(
             connection.execute(

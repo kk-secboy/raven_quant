@@ -190,6 +190,37 @@ def test_qlib_catalog_reuses_only_an_unchanged_exact_file_stat_fingerprint(
     assert calls == 3
 
 
+def test_qlib_catalog_does_not_restat_immutable_outputs_on_scheduler_timescale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    _seed_dataset(data_root)
+    _forget_memory_cache()
+    current = [100.0]
+    fingerprint_calls = 0
+    original_fingerprint = services._qlib_output_stat_fingerprint
+
+    def counted_fingerprint(*args: object, **kwargs: object) -> str | None:
+        nonlocal fingerprint_calls
+        fingerprint_calls += 1
+        return original_fingerprint(*args, **kwargs)
+
+    monkeypatch.setattr(services.time, "monotonic", lambda: current[0])
+    monkeypatch.setattr(
+        services, "_qlib_output_stat_fingerprint", counted_fingerprint
+    )
+
+    assert services.list_qlib_datasets(data_root)[0]["reproducible"] is True
+    initial_calls = fingerprint_calls
+    assert initial_calls >= 1
+
+    # The scheduler polls every few seconds.  Even an hour of polls must reuse
+    # the immutable catalog proof instead of walking every Qlib feature file.
+    current[0] += 60 * 60
+    assert services.list_qlib_datasets(data_root)[0]["reproducible"] is True
+    assert fingerprint_calls == initial_calls
+
+
 def test_display_catalog_persists_only_a_bounded_browser_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

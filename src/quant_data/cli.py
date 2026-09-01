@@ -2004,6 +2004,46 @@ def snapshot(
     console.print(path)
 
 
+@app.command("snapshot-ingested-at-successor")
+def snapshot_ingested_at_successor(
+    source: Annotated[
+        str,
+        typer.Option(
+            "--source",
+            help="Immutable source snapshot whose exact work units are re-verified",
+        ),
+    ],
+    name: Annotated[
+        str,
+        typer.Option(
+            "--name",
+            help="New immutable successor name; the source is never overwritten",
+        ),
+    ],
+    dataset: Annotated[
+        str,
+        typer.Option(
+            "--dataset",
+            help="Only this affected dataset is re-verified and rebuilt",
+        ),
+    ] = "fina_indicator",
+) -> None:
+    """Recover missing row acquisition times from the succeeded-unit ledger."""
+
+    if dataset != "fina_indicator":
+        raise typer.BadParameter(
+            "--dataset currently permits only the audited fina_indicator recovery"
+        )
+    context = load_context(require_credentials=False)
+    path = context.storage.build_ingested_at_successor(
+        name=name,
+        source_snapshot=context.storage.snapshots_root / source,
+        checkpoint=context.checkpoint,
+        datasets={dataset},
+    )
+    console.print(path)
+
+
 @app.command("margin-eligibility")
 def margin_eligibility(
     start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2024-01-01",

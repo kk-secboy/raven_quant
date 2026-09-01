@@ -27,7 +27,14 @@ from quant_data.execution_contract import QLIB_OUTPUT_MANIFEST_VERSION
 from quant_data.qlib_builder import verify_qlib_output_manifest
 
 _QLIB_OUTPUT_VERIFY_CACHE_LOCK = threading.Lock()
-_QLIB_OUTPUT_VERIFY_MEMORY_TTL_SECONDS = 60.0
+# Qlib publications are immutable directories.  A provenance change (or a new
+# directory) still bypasses this cache immediately, while formal consumers
+# always re-run ``verify_qlib_output_manifest`` before opening economic data.
+# Re-statting every sealed feature file once per minute made the scheduler
+# spend an entire core walking old immutable publications.  Keep the catalog
+# proof in process memory for six hours instead; this remains only a catalog
+# projection, never an admission shortcut.
+_QLIB_OUTPUT_VERIFY_MEMORY_TTL_SECONDS = 6 * 60 * 60.0
 _QLIB_OUTPUT_VERIFY_CACHE_MAX_ENTRIES = 128
 _QLIB_OUTPUT_VERIFY_CACHE_VERSION = 2
 _QLIB_OUTPUT_VERIFY_CACHE_FILE = ".catalog-output-verification-v2.json"
@@ -270,7 +277,7 @@ def _cached_qlib_output_verification(
 ) -> tuple[bool, str]:
     """Catalog-check sealed outputs with bounded cache and metadata-only refreshes.
 
-    A one-minute memory TTL prevents polling storms. After it expires, every
+    A bounded in-process TTL prevents polling storms. After it expires, every
     sealed path is restatted and the exact path/size/mtime/ctime collection is
     compared with the manifest. An unchanged fingerprint may reuse a persisted
     successful full-SHA result. Formal consumers intentionally do not use this

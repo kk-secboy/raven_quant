@@ -492,14 +492,20 @@ def test_migrated_unbound_cycle_stays_read_only_legacy_evidence() -> None:
 
 def test_autopilot_tick_dispatches_the_same_mainline_for_all_horizons() -> None:
     calls: list[str] = []
+    reconciliations: list[str] = []
+    store_reconciliations: list[str] = []
 
     class Store:
         @staticmethod
         def reconcile() -> int:
+            store_reconciliations.append("store")
             return 0
 
     controller = AutopilotController.__new__(AutopilotController)
     controller.store = Store()
+    controller.research = SimpleNamespace(
+        reconcile_autopilot_execution_state=lambda: reconciliations.append("research")
+    )
     controller.config = lambda: (normalize_autopilot_config(), 7)
     controller._latest_dataset = lambda: {"name": "latest"}
 
@@ -512,6 +518,8 @@ def test_autopilot_tick_dispatches_the_same_mainline_for_all_horizons() -> None:
     result = controller.tick(datetime(2026, 8, 31, tzinfo=UTC))
 
     assert calls == ["short_1_5d", "swing_1_6m", "long_1_3y"]
+    assert reconciliations == ["research", "research"]
+    assert store_reconciliations == ["store", "store"]
     assert result == {"cycles": 3, "branches": 3, "failed": 0}
 
 

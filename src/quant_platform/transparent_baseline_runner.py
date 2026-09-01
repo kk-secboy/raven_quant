@@ -138,21 +138,32 @@ STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION = (
 STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256 = (
     "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
 )
-# Historical v21 seal. It remains independently addressable after v22 becomes
-# current so existing evidence cannot be rebound to the new source closure.
+# Historical v21 seal. It remains independently addressable after later
+# versions become current so existing evidence cannot be rebound.
 STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "5859384d80aeee8302e1474f08b405eaaccec0e2b056b9f1da89e72454e42f48"
 )
-STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+STRATEGY_RESEARCH_V22_TARGET_RECIPE_VERSION = (
     "qlib-rdagent-single-mainline-2026-09-01-v22"
+)
+STRATEGY_RESEARCH_V22_TARGET_RUNNER_SHA256 = (
+    "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
+)
+# Historical v22 seal. It remains independently addressable after v23 becomes
+# current so already-applied database constraints and evidence stay immutable.
+STRATEGY_RESEARCH_V22_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "6709b7e2a4abcc2ae9dcb63db2d50f4bf8ba5507ee47c62ee95d70109fe7d7e0"
+)
+STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-09-01-v23"
 )
 STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
     "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
 )
-# Filled after the complete v22 source closure is stable. The source-closure
-# normalizer excludes both v22 seal assignments from their own digest.
+# Filled after the complete v23 source closure is stable. The source-closure
+# normalizer excludes both v23 seal assignments from their own digest.
 STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "6709b7e2a4abcc2ae9dcb63db2d50f4bf8ba5507ee47c62ee95d70109fe7d7e0"
+    "18c2964083d39c7abc761637f173b94eb72c6c5fff4be762177ca39048792558"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
@@ -207,6 +218,9 @@ _TARGET_RUNNERS = {
     ),
     STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION: (
         STRATEGY_RESEARCH_V21_TARGET_RUNNER_SHA256
+    ),
+    STRATEGY_RESEARCH_V22_TARGET_RECIPE_VERSION: (
+        STRATEGY_RESEARCH_V22_TARGET_RUNNER_SHA256
     ),
     STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
 }
@@ -306,6 +320,8 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return STRATEGY_RESEARCH_V20_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION:
         return STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256
+    if normalized_recipe_version == STRATEGY_RESEARCH_V22_TARGET_RECIPE_VERSION:
+        return STRATEGY_RESEARCH_V22_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == STRATEGY_RESEARCH_TARGET_RECIPE_VERSION:
         return STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     return None
@@ -342,6 +358,7 @@ def target_worker_runtime_image_for_recipe(
             FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_V22_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
     ):
@@ -356,7 +373,8 @@ def target_worker_runtime_image_for_recipe(
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
         STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION: "v20",
         STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION: "v21",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v22",
+        STRATEGY_RESEARCH_V22_TARGET_RECIPE_VERSION: "v22",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v23",
     }[normalized_recipe_version]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -498,7 +516,8 @@ def require_transparent_baseline_runner(
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
         STRATEGY_RESEARCH_V20_TARGET_RECIPE_VERSION: "v20",
         STRATEGY_RESEARCH_V21_TARGET_RECIPE_VERSION: "v21",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v22",
+        STRATEGY_RESEARCH_V22_TARGET_RECIPE_VERSION: "v22",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v23",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -546,6 +565,7 @@ def require_transparent_baseline_runner(
         "v20",
         "v21",
         "v22",
+        "v23",
     }:
         try:
             bundle_sha256 = (
@@ -562,6 +582,7 @@ def require_transparent_baseline_runner(
                     "v20",
                     "v21",
                     "v22",
+                    "v23",
                 }
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
@@ -581,7 +602,8 @@ def require_transparent_baseline_runner(
             "v18": FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256,
             "v20": STRATEGY_RESEARCH_V20_TARGET_RUNTIME_BUNDLE_SHA256,
             "v21": STRATEGY_RESEARCH_V21_TARGET_RUNTIME_BUNDLE_SHA256,
-            "v22": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v22": STRATEGY_RESEARCH_V22_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v23": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(

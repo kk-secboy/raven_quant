@@ -10,6 +10,7 @@ from sqlalchemy import func, insert, select, update
 
 from quant_data.config import Settings
 from quant_data.database import (
+    autopilot_cycles,
     jobs,
     model_candidates,
     open_database,
@@ -46,6 +47,77 @@ class PlatformModelTournamentService:
         self.research = ResearchStore(settings.database_url)
         self.candidates = RDAGentCandidateStore(settings.database_url)
         self.project_root = Path(__file__).resolve().parents[2]
+
+    def _attach_job_if_active_owner(
+        self,
+        *,
+        cycle_id: str,
+        research_run_id: str,
+        job_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        """Attach one exact evaluator only while its cycle still owns the run."""
+
+        with self.engine.begin() as connection:
+            # Keep the run -> cycle -> job lock order aligned with the setup-gap
+            # reconciler.  The final UPDATE remains a CAS so a future writer
+            # that does not take these locks still cannot revive a stale run.
+            run = connection.execute(
+                select(research_runs)
+                .where(research_runs.c.id == research_run_id)
+                .with_for_update()
+            ).first()
+            cycle = connection.execute(
+                select(autopilot_cycles)
+                .where(autopilot_cycles.c.id == cycle_id)
+                .with_for_update()
+            ).first()
+            job = connection.execute(
+                select(jobs).where(jobs.c.id == job_id).with_for_update()
+            ).first()
+            if run is None or cycle is None or job is None:
+                return False
+            config = dict(run.config_json or {})
+            if (
+                str(run.status) not in {"queued", "running", "evaluating"}
+                or str(run.requested_by) != f"autopilot:{cycle_id}"
+                or str(config.get("autopilot_cycle_id") or "") != cycle_id
+                or str(cycle.status) != "active"
+                or cycle.finished_at is not None
+                or str(job.kind) != kind
+                or dict(job.payload_json or {}) != dict(payload)
+            ):
+                return False
+            if run.job_id is not None:
+                return str(run.job_id) == job_id
+            result = connection.execute(
+                update(research_runs)
+                .where(
+                    research_runs.c.id == run.id,
+                    research_runs.c.status == run.status,
+                    research_runs.c.job_id.is_(None),
+                    research_runs.c.updated_at == run.updated_at,
+                )
+                .values(job_id=job_id, updated_at=datetime.now(UTC))
+            )
+            return int(result.rowcount or 0) == 1
+
+    def _cancel_unattached_job(self, job_id: str) -> None:
+        """Cancel only the exact evaluator that lost its active owner."""
+
+        current = self.jobs.get(job_id)
+        if str(current.get("status") or "") not in {"queued", "running"}:
+            return
+        try:
+            self.jobs.request_cancel(job_id)
+        except ValueError:
+            # A worker may have reached a terminal between the read and cancel.
+            # A terminal job is no longer an active orphan; otherwise surface
+            # the race instead of silently leaving runnable work behind.
+            current = self.jobs.get(job_id)
+            if str(current.get("status") or "") in {"queued", "running"}:
+                raise
 
     def fail_unattached_lane(
         self,
@@ -123,6 +195,41 @@ class PlatformModelTournamentService:
                 )
             )
         return True
+
+    def _adopt_exact_unattached_job(
+        self,
+        *,
+        cycle_id: str,
+        research_run_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Attach the one exact durable job left by a create/attach crash gap."""
+
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(jobs).where(
+                    jobs.c.payload_json["research_run_id"].as_string()
+                    == research_run_id
+                )
+            ).all()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("platform model run has multiple unattached evaluator jobs")
+        row = rows[0]
+        if str(row.kind) != kind or dict(row.payload_json or {}) != dict(payload):
+            raise ValueError("unattached platform model evaluator changed contract")
+        if not self._attach_job_if_active_owner(
+            cycle_id=cycle_id,
+            research_run_id=research_run_id,
+            job_id=str(row.id),
+            kind=kind,
+            payload=payload,
+        ):
+            self._cancel_unattached_job(str(row.id))
+            raise ValueError("platform model evaluator no longer has an active owner")
+        return self.jobs.get(str(row.id))
 
     def ensure_lane(
         self,
@@ -388,22 +495,39 @@ class PlatformModelTournamentService:
                 "primary_label_policy": policy,
                 "primary_label_policy_sha256": policy["policy_sha256"],
             }
-            job = self.jobs.create(
-                "model_evaluate",
-                payload,
-                self.settings.data_root
-                / "platform"
-                / "logs"
-                / (
-                    f"platform-model-{stage}-{cycle_id}-"
-                    f"{_safe_scope_token(feature_set_id)}.log"
-                ),
-                dedupe_active_kind=False,
-                idempotency_key=(
-                    f"platform-model:{cycle_id}:{stage}:{feature_set_id}"
-                ),
+            job = self._adopt_exact_unattached_job(
+                cycle_id=cycle_id,
+                research_run_id=str(run["id"]),
+                kind="model_evaluate",
+                payload=payload,
             )
-            self.research.attach_job(str(run["id"]), str(job["id"]))
+            if job is None:
+                job = self.jobs.create(
+                    "model_evaluate",
+                    payload,
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / (
+                        f"platform-model-{stage}-{cycle_id}-"
+                        f"{_safe_scope_token(feature_set_id)}.log"
+                    ),
+                    dedupe_active_kind=False,
+                    idempotency_key=(
+                        f"platform-model:{cycle_id}:{stage}:{feature_set_id}"
+                    ),
+                )
+                if not self._attach_job_if_active_owner(
+                    cycle_id=cycle_id,
+                    research_run_id=str(run["id"]),
+                    job_id=str(job["id"]),
+                    kind="model_evaluate",
+                    payload=payload,
+                ):
+                    self._cancel_unattached_job(str(job["id"]))
+                    raise ValueError(
+                        "platform model evaluator no longer has an active owner"
+                    )
         return {
             "run": self.research.get_run(str(run["id"])),
             "job": job,

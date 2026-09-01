@@ -46,13 +46,14 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
 
     with pytest.raises(ValueError, match="obsolete field contract"):
         require_daily_qlib_contract({**valid, "field_contract_version": "v1"})
-    with pytest.raises(ValueError, match="obsolete field contract"):
-        require_daily_qlib_contract(
-            {
-                **valid,
-                "field_contract_version": PREVIOUS_DAILY_QLIB_FIELD_CONTRACT_VERSION,
-            }
-        )
+    for obsolete_version in (
+        "daily-qlib-field-v6-fail-closed-missing-controls",
+        PREVIOUS_DAILY_QLIB_FIELD_CONTRACT_VERSION,
+    ):
+        with pytest.raises(ValueError, match="obsolete field contract"):
+            require_daily_qlib_contract(
+                {**valid, "field_contract_version": obsolete_version}
+            )
     with pytest.raises(ValueError, match="lineage is not verified"):
         require_daily_qlib_contract({**valid, "lineage_verified": False})
     with pytest.raises(ValueError, match="ETF whitelist"):

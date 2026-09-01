@@ -13,8 +13,11 @@ from sqlalchemy import and_, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
+    autopilot_branches,
+    autopilot_cycles,
     factor_candidates,
     factor_evaluations,
+    jobs,
     open_database,
     research_events,
     research_runs,
@@ -572,6 +575,203 @@ class ResearchStore:
             )
             if not result.rowcount:
                 raise KeyError(run_id)
+
+    def reconcile_terminal_autopilot_initializations(
+        self, *, actor: str = "autopilot"
+    ) -> int:
+        """Fail closed setup-only runs whose owning cycle is already terminal.
+
+        Platform model setup intentionally persists the ResearchRun before it
+        creates artifacts, candidates, and the evaluator job.  That makes the
+        lane recoverable after an ordinary process restart, but a run left in
+        that gap must not keep the global active-kind constraint forever after
+        its owning Autopilot cycle has been blocked or completed.
+
+        Active and operator-paused cycles are deliberately untouched:
+        ``ensure_lane`` can safely resume the exact run and its idempotent job.
+        A paused cycle whose stage is ``superseded`` and has a terminal time is
+        historical, not resumable. An active payload job or branch is also
+        authoritative evidence that setup advanced, so this reconciler never
+        races runnable work. A terminal unattached payload job cannot keep the
+        owning terminal cycle globally active forever.
+        """
+
+        now = _now()
+        changed = 0
+        with self.engine.begin() as connection:
+            run_ids = list(
+                connection.scalars(
+                    select(research_runs.c.id).where(
+                        research_runs.c.status.in_(("queued", "running", "evaluating")),
+                        research_runs.c.job_id.is_(None),
+                        research_runs.c.kind.like("platform_model_%"),
+                        research_runs.c.requested_by.like("autopilot:%"),
+                    )
+                )
+            )
+            for run_id in run_ids:
+                run = connection.execute(
+                    select(research_runs)
+                    .where(research_runs.c.id == run_id)
+                    .with_for_update()
+                ).first()
+                if run is None:
+                    continue
+                config = dict(run.config_json or {})
+                cycle_id = str(config.get("autopilot_cycle_id") or "")
+                if (
+                    config.get("contract_version")
+                    != "platform-model-tournament-run-v2-horizon"
+                    or not cycle_id
+                    or str(run.requested_by) != f"autopilot:{cycle_id}"
+                ):
+                    continue
+                cycle = connection.execute(
+                    select(
+                        autopilot_cycles.c.status,
+                        autopilot_cycles.c.stage,
+                        autopilot_cycles.c.finished_at,
+                    ).where(
+                        autopilot_cycles.c.id == cycle_id
+                    )
+                ).first()
+                if cycle is None:
+                    continue
+                terminal_owner = str(cycle.status) in {"blocked", "succeeded"} or (
+                    str(cycle.status) == "paused"
+                    and str(cycle.stage) == "superseded"
+                    and cycle.finished_at is not None
+                )
+                if not terminal_owner:
+                    continue
+                active_payload_jobs = connection.scalar(
+                    select(func.count())
+                    .select_from(jobs)
+                    .where(
+                        jobs.c.payload_json["research_run_id"].as_string() == run.id,
+                        jobs.c.status.in_(("queued", "running")),
+                    )
+                )
+                branches = connection.scalar(
+                    select(func.count())
+                    .select_from(autopilot_branches)
+                    .where(autopilot_branches.c.research_run_id == run.id)
+                )
+                if active_payload_jobs or branches:
+                    continue
+                error = (
+                    "platform model lane initialization ended without a job because "
+                    "its owning autopilot cycle is "
+                    f"{cycle.status}/{cycle.stage}"
+                )
+                result = connection.execute(
+                    update(research_runs)
+                    .where(
+                        research_runs.c.id == run.id,
+                        research_runs.c.status == run.status,
+                        research_runs.c.job_id.is_(None),
+                        research_runs.c.updated_at == run.updated_at,
+                    )
+                    .values(
+                        status="failed",
+                        error=error,
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                )
+                if int(result.rowcount or 0) != 1:
+                    continue
+                self._event(
+                    connection,
+                    run_id=str(run.id),
+                    event_type="run.failed",
+                    actor=actor,
+                    payload={
+                        "error": error,
+                        "stage": "terminal_cycle_reconciliation",
+                        "autopilot_cycle_id": cycle_id,
+                    },
+                )
+                changed += 1
+        return changed
+
+    def reconcile_terminal_autopilot_jobs(self, *, actor: str = "autopilot") -> int:
+        """Project an exact terminal current job onto its stale active run."""
+
+        now = _now()
+        changed = 0
+        with self.engine.begin() as connection:
+            run_ids = list(
+                connection.scalars(
+                    select(research_runs.c.id).where(
+                        research_runs.c.status.in_(("queued", "running", "evaluating")),
+                        research_runs.c.job_id.is_not(None),
+                        (
+                            (research_runs.c.requested_by == "autopilot")
+                            | research_runs.c.requested_by.like("autopilot:%")
+                        ),
+                    )
+                )
+            )
+            for run_id in run_ids:
+                run = connection.execute(
+                    select(research_runs)
+                    .where(research_runs.c.id == run_id)
+                    .with_for_update()
+                ).first()
+                if run is None or run.job_id is None:
+                    continue
+                job = connection.execute(
+                    select(jobs)
+                    .where(jobs.c.id == run.job_id)
+                    .with_for_update()
+                ).first()
+                if (
+                    job is None
+                    or str(job.status) not in {"failed", "cancelled"}
+                    or str((job.payload_json or {}).get("research_run_id") or "")
+                    != str(run.id)
+                    or job.finished_at is None
+                ):
+                    continue
+                error = str(job.error or "terminal autopilot research job failed")
+                result = connection.execute(
+                    update(research_runs)
+                    .where(
+                        research_runs.c.id == run.id,
+                        research_runs.c.status == run.status,
+                        research_runs.c.job_id == job.id,
+                        research_runs.c.updated_at == run.updated_at,
+                    )
+                    .values(
+                        status="failed",
+                        error=error,
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                )
+                if int(result.rowcount or 0) != 1:
+                    continue
+                self._event(
+                    connection,
+                    run_id=str(run.id),
+                    event_type="run.failed",
+                    actor=actor,
+                    payload={
+                        "error": error,
+                        "stage": "terminal_current_job_reconciliation",
+                        "job_id": str(job.id),
+                    },
+                )
+                changed += 1
+        return changed
+
+    def reconcile_autopilot_execution_state(self, *, actor: str = "autopilot") -> int:
+        """Reconcile both exact job terminals and terminal-cycle setup gaps."""
+
+        return self.reconcile_terminal_autopilot_jobs(
+            actor=actor
+        ) + self.reconcile_terminal_autopilot_initializations(actor=actor)
 
     def mark_run(
         self,

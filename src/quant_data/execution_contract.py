@@ -15,10 +15,10 @@ LEGACY_DAILY_QLIB_FIELD_CONTRACT_VERSION = (
     "daily-qlib-field-v5-governed-domestic-etf"
 )
 PREVIOUS_DAILY_QLIB_FIELD_CONTRACT_VERSION = (
-    "daily-qlib-field-v6-fail-closed-missing-controls"
+    "daily-qlib-field-v7-pit-financial-revisions"
 )
 DAILY_QLIB_FIELD_CONTRACT_VERSION = (
-    "daily-qlib-field-v7-pit-financial-revisions"
+    "daily-qlib-field-v8-pit-ingestion-lineage"
 )
 DAILY_MISSING_EXECUTION_CONTROL_POLICY = (
     "formal-nontradable-instrument-day-v1"
@@ -284,10 +284,12 @@ def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
     if provenance.get("frequency") != "day":
         raise ValueError("daily Qlib dataset provenance frequency is invalid")
     # Do not retain backward compatibility here.  v5 lacks the current
-    # execution-control policy and v6 globally selected later financial
-    # revisions before their final/actual disclosure date.  Both remain
-    # readable as forensic artifacts, but neither may feed governed research,
-    # backtests, simulations, or recommendations after the PIT repair.
+    # execution-control policy, v6 globally selected later financial revisions
+    # before their final/actual disclosure date, and v7 could expose a lone
+    # revised/unmarked payload at its historical announcement date.  They
+    # remain readable as forensic artifacts, but none may feed governed
+    # research, backtests, simulations, or recommendations after the PIT
+    # ingestion-lineage repair.
     if (
         provenance.get("field_contract_version")
         != DAILY_QLIB_FIELD_CONTRACT_VERSION

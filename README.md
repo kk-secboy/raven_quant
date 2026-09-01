@@ -86,6 +86,12 @@ Bootstrap、Qlib 转换、RD-Agent 研究和回测也可以从 Web 控制台创�
 基金/交易日的旧、新合同记录，质量门会逐业务字段复核：完全相同才由快照做语义
 去重，价格或复权因子存在任何冲突都会阻断发布，未完成的新单元也不得被旧成功
 记录掩盖。
+旧财务单元缺少行级 `ingested_at` 时，不允许直接修改原快照。运维人员只能在旧快照
+manifest、成功 work-unit ledger、原始单元 SHA/行数与封印投影全部吻合后运行
+`quant-data snapshot-ingested-at-successor --source <旧快照> --name <新快照>`；命令仅修复
+已审计的 `fina_indicator`，把 ledger `updated_at` 作为保守 acquisition 上界，并验证修复
+前后除 `ingested_at` 外的 provider 行集完全一致。Daily Qlib v8 才具有现行正式准入权限，
+旧 v7 及更早制品只保留审计用途。
 全 A 股 5 分钟增量任务按成功 checkpoint 的实际交易日覆盖复用旧单元；每个尚未覆盖的
 连续区间按自然季度合并且单次不超过 150 个交易日。这样补齐一个 14 交易日缺口时，
 每只股票只请求一个区间，下一交易日仍只新增后缀，既不重下历史也不改变旧成功单元键。

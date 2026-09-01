@@ -218,6 +218,9 @@ def test_unchanged_dataset_is_fully_linked(tmp_path: Path) -> None:
         _write_unit(store, "daily", "daily_20240102", _daily_rows("20240102")),
     ]
     base = store.build_snapshot(name="s1", successful_units={"daily": units}, manifest_extra={})
+    # The same-source fast path must trust the already sealed projection before
+    # resolving or opening dormant raw units.
+    (store.root / units[0]["output_path"]).unlink()
     successor = store.build_snapshot(
         name="s2",
         successful_units={"daily": units},

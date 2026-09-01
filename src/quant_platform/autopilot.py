@@ -1108,6 +1108,10 @@ class AutopilotController:
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or _now()
+        # Finish setup-only model runs from cycles terminalized on a previous
+        # tick before active-kind deduplication can suppress a new governed
+        # lane. Active-cycle runs remain recoverable and are never touched.
+        self.research.reconcile_autopilot_execution_state()
         self.store.reconcile()
         config, revision = self.config()
         if not config["enabled"]:
@@ -1126,6 +1130,11 @@ class AutopilotController:
             )
             for key in totals:
                 totals[key] += int(result.get(key) or 0)
+        # A stale bound dataset may have terminalized a cycle during this tick.
+        # Reconcile its setup-only runs now instead of leaving a false queue
+        # until the next scheduler invocation.
+        self.research.reconcile_autopilot_execution_state()
+        self.store.reconcile()
         return totals
 
     def _tick_horizon(

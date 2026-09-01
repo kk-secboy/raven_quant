@@ -2,8 +2,10 @@ import hashlib
 import json
 import logging
 import subprocess
+from datetime import date
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import pytest
 
@@ -22,6 +24,7 @@ from quant_data.qlib_builder import (
     DAILY_QLIB_DUCKDB_THREADS,
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     QlibBuilder,
+    _fundamental_revision_rows_sql,
     _to_wsl_path,
     build_qlib_output_manifest,
     verify_qlib_output_manifest,
@@ -65,6 +68,7 @@ def test_daily_duckdb_connection_applies_host_safe_resource_limits(
     assert f"SET memory_limit='{DAILY_QLIB_DUCKDB_MEMORY_LIMIT}'" in statements
     assert f"SET threads={DAILY_QLIB_DUCKDB_THREADS}" in statements
     assert "SET preserve_insertion_order=false" in statements
+    assert "SET TimeZone='Asia/Shanghai'" in statements
     assert f"SET temp_directory='{spill.resolve().as_posix()}'" in normalized
 
 
@@ -281,6 +285,7 @@ def _write_required_research_inputs(snapshot: Path) -> None:
             "ann_date": "2024-01-01",
             "end_date": "2023-12-31",
             "roe": 10.0,
+            "update_flag": 0,
         },
         "index_member_all": {
             "ts_code": "000001.SZ",
@@ -303,11 +308,13 @@ def _write_required_research_inputs(snapshot: Path) -> None:
             "ts_code": "000001.SZ",
             "ann_date": "2024-01-01",
             "total_hldr_eqy_exc_min_int": 10_000_000.0,
+            "update_flag": 0,
         },
         "fina_audit": {
             "ts_code": "000001.SZ",
             "ann_date": "2024-01-01",
             "audit_result": "standard_unqualified",
+            "update_flag": 0,
         },
         "namechange": {
             "ts_code": "000001.SZ",
@@ -548,6 +555,7 @@ def test_eligibility_metadata_reads_full_history_in_bounded_symbol_batches(
                 "ts_code": "600000.SH",
                 "ann_date": "2024-01-01",
                 "total_hldr_eqy_exc_min_int": 10_000_000.0,
+                "update_flag": 0,
             },
         ),
         (
@@ -556,6 +564,7 @@ def test_eligibility_metadata_reads_full_history_in_bounded_symbol_batches(
                 "ts_code": "600000.SH",
                 "ann_date": "2024-01-01",
                 "audit_result": "standard_unqualified",
+                "update_flag": 0,
             },
         ),
         (
@@ -1139,6 +1148,7 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
                 "roe": 12.5,
                 "debt_to_assets": 45.0,
                 "netprofit_yoy": 18.0,
+                "update_flag": 0,
             }
         ],
     }
@@ -2171,7 +2181,7 @@ def test_qlib_output_verifier_rejects_intact_obsolete_daily_provider(
     feature.write_bytes(b"intact-but-obsolete")
     provenance = {
         "frequency": "day",
-        "field_contract_version": "daily-qlib-field-v6-fail-closed-missing-controls",
+        "field_contract_version": "daily-qlib-field-v7-pit-financial-revisions",
         "output_manifest": build_qlib_output_manifest(qlib_dir),
     }
 
@@ -2358,7 +2368,9 @@ def test_fundamental_partitions_allow_optional_ingestion_metadata(tmp_path: Path
     pd.DataFrame(
         [{**common, "ann_date": "2023-12-31", "ingested_at": "2024-01-01T00:00:00Z"}]
     ).to_parquet(first / "data.parquet")
-    pd.DataFrame([{**common, "ann_date": "2024-01-01"}]).to_parquet(
+    pd.DataFrame(
+        [{**common, "ann_date": "2024-01-01", "update_flag": 0}]
+    ).to_parquet(
         second / "data.parquet"
     )
 
@@ -2520,6 +2532,158 @@ def _fund_roe(by_symbol: Path) -> list[float]:
     return pd.read_parquet(by_symbol / "SZ000001.parquet")["fund_roe"].tolist()
 
 
+def test_ingestion_boundary_is_stable_across_duckdb_session_timezones() -> None:
+    revision_rows = _fundamental_revision_rows_sql(
+        "SELECT * FROM revision_source",
+        payload_columns=["ts_code", "ann_date", "end_date", "roe"],
+        source_columns={
+            "ts_code",
+            "ann_date",
+            "end_date",
+            "roe",
+            "update_flag",
+            "ingested_at",
+        },
+    )
+    observed: list[tuple[date, str]] = []
+    for timezone_name in ("UTC", "America/New_York", "Asia/Shanghai"):
+        connection = duckdb.connect()
+        try:
+            connection.execute(f"SET TimeZone='{timezone_name}'")
+            connection.execute(
+                """
+                CREATE TABLE revision_source AS SELECT
+                    '000001.SZ'::VARCHAR AS ts_code,
+                    '2024-01-01'::VARCHAR AS ann_date,
+                    '2023-12-31'::VARCHAR AS end_date,
+                    10.0::DOUBLE AS roe,
+                    1::INTEGER AS update_flag,
+                    TIMESTAMPTZ '2024-01-01 16:30:00+00' AS ingested_at
+                """
+            )
+            observed.append(
+                connection.execute(
+                    "SELECT available_at, available_at_source FROM ("
+                    + revision_rows
+                    + ")"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    # 16:30 UTC is already 2024-01-02 in mainland China.  Host/session
+    # timezone must not move that acquisition boundary back to January 1.
+    assert observed == [
+        (date(2024, 1, 2), "ingested_at_upper_bound"),
+        (date(2024, 1, 2), "ingested_at_upper_bound"),
+        (date(2024, 1, 2), "ingested_at_upper_bound"),
+    ]
+
+
+def test_singleton_initial_payload_uses_announcement_before_ingestion(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "update_flag": 0,
+                "ingested_at": pd.Timestamp("2024-01-10T00:00:00Z"),
+            }
+        ],
+        daily_days=("2024-01-02",),
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert _fund_roe(by_symbol) == pytest.approx([10.0])
+
+
+@pytest.mark.parametrize("update_flag", [1, None], ids=["revised", "unmarked"])
+def test_singleton_noninitial_payload_uses_china_ingestion_upper_bound(
+    tmp_path: Path,
+    update_flag: int | None,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "update_flag": update_flag,
+                # Mainland-China calendar date is 2024-01-02.
+                "ingested_at": pd.Timestamp("2024-01-01T16:30:00Z"),
+            }
+        ],
+        daily_days=("2024-01-02", "2024-01-03"),
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert _fund_roe(by_symbol) == pytest.approx([float("nan"), 10.0], nan_ok=True)
+
+
+@pytest.mark.parametrize("update_flag", [1, None], ids=["revised", "unmarked"])
+def test_singleton_noninitial_payload_without_lineage_fails_closed(
+    tmp_path: Path,
+    update_flag: int | None,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "update_flag": update_flag,
+            }
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="financial revision rows without a reliable",
+    ):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_singleton_explicit_final_announcement_precedes_ingestion_fallback(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "f_ann_date": "2024-01-03",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "update_flag": 1,
+                "ingested_at": pd.Timestamp("2024-01-10T00:00:00Z"),
+            }
+        ],
+        daily_days=("2024-01-02", "2024-01-04", "2024-01-11"),
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert _fund_roe(by_symbol) == pytest.approx(
+        [float("nan"), 10.0, 10.0], nan_ok=True
+    )
+
+
 def test_fundamental_revision_becomes_visible_only_after_f_ann_date(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     _write_revision_fixture(
@@ -2580,10 +2744,126 @@ def test_undated_revision_uses_ingested_at_only_as_future_upper_bound(
 
     by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
 
-    # The first observed payload is the historical baseline.  A conflicting
-    # revision without f_ann_date cannot replace it before the only reliable
-    # upper bound we have: the revision row's ingestion date.
-    assert _fund_roe(by_symbol) == pytest.approx([10.0, 10.0, 20.0])
+    # Neither payload is marked update_flag=0, so ingestion order must not be
+    # reinterpreted as an announcement-date baseline.  Each payload becomes
+    # eligible only strictly after its own conservative acquisition boundary.
+    assert _fund_roe(by_symbol) == pytest.approx([float("nan"), 10.0, 20.0], nan_ok=True)
+
+
+def test_unique_update_flag_zero_payload_is_the_only_undated_initial(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "update_flag": 0,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 20.0,
+                "update_flag": 1,
+                "ingested_at": pd.Timestamp("2024-01-05T00:00:00Z"),
+            },
+        ],
+        daily_days=("2024-01-02", "2024-01-08"),
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert _fund_roe(by_symbol) == pytest.approx([10.0, 20.0])
+
+
+def test_undated_revision_after_unique_initial_still_requires_ingestion(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "update_flag": 0,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 20.0,
+                "update_flag": 1,
+            },
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="conflicting financial revision rows without a reliable",
+    ):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_revised_or_unmarked_payload_cannot_be_hash_selected_as_initial(
+    tmp_path: Path,
+) -> None:
+    base_rows = [
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "roe": 10.0,
+            "update_flag": 1,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "roe": 20.0,
+            "update_flag": None,
+        },
+    ]
+    for name, rows in (("forward", base_rows), ("reversed", list(reversed(base_rows)))):
+        snapshot = tmp_path / name / "snapshot"
+        _write_revision_fixture(snapshot, rows)
+        with pytest.raises(
+            RuntimeError,
+            match="conflicting financial revision rows without a reliable",
+        ):
+            QlibBuilder(snapshot).build_staging(tmp_path / name / "staging")
+
+
+def test_multiple_distinct_update_flag_zero_payloads_fail_closed(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": roe,
+                "update_flag": 0,
+            }
+            for roe in (10.0, 20.0)
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="conflicting financial revision rows without a reliable",
+    ):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
 
 
 def test_unsequenced_financial_revision_conflict_fails_closed_across_row_order(
@@ -2625,12 +2905,15 @@ def test_financial_restatement_applies_only_after_the_new_announcement(
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "roe": 10.0,
+                "update_flag": 0,
             },
             {
                 "ts_code": "000001.SZ",
                 "ann_date": "2024-01-05",
+                "f_ann_date": "2024-01-05",
                 "end_date": "2023-12-31",
                 "roe": 99.0,
+                "update_flag": 1,
             },
         ],
         daily_days=("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-08"),
@@ -2667,6 +2950,7 @@ def test_appending_future_market_and_restatement_rows_preserves_historical_featu
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "roe": 10.0,
+                "update_flag": 0,
             }
         ],
         daily_days=("2024-01-02", "2024-01-03", "2024-01-04"),
@@ -2711,8 +2995,10 @@ def test_appending_future_market_and_restatement_rows_preserves_historical_featu
             {
                 "ts_code": "000001.SZ",
                 "ann_date": "2024-01-05",
+                "f_ann_date": "2024-01-05",
                 "end_date": "2023-12-31",
                 "roe": 99.0,
+                "update_flag": 1,
             }
         ]
     ).to_parquet(
@@ -2760,6 +3046,7 @@ def test_appending_undated_revision_cannot_change_prior_trade_dates(
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "roe": 10.0,
+                "update_flag": 0,
                 "ingested_at": pd.Timestamp("2024-01-02T00:00:00Z"),
             }
         ],
@@ -2807,6 +3094,7 @@ def test_appending_undated_revision_cannot_change_prior_trade_dates(
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "roe": 20.0,
+                "update_flag": 1,
                 "ingested_at": pd.Timestamp("2024-01-05T00:00:00Z"),
             }
         ]
@@ -2852,6 +3140,7 @@ _EXTENDED_FINA_ROW = {
     "ann_date": "2024-01-03",
     "end_date": "2023-12-31",
     "roe": 12.5,
+    "update_flag": 0,
     "eps": 0.85,
     "bps": 6.4,
     "ocfps": 1.1,
@@ -2944,6 +3233,7 @@ def test_contract_distinguishes_missing_from_all_null_source_columns(
                 "ann_date": "2024-01-03",
                 "end_date": "2023-12-31",
                 "roe": 12.5,
+                "update_flag": 0,
                 # Declared and present in the schema, but entirely null.
                 "ocf_to_or": None,
             }
@@ -2954,12 +3244,17 @@ def test_contract_distinguishes_missing_from_all_null_source_columns(
         builder = QlibBuilder(snapshot)
 
     contract = builder.research_feature_contract
-    assert contract["version"] == 7
+    assert contract["version"] == 8
     assert contract["fundamental_revision_availability"] == {
-        "version": 1,
+        "version": 2,
         "explicit_boundary": "max_ann_date_and_valid_final_or_actual_date",
+        "announcement_date_initial": "unique_update_flag_zero_payload",
         "undated_revision_fallback": "ingested_at_upper_bound",
         "fallback_visibility": "strictly_after_ingestion_date",
+        "ingestion_calendar_timezone": "Asia/Shanghai",
+        "singleton_revised_or_unmarked": (
+            "explicit_disclosure_then_ingestion_upper_bound_or_fail_closed"
+        ),
         "unsequenced_conflict": "fail_closed",
         "row_source_column": "available_at_source",
     }
@@ -3015,6 +3310,7 @@ def _write_statement_fixture(
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "roe": 10.0,
+                "update_flag": 0,
             }
         ],
         daily_days=daily_days,
@@ -3034,13 +3330,16 @@ def test_statement_line_items_follow_announcement_dates_without_lookahead(
                 "end_date": "2023-12-31",
                 "n_income_attr_p": 1.0e6,
                 "rd_exp": 5.0e4,
+                "update_flag": 0,
             },
             {
                 "ts_code": "000001.SZ",
                 "ann_date": "2024-01-05",
+                "f_ann_date": "2024-01-05",
                 "end_date": "2023-12-31",
                 "n_income_attr_p": 2.0e6,
                 "rd_exp": 6.0e4,
+                "update_flag": 1,
             },
         ],
         balancesheet_rows=[
@@ -3051,6 +3350,7 @@ def test_statement_line_items_follow_announcement_dates_without_lookahead(
                 "total_assets": 5.0e7,
                 "money_cap": 8.0e6,
                 "goodwill": 1.0e6,
+                "update_flag": 0,
             }
         ],
         cashflow_rows=[
@@ -3060,6 +3360,7 @@ def test_statement_line_items_follow_announcement_dates_without_lookahead(
                 "end_date": "2023-12-31",
                 "n_cashflow_act": 3.0e6,
                 "c_pay_acq_const_fiolta": 9.0e5,
+                "update_flag": 0,
             }
         ],
         daily_days=("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-08"),
@@ -3132,6 +3433,7 @@ def test_statement_revision_conflict_prefers_newest_update_flag(tmp_path: Path) 
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "total_assets": 5.0e7,
+                "update_flag": 0,
             }
         ],
         cashflow_rows=[
@@ -3140,6 +3442,7 @@ def test_statement_revision_conflict_prefers_newest_update_flag(tmp_path: Path) 
                 "ann_date": "2024-01-01",
                 "end_date": "2023-12-31",
                 "n_cashflow_act": 3.0e6,
+                "update_flag": 0,
             }
         ],
         daily_days=("2024-01-02", "2024-01-03"),

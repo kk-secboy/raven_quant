@@ -22,6 +22,7 @@ from quant_platform.autopilot import (
     _derived_branch_status,
 )
 from quant_platform.job_store import JobStore
+from quant_platform.platform_model_tournament import PlatformModelTournamentService
 from quant_platform.research_store import ResearchStore
 
 
@@ -99,6 +100,7 @@ def _seed_failed_branch(
     run_status: str = "failed",
     current_job_status: str = "failed",
     current_job_kind: str = "factor_evaluate",
+    requested_by: str = "test",
 ) -> dict[str, str]:
     autopilot = AutopilotStore(database_url)
     cycle = autopilot.ensure_cycle(
@@ -141,7 +143,7 @@ def _seed_failed_branch(
         kind="factor",
         objective="verify atomic retry",
         dataset="retry-dataset",
-        requested_by="test",
+        requested_by=requested_by,
         budget={},
         config={},
         artifact_path=tmp_path / "run",
@@ -205,7 +207,12 @@ def test_atomic_retry_uses_current_evaluator_instead_of_stale_parent_job(
 def test_reconcile_exposes_failed_current_evaluator_for_atomic_retry(
     tmp_path: Path, database_url: str
 ) -> None:
-    ids = _seed_failed_branch(database_url, tmp_path, run_status="queued")
+    ids = _seed_failed_branch(
+        database_url,
+        tmp_path,
+        run_status="queued",
+        requested_by="autopilot",
+    )
     store = AutopilotStore(database_url)
     with store.engine.begin() as connection:
         connection.execute(
@@ -218,6 +225,40 @@ def test_reconcile_exposes_failed_current_evaluator_for_atomic_retry(
     assert store.get_branch(ids["branch_id"])["status"] == "failed"
     assert store.retry_failed_branch(ids["branch_id"])
     assert store.get_branch(ids["branch_id"])["status"] == "queued"
+    assert JobStore(database_url).get(ids["current_job_id"])["status"] == "queued"
+
+
+def test_scheduler_projects_terminal_current_job_before_atomic_retry(
+    tmp_path: Path, database_url: str
+) -> None:
+    ids = _seed_failed_branch(
+        database_url,
+        tmp_path,
+        run_status="queued",
+        requested_by="autopilot",
+    )
+    research = ResearchStore(database_url)
+    with research.engine.begin() as connection:
+        connection.execute(
+            update(job_rows)
+            .where(job_rows.c.id == ids["current_job_id"])
+            .values(
+                payload_json={
+                    "stage": "independent_evaluation",
+                    "research_run_id": ids["run_id"],
+                }
+            )
+        )
+
+    assert research.reconcile_terminal_autopilot_jobs() == 1
+    assert research.reconcile_terminal_autopilot_jobs() == 0
+    assert research.get_run(ids["run_id"])["status"] == "failed"
+
+    store = AutopilotStore(database_url)
+    store.reconcile()
+    assert store.get_branch(ids["branch_id"])["status"] == "failed"
+    assert store.retry_failed_branch(ids["branch_id"])
+    assert research.get_run(ids["run_id"])["status"] == "queued"
     assert JobStore(database_url).get(ids["current_job_id"])["status"] == "queued"
 
 
@@ -314,3 +355,221 @@ def test_atomic_retry_error_rolls_back_without_marking_queued_run_failed(
     assert store.get_branch(ids["branch_id"])["status"] == "failed"
     assert ResearchStore(database_url).get_run(ids["run_id"])["status"] == "queued"
     assert JobStore(database_url).get(ids["current_job_id"])["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("terminal_mode", "expected_owner"),
+    [
+        ("blocked", "blocked/dataset_unavailable"),
+        ("superseded", "paused/superseded"),
+    ],
+)
+def test_terminal_cycle_reconciliation_releases_setup_only_model_run(
+    tmp_path: Path,
+    database_url: str,
+    terminal_mode: str,
+    expected_owner: str,
+) -> None:
+    autopilot = AutopilotStore(database_url)
+    cycle = autopilot.ensure_cycle(
+        {
+            "name": "retired-model-dataset",
+            "lineage_id": "b" * 64,
+            "end_date": "2026-08-31",
+            "provenance": {"dataset_identity_sha256": "a" * 64},
+        },
+        config_revision=1,
+    )
+    research = ResearchStore(database_url)
+    kind = "platform_model_feature_screen_deadbeef_short_1_5d"
+    run = research.create_run(
+        kind=kind,
+        objective="recover interrupted platform setup",
+        dataset="retired-model-dataset",
+        requested_by=f"autopilot:{cycle['id']}",
+        budget={},
+        config={
+            "contract_version": "platform-model-tournament-run-v2-horizon",
+            "autopilot_cycle_id": cycle["id"],
+        },
+        artifact_path=tmp_path / "model-run",
+    )
+
+    # An active owner is resumable. The scheduler must not guess that the
+    # create-before-job gap is a terminal failure.
+    assert research.reconcile_terminal_autopilot_initializations() == 0
+    assert research.get_run(run["id"])["status"] == "queued"
+
+    if terminal_mode == "superseded":
+        autopilot.supersede_research_cycle(
+            cycle["id"],
+            replacement_dataset={
+                "name": "successor-model-dataset",
+                "provenance": {"dataset_identity_sha256": "c" * 64},
+            },
+        )
+    else:
+        autopilot.set_cycle_state(
+            cycle["id"],
+            state={**cycle["state"], "result": "bound_dataset_unavailable"},
+            stage="dataset_unavailable",
+            status="blocked",
+            error="bound Qlib dataset is unavailable",
+            finished=True,
+        )
+    assert research.reconcile_terminal_autopilot_initializations() == 1
+    assert research.reconcile_terminal_autopilot_initializations() == 0
+    terminal = research.get_run(run["id"])
+    assert terminal["status"] == "failed"
+    assert f"owning autopilot cycle is {expected_owner}" in terminal["error"]
+    with research.engine.connect() as connection:
+        events = list(
+            connection.scalars(
+                select(research_events.c.event_type).where(
+                    research_events.c.research_run_id == run["id"]
+                )
+            )
+        )
+    assert events == ["run.created", "run.failed"]
+
+    # History is retained, while the partial unique index no longer prevents
+    # the next immutable cycle from using the same governed lane kind.
+    replacement = research.create_run(
+        kind=kind,
+        objective="new immutable model lane",
+        dataset="successor-model-dataset",
+        requested_by="autopilot:successor-cycle",
+        budget={},
+        config={},
+        artifact_path=tmp_path / "replacement-model-run",
+    )
+    assert replacement["status"] == "queued"
+    assert research.get_run(run["id"])["status"] == "failed"
+
+
+def test_terminal_cycle_cancels_unattached_payload_job_before_reconciling_run(
+    tmp_path: Path, database_url: str
+) -> None:
+    autopilot = AutopilotStore(database_url)
+    cycle = autopilot.ensure_cycle(
+        {
+            "name": "job-gap-dataset",
+            "lineage_id": "b" * 64,
+            "end_date": "2026-08-31",
+            "provenance": {"dataset_identity_sha256": "c" * 64},
+        },
+        config_revision=1,
+    )
+    research = ResearchStore(database_url)
+    run = research.create_run(
+        kind="platform_model_feature_screen_payload_short_1_5d",
+        objective="preserve durable evaluator authority",
+        dataset="job-gap-dataset",
+        requested_by=f"autopilot:{cycle['id']}",
+        budget={},
+        config={
+            "contract_version": "platform-model-tournament-run-v2-horizon",
+            "autopilot_cycle_id": cycle["id"],
+        },
+        artifact_path=tmp_path / "payload-run",
+    )
+    payload = {"research_run_id": run["id"], "contract": "exact"}
+    job = JobStore(database_url).create(
+        "model_evaluate",
+        payload,
+        tmp_path / "model.log",
+        dedupe_active_kind=False,
+        idempotency_key="platform-model:payload-gap",
+    )
+    autopilot.set_cycle_state(
+        cycle["id"],
+        state={**cycle["state"], "result": "blocked"},
+        stage="research_blocked",
+        status="blocked",
+        error="test terminal",
+        finished=True,
+    )
+
+    assert research.reconcile_terminal_autopilot_initializations() == 0
+    assert research.get_run(run["id"])["status"] == "queued"
+
+    service = PlatformModelTournamentService.__new__(
+        PlatformModelTournamentService
+    )
+    service.engine = research.engine
+    service.research = research
+    service.jobs = JobStore(database_url)
+    with pytest.raises(ValueError, match="no longer has an active owner"):
+        service._adopt_exact_unattached_job(
+            cycle_id=cycle["id"],
+            research_run_id=run["id"],
+            kind="model_evaluate",
+            payload=payload,
+        )
+    assert JobStore(database_url).get(job["id"])["status"] == "cancelled"
+    assert research.get_run(run["id"])["job_id"] is None
+    assert research.reconcile_terminal_autopilot_initializations() == 1
+    assert research.get_run(run["id"])["status"] == "failed"
+    with research.engine.connect() as connection:
+        assert int(
+            connection.scalar(
+                select(func.count())
+                .select_from(job_rows)
+                .where(
+                    job_rows.c.payload_json["research_run_id"].as_string()
+                    == run["id"]
+                )
+            )
+            or 0
+        ) == 1
+
+
+def test_active_cycle_atomically_adopts_exact_unattached_payload_job(
+    tmp_path: Path, database_url: str
+) -> None:
+    autopilot = AutopilotStore(database_url)
+    cycle = autopilot.ensure_cycle(
+        {
+            "name": "active-job-gap-dataset",
+            "lineage_id": "d" * 64,
+            "end_date": "2026-08-31",
+            "provenance": {"dataset_identity_sha256": "e" * 64},
+        },
+        config_revision=1,
+    )
+    research = ResearchStore(database_url)
+    run = research.create_run(
+        kind="platform_model_feature_screen_active_short_1_5d",
+        objective="adopt exact interrupted evaluator",
+        dataset="active-job-gap-dataset",
+        requested_by=f"autopilot:{cycle['id']}",
+        budget={},
+        config={
+            "contract_version": "platform-model-tournament-run-v2-horizon",
+            "autopilot_cycle_id": cycle["id"],
+        },
+        artifact_path=tmp_path / "active-model-run",
+    )
+    payload = {"research_run_id": run["id"], "contract": "exact-active"}
+    job = JobStore(database_url).create(
+        "model_evaluate",
+        payload,
+        tmp_path / "active-model.log",
+        dedupe_active_kind=False,
+        idempotency_key="platform-model:active-payload-gap",
+    )
+    service = PlatformModelTournamentService.__new__(PlatformModelTournamentService)
+    service.engine = research.engine
+    service.research = research
+    service.jobs = JobStore(database_url)
+
+    adopted = service._adopt_exact_unattached_job(
+        cycle_id=cycle["id"],
+        research_run_id=run["id"],
+        kind="model_evaluate",
+        payload=payload,
+    )
+
+    assert adopted["id"] == job["id"]
+    assert research.get_run(run["id"])["job_id"] == job["id"]
+    assert JobStore(database_url).get(job["id"])["status"] == "queued"

@@ -125,3 +125,26 @@ def test_every_rdagent_runtime_build_inherits_package_mirrors() -> None:
     for service, body in runtime_builds:
         assert "PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}" in body, service
         assert "DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}" in body, service
+
+
+def test_capital_research_workers_can_verify_the_independent_evaluation_lane() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+
+    for service in (
+        "rdagent-worker",
+        "rdagent-model-worker",
+        "rdagent-report-worker",
+        "rdagent-quant-worker",
+    ):
+        match = re.search(
+            rf"^  {re.escape(service)}:\s*$\n(?P<body>.*?)(?=^  [a-z0-9-]+:\s*$|\Z)",
+            text,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, service
+        body = match.group("body")
+        assert (
+            "RDAGENT_EVALUATION_WORKER_URL: http://evaluation-worker:8770" in body
+        ), service
+        assert "MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}" in body, service

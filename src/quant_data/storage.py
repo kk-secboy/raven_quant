@@ -4,11 +4,12 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import pandas as pd
@@ -23,6 +24,13 @@ from .row_identity import (
     SNAPSHOT_QUARANTINE_KEYS,
     semantic_provider_columns,
 )
+
+if TYPE_CHECKING:
+    from .checkpoint import CheckpointStore
+
+
+INGESTED_AT_RECOVERY_CONTRACT_VERSION = "work-unit-ledger-ingested-at-recovery-v1"
+_INGESTED_AT_RECOVERY_KEY = "_snapshot_ingested_at_recovery"
 
 DATE_COLUMNS = {
     "trade_date",
@@ -144,6 +152,274 @@ class ParquetStore:
                 frames.append(pd.read_parquet(self.root / output_path))
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
+    def build_ingested_at_successor(
+        self,
+        *,
+        name: str,
+        source_snapshot: Path,
+        checkpoint: CheckpointStore,
+        datasets: set[str] | frozenset[str] = frozenset({"fina_indicator"}),
+        duckdb_memory_limit: str = "4GB",
+        duckdb_threads: int = 4,
+    ) -> Path:
+        """Rebuild missing row acquisition times from an exact succeeded-unit ledger.
+
+        This is deliberately a separate, fail-closed repair path.  The source
+        snapshot remains immutable.  A checkpoint ``updated_at`` is accepted as
+        an upper bound for a missing row timestamp only after the source
+        manifest identity, succeeded ledger identity, durable file checksum and
+        physical row count all agree.
+        """
+
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name):
+            raise ValueError("successor snapshot name is invalid")
+        snapshots_root = self.snapshots_root.resolve()
+        if source_snapshot.is_symlink() or not source_snapshot.is_dir():
+            raise ValueError("source snapshot is missing or unsafe")
+        source_snapshot = source_snapshot.resolve(strict=True)
+        if source_snapshot.parent != snapshots_root or source_snapshot.name == name:
+            raise ValueError("source snapshot must be an immutable sibling of the successor")
+
+        # Import here so the ordinary storage writer does not acquire a lineage
+        # dependency merely by being imported by download workers.
+        from .snapshot_lineage import make_lineage_id, verify_snapshot_lineage
+
+        source_manifest = verify_snapshot_lineage(source_snapshot)
+        source_manifest_path = source_snapshot / "manifest.json"
+        source_manifest_sha256 = _sha256_file(source_manifest_path)
+        source_datasets = source_manifest.get("datasets")
+        if not isinstance(source_datasets, dict) or not source_datasets:
+            raise ValueError("source snapshot has no sealed dataset unit evidence")
+        recovery_datasets = {str(dataset).strip() for dataset in datasets if str(dataset).strip()}
+        if not recovery_datasets:
+            raise ValueError("at least one ingested_at recovery dataset is required")
+        missing_datasets = sorted(recovery_datasets - set(source_datasets))
+        if missing_datasets:
+            raise ValueError(
+                "source snapshot does not contain recovery datasets: "
+                + ", ".join(missing_datasets)
+            )
+        for dataset, entry in sorted(source_datasets.items()):
+            if not _is_safe_dataset_name(dataset):
+                raise ValueError("source snapshot contains an unsafe dataset name")
+            if not isinstance(entry, dict):
+                raise ValueError(f"source snapshot {dataset} manifest is invalid")
+            if dataset in recovery_datasets:
+                _manifest_dataset_paths(
+                    source_snapshot / "parquet",
+                    dataset=str(dataset),
+                    entry=entry,
+                    reject_unmanifested=True,
+                    verify_hashes=True,
+                )
+
+        expected_by_key: dict[str, tuple[str, str, int]] = {}
+        for dataset in sorted(recovery_datasets):
+            entry = source_datasets[dataset]
+            identities = entry.get("source_units") if isinstance(entry, dict) else None
+            if not isinstance(identities, list):
+                raise ValueError(f"source snapshot {dataset} unit evidence is invalid")
+            for identity in identities:
+                if not isinstance(identity, dict):
+                    raise ValueError(f"source snapshot {dataset} unit evidence is invalid")
+                unit_key = str(identity.get("unit_key") or "")
+                sha256 = str(identity.get("sha256") or "").lower()
+                row_count = identity.get("row_count")
+                if (
+                    not unit_key
+                    or not _is_sha256(sha256)
+                    or isinstance(row_count, bool)
+                    or not isinstance(row_count, int)
+                    or row_count < 0
+                    or unit_key in expected_by_key
+                ):
+                    raise ValueError(f"source snapshot {dataset} unit evidence is invalid")
+                expected_by_key[unit_key] = (str(dataset), sha256, row_count)
+
+        ledger_rows = checkpoint.successful_units(expected_by_key)
+        actual_by_key = {str(row.get("unit_key") or ""): dict(row) for row in ledger_rows}
+        if set(actual_by_key) != set(expected_by_key):
+            raise ValueError(
+                "succeeded work-unit ledger no longer matches the source snapshot manifest"
+            )
+
+        verified_units: list[dict[str, Any]] = []
+        recovery_units: list[dict[str, Any]] = []
+        selected: dict[str, list[dict[str, Any]]] = {
+            dataset: [] for dataset in recovery_datasets
+        }
+        connection = duckdb.connect()
+        try:
+            for unit_key in sorted(expected_by_key):
+                expected_dataset, expected_sha256, expected_rows = expected_by_key[unit_key]
+                row = actual_by_key[unit_key]
+                actual_identity = (
+                    str(row.get("dataset") or ""),
+                    str(row.get("sha256") or "").lower(),
+                    int(row.get("row_count") or 0),
+                )
+                if (
+                    str(row.get("status") or "") != "succeeded"
+                    or actual_identity
+                    != (expected_dataset, expected_sha256, expected_rows)
+                ):
+                    raise ValueError(
+                        f"succeeded ledger identity changed for source unit {unit_key}"
+                    )
+                output_path = str(row.get("output_path") or "")
+                target = _safe_unit_file(self.root, output_path)
+                if _sha256_file(target) != expected_sha256:
+                    raise ValueError(f"source unit file checksum changed for {unit_key}")
+
+                missing_rows = 0
+                if target.suffix == ".parquet":
+                    columns = {
+                        str(record[0])
+                        for record in connection.execute(
+                            "DESCRIBE SELECT * FROM read_parquet("
+                            f"{_sql_string(str(target))})"
+                        ).fetchall()
+                    }
+                    if "filename" in columns:
+                        raise ValueError(
+                            f"source unit uses reserved recovery column filename: {unit_key}"
+                        )
+                    if "ingested_at" in columns:
+                        actual_rows, missing_rows = connection.execute(
+                            "SELECT count(*), count(*) FILTER (WHERE "
+                            "try_cast(ingested_at AS TIMESTAMPTZ) IS NULL) "
+                            "FROM read_parquet("
+                            f"{_sql_string(str(target))})"
+                        ).fetchone()
+                    else:
+                        actual_rows = connection.execute(
+                            "SELECT count(*) FROM read_parquet("
+                            f"{_sql_string(str(target))})"
+                        ).fetchone()[0]
+                        missing_rows = actual_rows
+                    actual_rows = int(actual_rows)
+                    missing_rows = int(missing_rows)
+                elif target.name.endswith(".empty.json"):
+                    try:
+                        marker = json.loads(target.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"source empty-unit marker is invalid for {unit_key}"
+                        ) from exc
+                    if marker.get("empty") is not True:
+                        raise ValueError(f"source empty-unit marker is invalid for {unit_key}")
+                    actual_rows = 0
+                else:
+                    raise ValueError(f"source unit file type is invalid for {unit_key}")
+                if actual_rows != expected_rows:
+                    raise ValueError(f"source unit physical row count changed for {unit_key}")
+
+                verified_identity = {
+                    "dataset": expected_dataset,
+                    "unit_key": unit_key,
+                    "sha256": expected_sha256,
+                    "row_count": expected_rows,
+                    "output_path": output_path,
+                }
+                verified_units.append(verified_identity)
+                selected_row = dict(row)
+                if missing_rows:
+                    observed_at = _ledger_timestamp(row.get("updated_at"), unit_key=unit_key)
+                    evidence = {
+                        "contract_version": INGESTED_AT_RECOVERY_CONTRACT_VERSION,
+                        **verified_identity,
+                        "evidence_source": "quantlab.work_units.succeeded.updated_at",
+                        "ledger_updated_at": observed_at,
+                        "missing_row_count": missing_rows,
+                    }
+                    evidence["evidence_sha256"] = _canonical_sha256(evidence)
+                    selected_row[_INGESTED_AT_RECOVERY_KEY] = evidence
+                    recovery_units.append(evidence)
+                selected[expected_dataset].append(selected_row)
+        finally:
+            connection.close()
+
+        if not recovery_units:
+            raise ValueError("source snapshot has no missing ingested_at rows to recover")
+        affected_datasets = {str(item["dataset"]) for item in recovery_units}
+        unsafe_carry = sorted(
+            dataset
+            for dataset in affected_datasets
+            if isinstance(source_datasets.get(dataset), dict)
+            and source_datasets[dataset].get("industry_history_carry")
+        )
+        if unsafe_carry:
+            raise ValueError(
+                "ingested_at recovery cannot discard inherited industry rows for: "
+                + ", ".join(unsafe_carry)
+            )
+
+        recovery_receipt: dict[str, Any] = {
+            "contract_version": INGESTED_AT_RECOVERY_CONTRACT_VERSION,
+            "source_snapshot": source_snapshot.name,
+            "source_snapshot_manifest_sha256": source_manifest_sha256,
+            "source_lineage_id": str(source_manifest.get("lineage_id") or ""),
+            "evidence_source": "quantlab.work_units.succeeded.updated_at",
+            "recovery_datasets": sorted(recovery_datasets),
+            "verified_unit_count": len(verified_units),
+            "verified_units_sha256": _canonical_sha256(verified_units),
+            "recovered_unit_count": len(recovery_units),
+            "recovered_row_count": sum(
+                int(item["missing_row_count"]) for item in recovery_units
+            ),
+            "recovery_units": recovery_units,
+        }
+        recovery_receipt["receipt_sha256"] = _canonical_sha256(recovery_receipt)
+        lineage_configuration = {
+            "source_snapshot_manifest_sha256": source_manifest_sha256,
+            "source_lineage_id": str(source_manifest.get("lineage_id") or ""),
+            "recovery_contract_version": INGESTED_AT_RECOVERY_CONTRACT_VERSION,
+            "recovery_receipt_sha256": recovery_receipt["receipt_sha256"],
+            "storage_implementation_sha256": _sha256_file(Path(__file__)),
+        }
+        lineage_contract = {
+            "kind": "qlib_daily_source_ingested_at_successor",
+            "configuration": lineage_configuration,
+        }
+        excluded = {
+            "name",
+            "created_at",
+            "datasets",
+            "coverage_audit",
+            "lineage_contract",
+            "lineage_id",
+            "parent_snapshot",
+            "parent_manifest_sha256",
+            "lineage_generation",
+            "ingested_at_recovery",
+        }
+        inherited = {
+            key: value for key, value in source_manifest.items() if key not in excluded
+        }
+        return self.build_snapshot(
+            name=name,
+            successful_units=selected,
+            manifest_extra={
+                **inherited,
+                "lineage_contract": lineage_contract,
+                "lineage_id": make_lineage_id(
+                    lineage_contract["kind"], lineage_configuration
+                ),
+                "parent_snapshot": None,
+                "parent_manifest_sha256": None,
+                "lineage_generation": 0,
+                "ingested_at_recovery": recovery_receipt,
+            },
+            # The source is projection reuse only, not a lineage parent.  Every
+            # affected dataset is forced through the raw-unit rebuild below;
+            # unaffected immutable files may be hard-linked byte-for-byte.
+            base_snapshot=source_snapshot,
+            duckdb_memory_limit=duckdb_memory_limit,
+            duckdb_threads=duckdb_threads,
+            _allow_ingested_at_recovery=True,
+            _sealed_projection_reuse=set(source_datasets) - recovery_datasets,
+        )
+
     def build_snapshot(
         self,
         *,
@@ -154,7 +430,25 @@ class ParquetStore:
         industry_history_anchor: Path | None = None,
         duckdb_memory_limit: str = "4GB",
         duckdb_threads: int = 4,
+        _allow_ingested_at_recovery: bool = False,
+        _sealed_projection_reuse: set[str] | frozenset[str] = frozenset(),
     ) -> Path:
+        has_recovery_metadata = any(
+            _INGESTED_AT_RECOVERY_KEY in row
+            for rows in successful_units.values()
+            for row in rows
+        )
+        if has_recovery_metadata and not _allow_ingested_at_recovery:
+            raise ValueError(
+                "ingested_at recovery metadata is only accepted by the verified "
+                "successor builder"
+            )
+        if _sealed_projection_reuse and (
+            not _allow_ingested_at_recovery or base_snapshot is None
+        ):
+            raise ValueError(
+                "sealed projection reuse is only valid for a verified recovery successor"
+            )
         target = self.snapshots_root / name
         temporary = self.snapshots_root / f".{name}.tmp"
         if base_snapshot is not None and industry_history_anchor is not None:
@@ -227,6 +521,46 @@ class ParquetStore:
             spill_dir = temporary / ".duckdb-spill"
             spill_dir.mkdir(exist_ok=True)
             connection.execute(f"SET temp_directory={_sql_string(str(spill_dir))}")
+            overlap = set(successful_units) & set(_sealed_projection_reuse)
+            if overlap:
+                raise ValueError(
+                    "recovery datasets cannot also be sealed projection reuse datasets: "
+                    + ", ".join(sorted(overlap))
+                )
+            sealed_reuse: list[tuple[str, dict[str, Any], Path]] = []
+            for dataset in sorted(_sealed_projection_reuse):
+                entry = (base_manifest.get("datasets") or {}).get(dataset)
+                if not _is_safe_dataset_name(dataset) or not isinstance(entry, dict):
+                    raise ValueError(
+                        f"source snapshot has no sealed {dataset} projection to reuse"
+                    )
+                if base_root is None:
+                    raise ValueError("sealed projection reuse has no source root")
+                # Projection reuse avoids raw-unit scans, but never bypasses
+                # the manifest file inventory, content hashes or symlink gate.
+                _manifest_dataset_paths(
+                    base_root,
+                    dataset=dataset,
+                    entry=entry,
+                    reject_unmanifested=True,
+                    verify_hashes=True,
+                )
+                source_dir = base_root / dataset if base_root is not None else None
+                if entry.get("files") and (
+                    source_dir is None or not source_dir.is_dir()
+                ):
+                    raise ValueError(
+                        f"source snapshot sealed {dataset} projection is missing"
+                    )
+                if source_dir is None:
+                    raise ValueError("sealed projection reuse has no dataset source")
+                sealed_reuse.append((dataset, entry, source_dir))
+            # No hard link is created until every reused dataset has passed its
+            # complete manifest/hash/unmanifested/symlink audit above.
+            for dataset, entry, source_dir in sealed_reuse:
+                if source_dir is not None and source_dir.is_dir():
+                    _link_tree(source_dir, temporary / "parquet" / dataset)
+                manifest["datasets"][dataset] = dict(entry)
             delisted_stock_symbols = self._explicitly_delisted_stock_symbols(
                 connection,
                 successful_units.get("stock_basic", []),
@@ -280,6 +614,32 @@ class ParquetStore:
                     delisted_stock_symbols=delisted_stock_symbols,
                     industry_history_anchor_evidence=industry_anchor_evidence,
                 )
+            parity_evidence: list[dict[str, Any]] = []
+            if _allow_ingested_at_recovery:
+                if base_root is None:
+                    raise ValueError("recovery successor has no sealed source projection")
+                for dataset, rows in sorted(successful_units.items()):
+                    if not any(_INGESTED_AT_RECOVERY_KEY in row for row in rows):
+                        continue
+                    source_entry = (base_manifest.get("datasets") or {}).get(dataset)
+                    target_entry = manifest["datasets"].get(dataset)
+                    if not isinstance(source_entry, dict) or not isinstance(
+                        target_entry, dict
+                    ):
+                        raise ValueError(
+                            f"recovery parity has no sealed {dataset} projection"
+                        )
+                    evidence = _verify_provider_projection_parity(
+                        connection,
+                        dataset=dataset,
+                        source_root=base_root,
+                        source_entry=source_entry,
+                        target_root=temporary / "parquet",
+                        target_entry=target_entry,
+                    )
+                    target_entry["provider_parity"] = evidence
+                    parity_evidence.append(evidence)
+                _bind_recovery_parity_to_manifest(manifest, parity_evidence)
             historical = {
                 dataset: {
                     "date_field": details["date_field"],
@@ -326,7 +686,6 @@ class ParquetStore:
         delisted_stock_symbols: frozenset[str] = frozenset(),
         industry_history_anchor_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        refresh_metadata = reference_manifest_metadata(rows)
         source_identity = [
             {
                 "unit_key": str(row["unit_key"]),
@@ -335,6 +694,55 @@ class ParquetStore:
             }
             for row in sorted(rows, key=lambda item: str(item["unit_key"]))
         ]
+        current_tuples = {
+            (item["unit_key"], item["sha256"], item["row_count"]) for item in source_identity
+        }
+        base_dir = base_root / dataset if base_root is not None else None
+        dataset_dir = temporary / "parquet" / dataset
+        has_recovery_metadata = any(
+            _INGESTED_AT_RECOVERY_KEY in row for row in rows
+        )
+        base_date_field = (
+            str(base_entry.get("date_field") or "")
+            if isinstance(base_entry, dict)
+            else ""
+        )
+        base_min = str(base_entry.get("date_min") or "")[:10] if base_entry else ""
+        base_max = str(base_entry.get("date_max") or "")[:10] if base_entry else ""
+        base_projection_is_bounded_outside_target = bool(
+            base_date_field
+            and (
+                (snapshot_start is not None and base_min and base_min < snapshot_start)
+                or (snapshot_end is not None and base_max and base_max > snapshot_end)
+            )
+        )
+        obsolete_fund_projection = bool(
+            dataset == "fund_basic"
+            and isinstance(base_entry, dict)
+            and (
+                base_entry.get("date_field") is not None
+                or base_entry.get("date_filter_mode") is not None
+            )
+        )
+        if (
+            not has_recovery_metadata
+            and dataset not in {"index_member_all", "namechange"}
+            and not obsolete_fund_projection
+            and not base_projection_is_bounded_outside_target
+            and base_entry is not None
+            and base_dir is not None
+            and base_dir.exists()
+            and current_tuples == _source_unit_tuples(base_entry)
+        ):
+            # This check intentionally precedes all raw-unit path resolution and
+            # DuckDB DESCRIBE calls.  Equal immutable unit identities plus a
+            # compatible sealed projection are sufficient to hard-link it.
+            _link_tree(base_dir, dataset_dir)
+            return dict(base_entry)
+
+        refresh_metadata = reference_manifest_metadata(rows)
+        recovery_by_path = _ingested_at_recovery_by_path(self.root, dataset, rows)
+        recovery_manifest = _ingested_at_recovery_manifest(recovery_by_path)
         source_sha256 = hashlib.sha256(
             json.dumps(
                 source_identity,
@@ -343,6 +751,13 @@ class ParquetStore:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        if recovery_manifest is not None:
+            source_sha256 = _canonical_sha256(
+                {
+                    "source_units_sha256": source_sha256,
+                    "ingested_at_recovery": recovery_manifest,
+                }
+            )
         paths = [
             str((self.root / row["output_path"]).resolve())
             for row in rows
@@ -369,18 +784,34 @@ class ParquetStore:
             "source_sha256": source_sha256,
             "source_units": source_identity,
             "files": [],
+            **(
+                {"ingested_at_recovery": recovery_manifest}
+                if recovery_manifest is not None
+                else {}
+            ),
         }
         if not paths:
             return empty_entry
 
-        current_tuples = {
-            (item["unit_key"], item["sha256"], item["row_count"]) for item in source_identity
-        }
-        base_dir = base_root / dataset if base_root is not None else None
-        dataset_dir = temporary / "parquet" / dataset
+        if recovery_manifest is not None:
+            # Equal source tuples identify the immutable provider bytes, not
+            # the corrected projection.  Never hard-link an old projection for
+            # a dataset whose missing acquisition timestamps are being rebuilt.
+            base_entry = None
+            base_dir = None
         quoted_paths = "[" + ",".join(_sql_string(path) for path in paths) + "]"
-        raw_source_sql = (
+        unprojected_source_sql = (
             f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+        )
+        unprojected_columns = set(
+            connection.execute(f"DESCRIBE {unprojected_source_sql}")
+            .fetchdf()["column_name"]
+            .tolist()
+        )
+        raw_source_sql = _ingested_at_recovery_source_query(
+            quoted_paths,
+            unprojected_columns,
+            recovery_by_path,
         )
         columns = (
             connection.execute(f"DESCRIBE {raw_source_sql}")
@@ -523,6 +954,7 @@ class ParquetStore:
                 current_tuples,
                 snapshot_start,
                 snapshot_end,
+                recovery_by_path,
             )
         bounded_source_sql = _bounded_snapshot_query(
             raw_source_sql,
@@ -572,7 +1004,7 @@ class ParquetStore:
         if "ingested_at" in columns:
             ingested_min, ingested_max = connection.execute(
                 "SELECT min(ingested_at)::VARCHAR, max(ingested_at)::VARCHAR "
-                f"FROM read_parquet({quoted_paths}, union_by_name=true) "
+                f"FROM ({raw_source_sql}) "
                 "WHERE ingested_at IS NOT NULL"
             ).fetchone()
         base_files = {}
@@ -620,6 +1052,11 @@ class ParquetStore:
             "source_sha256": _effective_source_sha256(source_sha256, industry_carry),
             "source_units": source_identity,
             "files": files,
+            **(
+                {"ingested_at_recovery": recovery_manifest}
+                if recovery_manifest is not None
+                else {}
+            ),
             **({"industry_history_carry": industry_carry} if industry_carry else {}),
         }
 
@@ -793,6 +1230,7 @@ class ParquetStore:
         current_tuples: set[tuple[str, str, int]],
         snapshot_start: str | None,
         snapshot_end: str | None,
+        recovery_by_path: dict[str, dict[str, Any]],
     ) -> None:
         date_expression = _date_sql_expression(date_field)
         # Metadata pass: one single-column min/max scan per unit file, so the
@@ -908,14 +1346,33 @@ class ParquetStore:
                     f"DESCRIBE SELECT * FROM read_parquet({quoted}, union_by_name=true)"
                 ).fetchall()
             }
-            source_sql = _snapshot_source_query(dataset, quoted, partition_columns)
+            recovered_source_sql = _ingested_at_recovery_source_query(
+                quoted,
+                partition_columns,
+                {
+                    path: recovery_by_path[path]
+                    for path in sources
+                    if path in recovery_by_path
+                },
+            )
+            projected_columns = set(
+                connection.execute(f"DESCRIBE {recovered_source_sql}")
+                .fetchdf()["column_name"]
+                .tolist()
+            )
+            source_sql = _snapshot_source_query(
+                dataset,
+                quoted,
+                projected_columns,
+                source_sql=recovered_source_sql,
+            )
             source_sql = _bounded_snapshot_query(
                 source_sql,
                 dataset,
                 date_field,
                 snapshot_start,
                 snapshot_end,
-                partition_columns,
+                projected_columns,
             )
             partition_dir = dataset_dir / f"partition_year={year}" / f"partition_month={month}"
             partition_dir.mkdir(parents=True, exist_ok=True)
@@ -929,6 +1386,302 @@ class ParquetStore:
                 f") TO {_sql_string(str(partition_dir / 'data.parquet'))} "
                 "(FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)"
             )
+
+
+def _ingested_at_recovery_by_path(
+    root: Path,
+    dataset: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    recovery_by_path: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        evidence = row.get(_INGESTED_AT_RECOVERY_KEY)
+        if evidence is None:
+            continue
+        if not isinstance(evidence, dict):
+            raise ValueError("ingested_at recovery evidence is invalid")
+        expected = dict(evidence)
+        evidence_sha256 = str(expected.pop("evidence_sha256", "")).lower()
+        output_path = str(row.get("output_path") or "")
+        if (
+            evidence.get("contract_version")
+            != INGESTED_AT_RECOVERY_CONTRACT_VERSION
+            or evidence.get("evidence_source")
+            != "quantlab.work_units.succeeded.updated_at"
+            or str(evidence.get("dataset") or "") != dataset
+            or str(evidence.get("unit_key") or "")
+            != str(row.get("unit_key") or "")
+            or str(evidence.get("sha256") or "").lower()
+            != str(row.get("sha256") or "").lower()
+            or int(evidence.get("row_count") or 0) != int(row.get("row_count") or 0)
+            or str(evidence.get("output_path") or "") != output_path
+            or not _is_sha256(evidence_sha256)
+            or evidence_sha256 != _canonical_sha256(expected)
+            or int(evidence.get("missing_row_count") or 0) <= 0
+        ):
+            raise ValueError(
+                f"ingested_at recovery evidence does not bind source unit "
+                f"{row.get('unit_key')}"
+            )
+        _ledger_timestamp(
+            evidence.get("ledger_updated_at"),
+            unit_key=str(row.get("unit_key") or ""),
+        )
+        target = _safe_unit_file(root, output_path)
+        normalized_path = str(target)
+        if normalized_path in recovery_by_path:
+            raise ValueError("ingested_at recovery repeats a source unit file")
+        recovery_by_path[normalized_path] = dict(evidence)
+    return recovery_by_path
+
+
+def _ingested_at_recovery_manifest(
+    recovery_by_path: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not recovery_by_path:
+        return None
+    units = sorted(
+        (dict(evidence) for evidence in recovery_by_path.values()),
+        key=lambda item: (str(item["unit_key"]), str(item["sha256"])),
+    )
+    return {
+        "contract_version": INGESTED_AT_RECOVERY_CONTRACT_VERSION,
+        "evidence_source": "quantlab.work_units.succeeded.updated_at",
+        "unit_count": len(units),
+        "recovered_row_count": sum(int(item["missing_row_count"]) for item in units),
+        "unit_evidence_sha256": _canonical_sha256(units),
+        "units": units,
+    }
+
+
+def _ingested_at_recovery_source_query(
+    quoted_paths: str,
+    columns: set[str],
+    recovery_by_path: dict[str, dict[str, Any]],
+) -> str:
+    if not recovery_by_path:
+        return f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+    values = ", ".join(
+        "({path}, CAST({observed_at} AS TIMESTAMPTZ))".format(
+            path=_sql_string(path),
+            observed_at=_sql_string(str(evidence["ledger_updated_at"])),
+        )
+        for path, evidence in sorted(recovery_by_path.items())
+    )
+    prefix = (
+        "WITH recovery_map(filename, recovered_ingested_at) AS ("
+        f"VALUES {values}), source_rows AS ("
+        f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true, filename=true)"
+        ") "
+    )
+    if "ingested_at" in columns:
+        return (
+            prefix
+            + "SELECT source_rows.* EXCLUDE (filename, ingested_at), "
+            "coalesce(try_cast(source_rows.ingested_at AS TIMESTAMPTZ), "
+            "recovery_map.recovered_ingested_at) AS ingested_at "
+            "FROM source_rows LEFT JOIN recovery_map USING (filename)"
+        )
+    return (
+        prefix
+        + "SELECT source_rows.* EXCLUDE (filename), "
+        "recovery_map.recovered_ingested_at AS ingested_at "
+        "FROM source_rows LEFT JOIN recovery_map USING (filename)"
+    )
+
+
+def _verify_provider_projection_parity(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    dataset: str,
+    source_root: Path,
+    source_entry: dict[str, Any],
+    target_root: Path,
+    target_entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove a recovery changed only row-level acquisition evidence."""
+
+    source_paths = _manifest_dataset_paths(
+        source_root,
+        dataset=dataset,
+        entry=source_entry,
+        reject_unmanifested=True,
+        verify_hashes=False,
+    )
+    target_paths = _manifest_dataset_paths(
+        target_root,
+        dataset=dataset,
+        entry=target_entry,
+        reject_unmanifested=True,
+        verify_hashes=True,
+    )
+    if bool(source_paths) != bool(target_paths):
+        raise ValueError(f"recovery provider parity failed for {dataset}: file presence")
+
+    def _schema(paths: list[Path]) -> dict[str, str]:
+        if not paths:
+            return {}
+        quoted = "[" + ",".join(_sql_string(str(path)) for path in paths) + "]"
+        return {
+            str(record[0]): str(record[1])
+            for record in connection.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({quoted}, union_by_name=true)"
+            ).fetchall()
+            if str(record[0]) != "ingested_at"
+        }
+
+    source_schema = _schema(source_paths)
+    target_schema = _schema(target_paths)
+    if source_schema != target_schema:
+        raise ValueError(f"recovery provider parity failed for {dataset}: schema changed")
+
+    provider_columns = sorted(source_schema)
+    source_rows = target_rows = source_minus_target = target_minus_source = 0
+    if source_paths:
+        source_quoted = "[" + ",".join(
+            _sql_string(str(path)) for path in source_paths
+        ) + "]"
+        target_quoted = "[" + ",".join(
+            _sql_string(str(path)) for path in target_paths
+        ) + "]"
+        if provider_columns:
+            projection = ", ".join(_identifier(column) for column in provider_columns)
+            comparison = f"""
+                WITH source_rows AS (
+                    SELECT {projection}
+                    FROM read_parquet({source_quoted}, union_by_name=true)
+                ), target_rows AS (
+                    SELECT {projection}
+                    FROM read_parquet({target_quoted}, union_by_name=true)
+                ), source_minus_target AS (
+                    SELECT * FROM source_rows EXCEPT ALL SELECT * FROM target_rows
+                ), target_minus_source AS (
+                    SELECT * FROM target_rows EXCEPT ALL SELECT * FROM source_rows
+                )
+                SELECT
+                    (SELECT count(*) FROM source_rows),
+                    (SELECT count(*) FROM target_rows),
+                    (SELECT count(*) FROM source_minus_target),
+                    (SELECT count(*) FROM target_minus_source)
+            """
+            (
+                source_rows,
+                target_rows,
+                source_minus_target,
+                target_minus_source,
+            ) = (int(value) for value in connection.execute(comparison).fetchone())
+        else:
+            source_rows = int(
+                connection.execute(
+                    f"SELECT count(*) FROM read_parquet({source_quoted}, union_by_name=true)"
+                ).fetchone()[0]
+            )
+            target_rows = int(
+                connection.execute(
+                    f"SELECT count(*) FROM read_parquet({target_quoted}, union_by_name=true)"
+                ).fetchone()[0]
+            )
+            source_minus_target = max(source_rows - target_rows, 0)
+            target_minus_source = max(target_rows - source_rows, 0)
+    if source_minus_target or target_minus_source or source_rows != target_rows:
+        raise ValueError(
+            f"recovery provider parity failed for {dataset}: provider rows changed"
+        )
+
+    def _file_inventory(entry: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": str(item.get("path") or ""),
+                "bytes": int(item.get("bytes") or 0),
+                "sha256": str(item.get("sha256") or ""),
+            }
+            for item in entry.get("files") or []
+        ]
+
+    evidence: dict[str, Any] = {
+        "contract_version": "provider-projection-parity-v1",
+        "dataset": dataset,
+        "ignored_columns": ["ingested_at"],
+        "provider_schema_sha256": _canonical_sha256(source_schema),
+        "source_files_sha256": _canonical_sha256(_file_inventory(source_entry)),
+        "target_files_sha256": _canonical_sha256(_file_inventory(target_entry)),
+        "source_rows": source_rows,
+        "target_rows": target_rows,
+        "source_minus_target_rows": source_minus_target,
+        "target_minus_source_rows": target_minus_source,
+    }
+    evidence["parity_sha256"] = _canonical_sha256(evidence)
+    return evidence
+
+
+def _bind_recovery_parity_to_manifest(
+    manifest: dict[str, Any],
+    parity_evidence: list[dict[str, Any]],
+) -> None:
+    receipt = manifest.get("ingested_at_recovery")
+    lineage_contract = manifest.get("lineage_contract")
+    if not isinstance(receipt, dict) or not isinstance(lineage_contract, dict):
+        raise ValueError("recovery manifest binding is incomplete")
+    configuration = lineage_contract.get("configuration")
+    kind = lineage_contract.get("kind")
+    if not isinstance(configuration, dict) or not isinstance(kind, str) or not kind:
+        raise ValueError("recovery lineage binding is incomplete")
+    parity = {
+        "contract_version": "provider-projection-parity-v1",
+        "datasets": sorted(parity_evidence, key=lambda item: str(item["dataset"])),
+    }
+    parity["parity_sha256"] = _canonical_sha256(parity)
+    receipt.pop("receipt_sha256", None)
+    receipt["provider_parity"] = parity
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    configuration["recovery_receipt_sha256"] = receipt["receipt_sha256"]
+    manifest["lineage_id"] = _canonical_sha256(
+        {"kind": kind, "configuration": configuration}
+    )
+
+
+def _safe_unit_file(root: Path, output_path: str) -> Path:
+    relative = Path(output_path)
+    if (
+        not output_path
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or _path_contains_symlink(root, relative)
+    ):
+        raise ValueError("source unit file path is unsafe")
+    root = root.resolve()
+    unresolved = root / relative
+    if not unresolved.is_file() or unresolved.is_symlink():
+        raise ValueError("source unit file is missing or unsafe")
+    try:
+        target = unresolved.resolve(strict=True)
+        target.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError("source unit file escapes the data root") from exc
+    return target
+
+
+def _path_contains_symlink(root: Path, relative: Path) -> bool:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _ledger_timestamp(value: Any, *, unit_key: str) -> str:
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"succeeded ledger timestamp is invalid for {unit_key}") from exc
+    if pd.isna(timestamp) or timestamp.tzinfo is None:
+        raise ValueError(f"succeeded ledger timestamp is not UTC-bound for {unit_key}")
+    return timestamp.tz_convert(UTC).isoformat()
+
+
+def _is_sha256(value: Any) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "").lower()))
 
 
 def _source_unit_tuples(entry: dict[str, Any]) -> set[tuple[str, str, int]]:
@@ -1013,20 +1766,24 @@ def _manifest_dataset_paths(
                 or expected_bytes < 0
                 or resolved.stat().st_size != expected_bytes
                 or len(expected_sha256) != 64
-                or hashlib.sha256(resolved.read_bytes()).hexdigest() != expected_sha256
+                or _sha256_file(resolved) != expected_sha256
             ):
                 raise ValueError(f"history snapshot {dataset} file hash does not match")
         seen.add(resolved)
         declared.append(resolved)
     if reject_unmanifested:
-        actual = {
-            path.resolve()
-            for path in (parquet_root / dataset).rglob("*.parquet")
-            if path.is_file()
-        }
+        dataset_root = parquet_root / dataset
+        actual: set[Path] = set()
+        if dataset_root.is_symlink():
+            raise ValueError(f"history snapshot {dataset} tree is unsafe")
+        for path in dataset_root.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(f"history snapshot {dataset} tree is unsafe")
+            if path.is_file():
+                actual.add(path.resolve())
         if actual != seen:
             raise ValueError(
-                f"industry history anchor contains unmanifested {dataset} parquet files"
+                f"industry history anchor contains unmanifested {dataset} files"
             )
     return sorted(declared)
 
@@ -1051,7 +1808,11 @@ def _months_between(lo: tuple[int, int], hi: tuple[int, int]) -> list[tuple[int,
 
 def _link_tree(source: Path, target: Path) -> None:
     """Hard-link every file under source into target (copy as fallback)."""
+    if source.is_symlink() or target.is_symlink():
+        raise ValueError("sealed projection tree is unsafe")
     for path in sorted(source.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("sealed projection tree is unsafe")
         if not path.is_file():
             continue
         destination = target / path.relative_to(source)
@@ -1060,6 +1821,15 @@ def _link_tree(source: Path, target: Path) -> None:
             os.link(path, destination)
         except OSError:
             shutil.copy2(path, destination)
+
+
+def _is_safe_dataset_name(value: Any) -> bool:
+    dataset = str(value or "")
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", dataset)
+        and Path(dataset).name == dataset
+        and dataset not in {".", ".."}
+    )
 
 
 def _date_field_candidates(dataset: str) -> tuple[str, ...]:
