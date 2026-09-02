@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,12 @@ from typer.testing import CliRunner
 import quant_platform.db_cli as db_cli
 from quant_data.cli import app as data_app
 from quant_platform import global_reference_factors as m
+from quant_platform.global_reference_sector_map import (
+    SECTOR_LEADER_MAP_VERSION,
+    SECTOR_LEADERS,
+    sector_factor_name,
+    sector_leader_map_identity,
+)
 from quant_platform.research_store import ResearchStore
 
 NOW = datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC)
@@ -72,15 +79,10 @@ def _seed_full(data_root: Path) -> None:
         ],
         name="dup.parquet",
     )  # exact duplicates across unit files collapse onto one row
+    members = sorted({code for _label, codes in SECTOR_LEADERS.values() for code in codes})
     _write_parquet(
         data_root / "units" / "us_daily",
-        [
-            _us_row(code, day, pct)
-            for day in days
-            for code, pct in zip(
-                m.SEMICON_BASKET_CODES, (1.0, -2.0, 3.0), strict=True
-            )
-        ],
+        [_us_row(code, day, 1.0) for day in days for code in members],
     )
     _write_parquet(
         data_root / "units" / "us_tycr",
@@ -159,13 +161,13 @@ def test_process_fails_closed_without_trade_calendar(tmp_path: Path) -> None:
 
 
 @pytest.mark.no_database
-def test_process_fails_closed_when_a_basket_member_is_missing(tmp_path: Path) -> None:
+def test_process_fails_closed_when_a_sector_member_is_missing(tmp_path: Path) -> None:
     _seed_full(tmp_path)
     us_path = tmp_path / "units" / "us_daily" / "data.parquet"
     frame = pd.read_parquet(us_path)
-    frame = frame[frame["ts_code"] != "AVGO"]
+    frame = frame[frame["ts_code"] != "XOM"]
     frame.to_parquet(us_path, index=False)
-    with pytest.raises(RuntimeError, match="no rows for basket members"):
+    with pytest.raises(RuntimeError, match="no rows for 能源 sector basket members"):
         m.process_global_reference(tmp_path, now=lambda: NOW)
 
 
@@ -180,7 +182,7 @@ def test_process_fails_closed_without_the_us10y_column(tmp_path: Path) -> None:
 
 
 @pytest.mark.no_database
-def test_semicon_basket_skips_dates_without_all_members(tmp_path: Path) -> None:
+def test_sector_basket_skips_dates_without_all_members(tmp_path: Path) -> None:
     _seed_full(tmp_path)
     us_path = tmp_path / "units" / "us_daily" / "data.parquet"
     frame = pd.read_parquet(us_path)
@@ -190,12 +192,45 @@ def test_semicon_basket_skips_dates_without_all_members(tmp_path: Path) -> None:
     ]
     frame.to_parquet(us_path, index=False)
     summary = m.process_global_reference(tmp_path, now=lambda: NOW)
-    basket = summary.factors[m.SEMICON_BASKET_FACTOR_NAME]
+    name = sector_factor_name("information_technology")
+    basket = summary.factors[name]
     assert basket["manifest"]["rows"] == 2
     values = pd.read_parquet(basket["artifact_path"])
-    # 2026-08-25 source: mean(1.0, -2.0, 3.0)% = 2/3% fractional.
-    first = values[m.SEMICON_BASKET_FACTOR_NAME].iloc[0]
-    assert first == pytest.approx((0.01 - 0.02 + 0.03) / 3)
+    # Uniform +1% members: the surviving dates hold the fractional mean 0.01.
+    assert values[name].tolist() == [pytest.approx(0.01)] * 2
+
+
+@pytest.mark.no_database
+def test_all_eleven_gics_sector_factors_are_produced(tmp_path: Path) -> None:
+    _seed_full(tmp_path)
+    summary = m.process_global_reference(tmp_path, now=lambda: NOW)
+    sector_names = {sector_factor_name(slug) for slug in SECTOR_LEADERS}
+    assert len(sector_names) == 11
+    assert sector_names <= set(summary.factors)
+    for name in sector_names:
+        manifest = summary.factors[name]["manifest"]
+        identity = sector_leader_map_identity()
+        assert manifest["source"]["sector_leader_map_version"] == identity["version"]
+        assert manifest["source"]["sector_leader_map_sha256"] == identity["sha256"]
+        assert manifest["rows"] == 3
+
+
+@pytest.mark.no_database
+def test_sector_map_identity_detects_tampering() -> None:
+    identity = sector_leader_map_identity()
+    assert identity["version"] == SECTOR_LEADER_MAP_VERSION
+    tampered = dict(SECTOR_LEADERS)
+    label, members = tampered["energy"]
+    tampered["energy"] = (label, (*members, "BP"))
+    canonical = {
+        "version": SECTOR_LEADER_MAP_VERSION,
+        "sectors": {
+            slug: {"label": lbl, "members": list(m)}
+            for slug, (lbl, m) in tampered.items()
+        },
+    }
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(raw.encode("utf-8")).hexdigest() != identity["sha256"]
 
 
 @pytest.mark.no_database

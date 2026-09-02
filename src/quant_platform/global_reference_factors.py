@@ -39,24 +39,30 @@ from .announcement_factor_registry import (
 from .announcement_nlp import _sha256_file, _write_json_atomic, _write_parquet_atomic
 from .external_factor_evaluation import MARKET_INSTRUMENT
 from .factor_evaluator import normalize_series
+from .global_reference_sector_map import (
+    SECTOR_LEADERS,
+    SECTOR_SLUGS,
+    sector_factor_name,
+    sector_leader_map_identity,
+)
 
 if TYPE_CHECKING:
     from .research_store import ResearchStore
 
-PRODUCER_VERSION = "global-reference-factors.v1"
+PRODUCER_VERSION = "global-reference-factors.v2"
 
 GLOBAL_REFERENCE_DIR = "global_reference"
 
 SPX_OVERNIGHT_FACTOR_NAME = "global_ref_spx_overnight"
 IXIC_OVERNIGHT_FACTOR_NAME = "global_ref_ixic_overnight"
 HSI_OVERNIGHT_FACTOR_NAME = "global_ref_hsi_overnight"
-SEMICON_BASKET_FACTOR_NAME = "global_ref_semicon_basket_ret"
 US10Y_CHANGE_FACTOR_NAME = "global_ref_us10y_change"
+SECTOR_FACTOR_NAMES = tuple(sector_factor_name(slug) for slug in SECTOR_SLUGS)
 FACTOR_NAMES = (
     SPX_OVERNIGHT_FACTOR_NAME,
     IXIC_OVERNIGHT_FACTOR_NAME,
     HSI_OVERNIGHT_FACTOR_NAME,
-    SEMICON_BASKET_FACTOR_NAME,
+    *SECTOR_FACTOR_NAMES,
     US10Y_CHANGE_FACTOR_NAME,
 )
 
@@ -70,9 +76,8 @@ INDEX_FACTOR_CODES = {
     IXIC_OVERNIGHT_FACTOR_NAME: "IXIC",
     HSI_OVERNIGHT_FACTOR_NAME: "HSI",
 }
-# Semiconductor leaders basket (us_daily): the plan's industry-transmission
-# proxy because no sector index exists in index_global.  Plain US tickers.
-SEMICON_BASKET_CODES = ("NVDA", "TSM", "AVGO")
+# Sector transmission is proxied by the governed GICS sector-leader baskets in
+# global_reference_sector_map (versioned, hash-bound into factor manifests).
 # us_tycr column holding the 10-year treasury yield (percent).
 US10Y_COLUMN = "y10"
 
@@ -94,7 +99,7 @@ _FACTOR_DATASETS = {
     SPX_OVERNIGHT_FACTOR_NAME: "index_global",
     IXIC_OVERNIGHT_FACTOR_NAME: "index_global",
     HSI_OVERNIGHT_FACTOR_NAME: "index_global",
-    SEMICON_BASKET_FACTOR_NAME: "us_daily",
+    **{name: "us_daily" for name in SECTOR_FACTOR_NAMES},
     US10Y_CHANGE_FACTOR_NAME: "us_tycr",
 }
 
@@ -254,24 +259,27 @@ def build_global_reference_series(
         ),
         "trade_date",
     )
-    basket = us_frame[us_frame["ts_code"].isin(SEMICON_BASKET_CODES)].copy()
-    observed_codes = sorted(basket["ts_code"].unique())
-    missing_codes = sorted(set(SEMICON_BASKET_CODES) - set(observed_codes))
-    if missing_codes:
-        sample = sorted(us_frame["ts_code"].unique())[:10]
-        raise RuntimeError(
-            f"us_daily has no rows for basket members {missing_codes} "
-            f"(observed ts_code sample: {sample}); the semiconductor basket "
-            "cannot be synthesized without all members"
-        )
-    basket["value"] = _daily_return(basket, dataset="us_daily")
-    basket = basket.dropna(subset=["value"])
-    # Equal weight, and only on dates where every member trades.
-    member_counts = basket.groupby("trade_date")["ts_code"].nunique()
-    complete_dates = member_counts[member_counts == len(SEMICON_BASKET_CODES)].index
-    basket = basket[basket["trade_date"].isin(complete_dates)]
-    grouped = basket.groupby("trade_date", sort=True)["value"].mean()
-    frames[SEMICON_BASKET_FACTOR_NAME] = grouped.rename_axis("source_date").reset_index()
+    us_codes = set(us_frame["ts_code"].unique())
+    for slug in SECTOR_SLUGS:
+        label, members = SECTOR_LEADERS[slug]
+        name = sector_factor_name(slug)
+        basket = us_frame[us_frame["ts_code"].isin(members)].copy()
+        missing_codes = sorted(set(members) - set(basket["ts_code"].unique()))
+        if missing_codes:
+            sample = sorted(us_codes)[:10]
+            raise RuntimeError(
+                f"us_daily has no rows for {label} sector basket members "
+                f"{missing_codes} (observed ts_code sample: {sample}); the "
+                "sector proxy cannot be synthesized without all members"
+            )
+        basket["value"] = _daily_return(basket, dataset="us_daily")
+        basket = basket.dropna(subset=["value"])
+        # Equal weight, and only on dates where every member trades.
+        member_counts = basket.groupby("trade_date")["ts_code"].nunique()
+        complete_dates = member_counts[member_counts == len(members)].index
+        basket = basket[basket["trade_date"].isin(complete_dates)]
+        grouped = basket.groupby("trade_date", sort=True)["value"].mean()
+        frames[name] = grouped.rename_axis("source_date").reset_index()
 
     treasury = _window(
         _load_market_frame(data_root, "us_tycr", value_columns=(US10Y_COLUMN,)),
@@ -301,26 +309,32 @@ def _write_factor_artifact(
     *,
     name: str,
     now: datetime,
-    source_window: dict[str, str],
+    source_window: dict[str, Any],
 ) -> dict[str, Any]:
     """Write the normalized factor-values parquet plus its sha256 manifest."""
 
     artifact_path = factors_dir / f"{name}.parquet"
     _write_parquet_atomic(series.rename(name).reset_index(), artifact_path)
+    source: dict[str, Any] = {
+        "dataset": GLOBAL_REFERENCE_DIR,
+        "source_dataset": _FACTOR_DATASETS[name],
+        "producer_version": PRODUCER_VERSION,
+        "observation_cadence": "daily",
+        "instrument": MARKET_INSTRUMENT,
+        **source_window,
+    }
+    if name in SECTOR_FACTOR_NAMES:
+        # Sector factors are bound to the exact governed basket mapping.
+        identity = sector_leader_map_identity()
+        source["sector_leader_map_version"] = identity["version"]
+        source["sector_leader_map_sha256"] = identity["sha256"]
     manifest: dict[str, Any] = {
         "factor": name,
         "artifact": artifact_path.name,
         "sha256": _sha256_file(artifact_path),
         "rows": int(len(series)),
         "availability_policy": {name: AVAILABILITY_POLICY[name]},
-        "source": {
-            "dataset": GLOBAL_REFERENCE_DIR,
-            "source_dataset": _FACTOR_DATASETS[name],
-            "producer_version": PRODUCER_VERSION,
-            "observation_cadence": "daily",
-            "instrument": MARKET_INSTRUMENT,
-            **source_window,
-        },
+        "source": source,
         "generated_at": now.isoformat(),
     }
     manifest_path = factors_dir / f"{name}.json"
@@ -394,7 +408,6 @@ def process_global_reference(
     source_window = {
         "start_date": start.isoformat() if start else None,
         "end_date": end.isoformat() if end else None,
-        "basket_codes": ",".join(SEMICON_BASKET_CODES),
         "index_codes": ",".join(INDEX_FACTOR_CODES.values()),
         "us10y_column": US10Y_COLUMN,
     }
@@ -416,6 +429,24 @@ def process_global_reference(
 # Registration into factor_candidates (generic external-factor channel)
 # ---------------------------------------------------------------------------
 
+_SECTOR_DESCRIPTIONS = {
+    sector_factor_name(slug): (
+        f"Equal-weight daily return of the GICS {label} sector leader basket "
+        f"({', '.join(members)}) from US daily bars, only on dates where every "
+        "member trades."
+    )
+    for slug, (label, members) in SECTOR_LEADERS.items()
+}
+
+_SECTOR_FORMULATIONS = {
+    sector_factor_name(slug): (
+        f"mean of member daily returns across {', '.join(members)} per source "
+        "date, dates missing any member excluded; factor_date = first "
+        "trade_cal open day strictly after the source date"
+    )
+    for slug, (_label, members) in SECTOR_LEADERS.items()
+}
+
 _FACTOR_DESCRIPTIONS = {
     SPX_OVERNIGHT_FACTOR_NAME: (
         "Overnight S&P 500 return (fractional) from the global index dataset, "
@@ -429,11 +460,7 @@ _FACTOR_DESCRIPTIONS = {
         "Overnight Hang Seng Index return (fractional) from the global index "
         "dataset, visible to A-share research from the next calendar day."
     ),
-    SEMICON_BASKET_FACTOR_NAME: (
-        "Equal-weight daily return of the semiconductor leaders basket "
-        f"({', '.join(SEMICON_BASKET_CODES)}) from US daily bars, only on "
-        "dates where every member trades."
-    ),
+    **_SECTOR_DESCRIPTIONS,
     US10Y_CHANGE_FACTOR_NAME: (
         "Daily first difference of the US 10-year treasury yield "
         f"(us_tycr.{US10Y_COLUMN}, percentage points)."
@@ -453,11 +480,7 @@ _FACTOR_FORMULATIONS = {
         "pct_chg/100 (provider) or close/pre_close - 1 for HSI per source date; "
         "factor_date = first trade_cal open day strictly after the source date"
     ),
-    SEMICON_BASKET_FACTOR_NAME: (
-        f"mean of member daily returns across {', '.join(SEMICON_BASKET_CODES)} "
-        "per source date, dates missing any member excluded; factor_date = "
-        "first trade_cal open day strictly after the source date"
-    ),
+    **_SECTOR_FORMULATIONS,
     US10Y_CHANGE_FACTOR_NAME: (
         f"diff of us_tycr.{US10Y_COLUMN} ordered by date; factor_date = first "
         "trade_cal open day strictly after the source date"
@@ -555,9 +578,10 @@ def _global_reference_provenance_identity(manifest: dict[str, Any]) -> str:
             "source_dataset",
             "start_date",
             "end_date",
-            "basket_codes",
             "index_codes",
             "us10y_column",
+            "sector_leader_map_version",
+            "sector_leader_map_sha256",
         )
     }
     return hashlib.sha256(
