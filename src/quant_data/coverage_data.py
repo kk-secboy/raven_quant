@@ -372,7 +372,14 @@ def coverage_specs(
                     )
         elif rule.mode == "calendar_daily_range":
             for value in rule_calendar_dates:
-                params = {"start_date": value, "end_date": value}
+                # The relay's npr interface silently returns zero rows unless
+                # dates arrive in "YYYY-MM-DD HH:MM:SS" form (compact dates
+                # return empty even with content_html requested).
+                day = f"{value[:4]}-{value[4:6]}-{value[6:]}"
+                params = {
+                    "start_date": f"{day} 00:00:00",
+                    "end_date": f"{day} 23:59:59",
+                }
                 specs.extend(_paged(rule, params, f"{rule.dataset}:{value}", max_attempts))
         elif rule.mode == "month":
             for month_start, _ in _month_ranges(rule_start, end):
