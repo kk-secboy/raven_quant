@@ -490,3 +490,58 @@ def test_holiday_compression_keeps_the_latest_source_session(tmp_path: Path) -> 
     assert spx.index.get_level_values("datetime").tolist() == [pd.Timestamp("2026-08-27")]
     # Wednesday's session (the latest knowable one) wins the compressed slot.
     assert spx.iloc[0] == pytest.approx(0.003)
+
+
+# ---------------------------------------------------------------------------
+# Scan-time predicate pushdown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_database
+def test_reads_push_symbol_filters_down_to_the_parquet_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Millions of irrelevant peripheral rows must never leave the reader.
+
+    us_daily carries a large irrelevant cross-section block here; the spy on
+    _read_parquet_union asserts the whitelist WHERE clause is pushed into the
+    scan and that only member rows materialize.
+    """
+
+    _seed_full(tmp_path)
+    noise_path = tmp_path / "units" / "us_daily" / "noise.parquet"
+    pd.DataFrame(
+        [
+            _us_row(f"JUNK{i:04d}", date(2026, 8, 24), 9.9)
+            for i in range(500)
+        ]
+    ).to_parquet(noise_path, index=False)
+
+    member_count = len(
+        {code for _label, codes in SECTOR_LEADERS.values() for code in codes}
+    )
+    captured: dict[str, int] = {}
+    real_reader = m._read_parquet_union
+
+    def spy(paths, query, parameters=()):
+        frame = real_reader(paths, query, parameters)
+        captured[query] = len(frame)
+        return frame
+
+    monkeypatch.setattr(m, "_read_parquet_union", spy)
+    summary = m.process_global_reference(tmp_path, now=lambda: NOW)
+
+    # Identify the data-loading queries by their selected value columns.
+    load_queries = [(query, rows) for query, rows in captured.items() if "try_cast(" in query]
+    assert len(load_queries) == 3
+    for query, rows in load_queries:
+        if "y10" in query:
+            # Treasury yields are a single series: nothing to filter out.
+            assert "WHERE" not in query
+            continue
+        assert " WHERE CAST(ts_code AS VARCHAR) IN (" in query
+        assert "'SPX'" in query or "'NVDA'" in query
+        if "NVDA" in query:
+            # 44 sector members x 3 sessions; the 500 JUNK rows stay unread.
+            assert rows == member_count * 3
+    assert summary.factors[m.SPX_OVERNIGHT_FACTOR_NAME]["manifest"]["rows"] == 3

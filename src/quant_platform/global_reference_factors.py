@@ -118,7 +118,11 @@ def _date_select(column: str) -> str:
 
 
 def _load_market_frame(
-    data_root: Path, dataset: str, *, value_columns: tuple[str, ...]
+    data_root: Path,
+    dataset: str,
+    *,
+    value_columns: tuple[str, ...],
+    symbols: tuple[str, ...] = (),
 ) -> pd.DataFrame:
     """Read a peripheral daily dataset from the units/snapshots layout.
 
@@ -126,7 +130,10 @@ def _load_market_frame(
     fabricating coverage.  Rows duplicated across units and snapshots collapse
     onto one row.  ``value_columns`` are optional numeric candidates (the
     return column differs by provider revision); the frame keeps whichever
-    exist and the caller decides whether that is enough.
+    exist and the caller decides whether that is enough.  ``symbols`` pushes a
+    ts_code whitelist down into the scan so the full peripheral cross-section
+    (millions of rows) never leaves the parquet reader; both the units and the
+    snapshots layers are filtered at scan time.
     """
 
     paths = _parquet_files(data_root, dataset)
@@ -158,9 +165,16 @@ def _load_market_frame(
         if column in available:
             select_parts.append(f'try_cast("{column}" AS DOUBLE) AS "{column}"')
             observed_values.append(column)
+    where = ""
+    if symbols and "ts_code" in required:
+        whitelist = ", ".join(
+            "'" + code.replace("'", "''") + "'" for code in sorted(symbols)
+        )
+        where = f" WHERE CAST(ts_code AS VARCHAR) IN ({whitelist})"
     frame = _read_parquet_union(
         paths,
-        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)",
+        f"SELECT {', '.join(select_parts)} "
+        f"FROM read_parquet(?, union_by_name=true){where}",
     )
     for column in observed_values:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -183,6 +197,20 @@ def _load_market_frame(
         frame = frame.sort_values(subset, kind="stable")
     frame = frame.drop_duplicates(subset=subset, keep="last")
     return frame.sort_values(subset, kind="stable").reset_index(drop=True)
+
+
+def _sample_ts_codes(data_root: Path, dataset: str, limit: int = 10) -> list[str]:
+    """Small provider ts_code sample for fail-closed diagnostics only."""
+
+    paths = _parquet_files(data_root, dataset)
+    if not paths:
+        return []
+    frame = _read_parquet_union(
+        paths,
+        "SELECT DISTINCT CAST(ts_code AS VARCHAR) AS ts_code "
+        f"FROM read_parquet(?, union_by_name=true) LIMIT {int(limit)}",
+    )
+    return sorted(frame["ts_code"].astype(str))
 
 
 def _daily_return(frame: pd.DataFrame, *, dataset: str) -> pd.Series:
@@ -258,16 +286,21 @@ def build_global_reference_series(
 
     index_frame = _window(
         _load_market_frame(
-            data_root, "index_global", value_columns=("pct_chg", "close", "pre_close")
+            data_root,
+            "index_global",
+            value_columns=("pct_chg", "close", "pre_close"),
+            symbols=tuple(set(INDEX_FACTOR_CODES.values())),
         ),
         "trade_date",
     )
     for name, code in INDEX_FACTOR_CODES.items():
         rows = index_frame[index_frame["ts_code"] == code].copy()
         if rows.empty:
+            sample = _sample_ts_codes(data_root, "index_global")
             raise RuntimeError(
-                f"index_global has no rows for {code}; the overnight factor {name} "
-                "cannot be built without the real index series"
+                f"index_global has no rows for {code} (observed ts_code sample: "
+                f"{sample}); the overnight factor {name} cannot be built without "
+                "the real index series"
             )
         rows["value"] = _daily_return(rows, dataset="index_global")
         rows = rows.dropna(subset=["value"])
@@ -277,18 +310,22 @@ def build_global_reference_series(
 
     us_frame = _window(
         _load_market_frame(
-            data_root, "us_daily", value_columns=("pct_chg", "close", "pre_close")
+            data_root,
+            "us_daily",
+            value_columns=("pct_chg", "close", "pre_close"),
+            symbols=tuple(
+                sorted({code for _label, codes in SECTOR_LEADERS.values() for code in codes})
+            ),
         ),
         "trade_date",
     )
-    us_codes = set(us_frame["ts_code"].unique())
     for slug in SECTOR_SLUGS:
         label, members = SECTOR_LEADERS[slug]
         name = sector_factor_name(slug)
         basket = us_frame[us_frame["ts_code"].isin(members)].copy()
         missing_codes = sorted(set(members) - set(basket["ts_code"].unique()))
         if missing_codes:
-            sample = sorted(us_codes)[:10]
+            sample = _sample_ts_codes(data_root, "us_daily")
             raise RuntimeError(
                 f"us_daily has no rows for {label} sector basket members "
                 f"{missing_codes} (observed ts_code sample: {sample}); the "
