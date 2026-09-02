@@ -19,9 +19,11 @@ from .models import ProviderResult, UnitResult
 from .reference_data import reference_manifest_metadata
 from .release_window import PIT_CARRY_IN_DATASETS
 from .row_identity import (
+    LATEST_GENERATION_KEYS,
     NULL_ON_AMBIGUITY_COLUMNS,
     SEMANTIC_METADATA_COLUMNS,
     SNAPSHOT_QUARANTINE_KEYS,
+    provider_row_completeness_sql,
     semantic_provider_columns,
 )
 
@@ -1998,8 +2000,27 @@ def _snapshot_source_query(
             f"FROM ({source_sql}) "
             f"GROUP BY {projected}"
         )
+        latest_generation_key = LATEST_GENERATION_KEYS.get(dataset)
         quarantine_key = SNAPSHOT_QUARANTINE_KEYS.get(dataset)
-        if quarantine_key:
+        if latest_generation_key:
+            # Revisioned peripheral series (adjusted prices recomputed after
+            # corporate actions, later pulls backfilling NULL fields): keep the
+            # latest ingestion generation per business key.  Exact provider-row
+            # duplicates already collapsed above with their earliest timestamp;
+            # the rank tiebreak (field completeness, then full-row order) only
+            # orders rows and never invents values.  Verification blocks
+            # publication when the top rank is not unique.
+            key_columns = ", ".join(_identifier(column) for column in latest_generation_key)
+            completeness = provider_row_completeness_sql(dataset, columns)
+            order_columns = ", ".join(_identifier(column) for column in provider_columns)
+            base = (
+                f"WITH semantic_rows AS ({semantic_rows}) "
+                "SELECT * FROM semantic_rows "
+                f"QUALIFY row_number() OVER (PARTITION BY {key_columns} "
+                "ORDER BY ingested_at DESC NULLS LAST, "
+                f"({completeness}) DESC, {order_columns}) = 1"
+            )
+        elif quarantine_key:
             quarantine_columns = ", ".join(_identifier(column) for column in quarantine_key)
             base = (
                 f"WITH semantic_rows AS ({semantic_rows}) "

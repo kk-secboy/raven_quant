@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -1009,3 +1009,77 @@ def test_legacy_news_global_dedup_is_preserved_with_base(tmp_path: Path) -> None
     frame = _dataset_frame(successor, "news")
     assert len(frame) == 1
     assert frame.iloc[0]["source"] == "财联社"
+
+
+def _us_adj_rows(day: str, close: float, *, pct_change: float | None = 0.5) -> list[dict]:
+    return [
+        {
+            "ts_code": "NVDA",
+            "trade_date": day,
+            "close": close,
+            "pct_change": pct_change,
+        }
+    ]
+
+
+def test_latest_generation_snapshot_keeps_the_newest_revision(tmp_path: Path) -> None:
+    # Adjusted series republish a business key after corporate actions; the
+    # snapshot must keep the newest ingestion generation, never a random one.
+    old_store = ParquetStore(
+        tmp_path / "data",
+        clock=lambda: datetime(2026, 8, 20, 8, 0, tzinfo=UTC),
+    )
+    old_unit = _write_unit(
+        old_store, "us_daily_adj", "gen-old", _us_adj_rows("20260819", 100.0)
+    )
+    new_store = ParquetStore(
+        tmp_path / "data",
+        clock=lambda: datetime(2026, 8, 21, 8, 0, tzinfo=UTC),
+    )
+    new_unit = _write_unit(
+        new_store, "us_daily_adj", "gen-new", _us_adj_rows("20260819", 105.0)
+    )
+
+    snapshot = new_store.build_snapshot(
+        name="latest-gen",
+        successful_units={"us_daily_adj": [old_unit, new_unit]},
+        manifest_extra={},
+    )
+
+    frame = _dataset_frame(snapshot, "us_daily_adj")
+    assert len(frame) == 1
+    assert frame["close"].tolist() == [105.0]
+    assert frame["ingested_at"].tolist() == [pd.Timestamp("2026-08-21 08:00:00+00:00")]
+
+
+def test_latest_generation_tiebreak_prefers_the_more_complete_row(
+    tmp_path: Path,
+) -> None:
+    # Same generation, same key: the provider double-writes a row with and
+    # without derived fields; the filled row wins deterministically.
+    store = ParquetStore(
+        tmp_path / "data",
+        clock=lambda: datetime(2026, 8, 22, 8, 0, tzinfo=UTC),
+    )
+    sparse = _write_unit(
+        store,
+        "us_daily_adj",
+        "same-gen-a",
+        _us_adj_rows("20260820", 21.34, pct_change=None),
+    )
+    filled = _write_unit(
+        store,
+        "us_daily_adj",
+        "same-gen-b",
+        _us_adj_rows("20260820", 21.34, pct_change=3.39),
+    )
+
+    snapshot = store.build_snapshot(
+        name="same-gen",
+        successful_units={"us_daily_adj": [sparse, filled]},
+        manifest_extra={},
+    )
+
+    frame = _dataset_frame(snapshot, "us_daily_adj")
+    assert len(frame) == 1
+    assert frame["pct_change"].tolist() == [3.39]

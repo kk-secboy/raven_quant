@@ -213,3 +213,74 @@ def test_verify_global_reference_flags_missing_ohlc_and_big_moves(
     assert any("index_global: 1 rows move more than 35%" in w for w in warnings)
     assert checks["global_reference_missing_ohlc_datasets"] == 1
     assert checks["global_reference_large_pct_chg_rows"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Latest-generation duplicate adjudication (verify layer)
+# ---------------------------------------------------------------------------
+
+
+def _unresolved_keys(data_root: Path, dataset: str) -> int:
+    import duckdb
+
+    from quant_data.verify import _latest_generation_unresolved_keys
+
+    unit_dir = data_root / "units" / dataset
+    glob = str((unit_dir / "*.parquet").resolve()).replace("'", "''")
+    connection = duckdb.connect()
+    try:
+        columns = {
+            str(row[0])
+            for row in connection.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{glob}', union_by_name=true)"
+            ).fetchall()
+        }
+        connection.execute(
+            "CREATE TEMP TABLE selected_unit_files(path VARCHAR PRIMARY KEY)"
+        )
+        for path in sorted(unit_dir.glob("*.parquet")):
+            connection.execute(
+                "INSERT INTO selected_unit_files VALUES (?)", (str(path.resolve()),)
+            )
+        return _latest_generation_unresolved_keys(connection, dataset, glob, columns)
+    finally:
+        connection.close()
+
+
+def _generation_rows(close: float, ingested: str, pct_change=None) -> dict:
+    return {
+        "ts_code": "NVDA",
+        "trade_date": "20260819",
+        "close": close,
+        "pct_change": pct_change,
+        "ingested_at": pd.Timestamp(ingested),
+    }
+
+
+def test_latest_generation_resolver_counts_only_true_conflicts(tmp_path: Path) -> None:
+    # One key revised across generations (resolvable), one key torn inside a
+    # single generation (true conflict), one key with identical re-pulls.
+    rows = [
+        _generation_rows(100.0, "2026-08-20T08:00:00Z", 0.5),
+        _generation_rows(105.0, "2026-08-21T08:00:00Z", 0.5),  # newer generation wins
+        {**_generation_rows(50.0, "2026-08-21T08:00:00Z", 0.5), "ts_code": "TSM"},
+        {**_generation_rows(51.0, "2026-08-21T08:00:00Z", 0.5), "ts_code": "TSM"},
+        # same generation, same completeness, different value: true conflict
+        {**_generation_rows(60.0, "2026-08-21T08:00:00Z", 0.5), "ts_code": "AVGO"},
+        {**_generation_rows(60.0, "2026-08-21T08:00:00Z", 0.5), "ts_code": "AVGO"},
+    ]
+    _write_unit(tmp_path, "us_daily_adj", pd.DataFrame(rows), "a")
+    assert _unresolved_keys(tmp_path, "us_daily_adj") == 1
+
+
+def test_latest_generation_resolver_accepts_completeness_tiebreak(
+    tmp_path: Path,
+) -> None:
+    # Same generation: a NULL-derived-field row plus its filled twin resolve to
+    # the filled row, so the key is not a true conflict.
+    rows = [
+        _generation_rows(21.34, "2026-08-22T18:11:42Z", None),
+        _generation_rows(21.34, "2026-08-22T18:11:42Z", 3.39),
+    ]
+    _write_unit(tmp_path, "us_daily_adj", pd.DataFrame(rows), "b")
+    assert _unresolved_keys(tmp_path, "us_daily_adj") == 0

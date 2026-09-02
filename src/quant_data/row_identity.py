@@ -51,6 +51,39 @@ SNAPSHOT_QUARANTINE_KEYS: dict[str, tuple[str, ...]] = {
     "irm_qa_sz": ("trade_date", "ts_code", "q"),
 }
 
+# Peripheral datasets whose provider legitimately republishes a business key
+# with revised content (adjusted-price recomputation after corporate actions,
+# or later pulls filling previously NULL trailing fields).  The safe revision
+# selector is the ingestion generation: the snapshot keeps the row from the
+# latest generation per business key (ties broken by provider-field
+# completeness, then full-row order for determinism).  Verification still
+# blocks publication when the top rank is not unique, so a genuine same-
+# generation conflict can never be masked.  Measured on production
+# 2026-09-02: hk_daily_adj 394 keys, us_daily 637 keys, us_tbr 8 keys all
+# resolve to a unique latest generation; us_daily_adj had 2 same-generation
+# keys whose rows differ only by NULL-vs-filled derived fields (completeness
+# tiebreak resolves them deterministically).
+LATEST_GENERATION_KEYS: dict[str, tuple[str, ...]] = {
+    "us_daily": ("ts_code", "trade_date"),
+    "us_daily_adj": ("ts_code", "trade_date"),
+    "hk_daily_adj": ("ts_code", "trade_date"),
+    "us_tbr": ("date",),
+}
+
+
+def provider_row_completeness_sql(dataset: str, columns: Collection[str]) -> str:
+    """SQL expression counting non-NULL provider fields (revision tiebreak)."""
+
+    terms = [
+        f"CASE WHEN {_sql_identifier(column)} IS NOT NULL THEN 1 ELSE 0 END"
+        for column in sorted(semantic_provider_columns(dataset, columns))
+    ]
+    return " + ".join(terms) if terms else "0"
+
+
+def _sql_identifier(column: str) -> str:
+    return '"' + column.replace('"', '""') + '"'
+
 
 def semantic_provider_columns(dataset: str, columns: Collection[str]) -> set[str]:
     """Provider fields that define a distinct financial observation."""

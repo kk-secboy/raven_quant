@@ -25,7 +25,12 @@ from .execution_contract import (
 )
 from .history_bounds import BSE_GOVERNED_HISTORY_START
 from .release_window import select_release_window_units, summarize_release_plan
-from .row_identity import SNAPSHOT_QUARANTINE_KEYS, semantic_provider_columns
+from .row_identity import (
+    LATEST_GENERATION_KEYS,
+    SNAPSHOT_QUARANTINE_KEYS,
+    provider_row_completeness_sql,
+    semantic_provider_columns,
+)
 
 # Interfaces whose provider pagination reorders rows between pages, whose
 # intraday snapshots drift between polls, or whose requested date partitions
@@ -54,6 +59,25 @@ UNSTABLE_PAGINATION_DATASETS = frozenset(
         "us_tltr",
         "us_trltr",
         "us_trycr",
+        # Measured on production 2026-09-02: exact-duplicate rows from
+        # overlapping date pages / repeated pulls, with any residual semantic
+        # conflicts adjudicated by LATEST_GENERATION_KEYS below.
+        # hk_tradecal/us_tradecal: 925 exact duplicates each (re-pulled
+        # calendars), zero semantic variants.
+        "hk_tradecal",
+        "us_tradecal",
+        # us_tycr: yearly window boundaries overlap; earlier duplicate primary
+        # keys were exact repeats of the same provider row.
+        "us_tycr",
+        # us_daily: 69 exact duplicates plus generational revisions.
+        # hk_daily: daily-paged interface; boundary overlaps are possible even
+        # though the 2026-09-02 probe found none.
+        # hk_daily_adj: 732,486 exact duplicates plus generational repricing.
+        # us_daily_adj: generational repricing after corporate actions.
+        "us_daily",
+        "hk_daily",
+        "us_daily_adj",
+        "hk_daily_adj",
     }
 )
 
@@ -284,6 +308,24 @@ def verify_downloads(
                             """
                         ).fetchone()[0]
                     )
+                if conflicting_duplicates and dataset in LATEST_GENERATION_KEYS:
+                    unresolved = _latest_generation_unresolved_keys(
+                        connection, dataset, glob, columns
+                    )
+                    resolved = conflicting_keys - unresolved
+                    if resolved:
+                        warnings.append(
+                            f"{dataset}: {resolved} conflicting business keys resolve "
+                            "to the latest ingestion generation; the snapshot keeps "
+                            "the newest row per key"
+                        )
+                    if unresolved:
+                        errors.append(
+                            f"{dataset}: {unresolved} conflicting business keys have "
+                            "no unique latest-generation row (true same-generation "
+                            "conflict; publication blocked)"
+                        )
+                elif conflicting_duplicates:
                     if dataset in SNAPSHOT_QUARANTINE_KEYS:
                         quarantined_conflict_checks[dataset] = conflicting_keys
                         warnings.append(
@@ -1576,6 +1618,67 @@ def _date_sql(column: str) -> str:
     return (
         f"coalesce(try_cast({identifier} AS DATE), "
         f"try_strptime(CAST({identifier} AS VARCHAR), '%Y%m%d')::DATE)"
+    )
+
+
+def _latest_generation_unresolved_keys(
+    connection: duckdb.DuckDBPyConnection,
+    dataset: str,
+    glob: str,
+    columns: set[str],
+) -> int:
+    """Count conflicting keys with no unique (generation, completeness) winner.
+
+    A conflict is resolvable when exactly one distinct provider row tops the
+    (latest ingested_at, highest provider-field completeness) ranking.  Rows
+    that still tie at the top disagree within one generation and stay blocked.
+    """
+
+    key = LATEST_GENERATION_KEYS[dataset]
+    key_columns = ", ".join(f'"{column}"' for column in key)
+    using = ", ".join(f'"{column}"' for column in key)
+    completeness = provider_row_completeness_sql(dataset, columns)
+    return int(
+        connection.execute(
+            f"""
+            WITH d AS (
+                SELECT DISTINCT * EXCLUDE (filename) FROM read_parquet(
+                    '{glob}', union_by_name=true, filename=true
+                ) AS materialized
+                INNER JOIN selected_unit_files AS selected
+                    ON materialized.filename = selected.path
+            ),
+            proj AS (SELECT * EXCLUDE (ingested_at) FROM d),
+            conf AS (
+                SELECT {key_columns} FROM proj
+                GROUP BY {key_columns} HAVING count(*) > 1
+            ),
+            scored AS (
+                SELECT d.*, ({completeness}) AS _comp
+                FROM d JOIN conf USING ({using})
+            ),
+            top_ing AS (
+                SELECT {key_columns}, max(ingested_at) AS m_ing
+                FROM scored GROUP BY {key_columns}
+            ),
+            top_rows AS (
+                SELECT s.* FROM scored s
+                JOIN top_ing USING ({using})
+                WHERE s.ingested_at = top_ing.m_ing
+            ),
+            top_comp AS (
+                SELECT {key_columns}, max(_comp) AS m_comp
+                FROM top_rows GROUP BY {key_columns}
+            )
+            SELECT count(*) FROM (
+                SELECT {key_columns} FROM (
+                    SELECT * EXCLUDE (_comp, ingested_at) FROM top_rows t
+                    JOIN top_comp USING ({using})
+                    WHERE t._comp = top_comp.m_comp
+                ) GROUP BY {key_columns} HAVING count(*) > 1
+            )
+            """
+        ).fetchone()[0]
     )
 
 
