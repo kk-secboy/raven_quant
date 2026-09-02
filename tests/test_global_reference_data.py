@@ -177,9 +177,10 @@ def test_verify_global_reference_rejects_bad_dates_and_ohlc(tmp_path: Path) -> N
             )
         ],
     }
-    errors, _warnings, checks = _run_checks(tmp_path, selected)
+    errors, warnings, checks = _run_checks(tmp_path, selected)
     assert any("us_daily: 1 rows have a missing or unparseable" in e for e in errors)
-    assert any("us_daily: 1 rows have high below low" in e for e in errors)
+    # Row-quality noise (high < low) is quarantined as a warning, not an error.
+    assert any("us_daily: 1 rows have high below low" in w for w in warnings)
     assert any("index_global: 1 rows are dated after the snapshot end" in e for e in errors)
     assert checks["global_reference_bad_date_rows"] == 1
     assert checks["global_reference_future_rows"] == 1

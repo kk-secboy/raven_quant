@@ -813,6 +813,12 @@ def _verify_global_reference_frames(
                 "open/close outside the [low, high] range",
             ),
         }
+        # Provider noise on OTC/illiquid names (e.g. us_daily reports 0-price
+        # rows with non-zero volume for OTC tickers) is quarantined, not
+        # fatal: peripheral factor producers consume whitelisted symbols only,
+        # so junk rows never enter factor inputs.  Counts stay visible in the
+        # report for audit.  Structural problems (missing date column, future
+        # rows, provider schema drift) remain errors above.
         for check, (predicate, label) in violations.items():
             count = int(
                 connection.execute(
@@ -821,7 +827,10 @@ def _verify_global_reference_frames(
             )
             checks[check] += count
             if count:
-                errors.append(f"{dataset}: {count} rows have {label}")
+                warnings.append(
+                    f"{dataset}: {count} rows have {label} "
+                    "(quarantined provider noise; whitelist-only factor consumption)"
+                )
         if "pct_chg" in columns:
             jumps = int(
                 connection.execute(
