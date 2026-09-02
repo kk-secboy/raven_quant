@@ -1083,3 +1083,74 @@ def test_latest_generation_tiebreak_prefers_the_more_complete_row(
     frame = _dataset_frame(snapshot, "us_daily_adj")
     assert len(frame) == 1
     assert frame["pct_change"].tolist() == [3.39]
+
+
+def _member_rows(
+    ts_code: str, in_date: str, out_date: str | None, l1: str = "801010.SI"
+) -> list[dict]:
+    return [
+        {
+            "ts_code": ts_code,
+            "in_date": in_date,
+            "out_date": out_date,
+            "l1_code": l1,
+            "l2_code": "801016.SI",
+            "l3_code": "850111.SI",
+            "is_new": "N",
+        }
+    ]
+
+
+def test_index_member_all_unions_cohorts_with_newest_revision_winning(
+    tmp_path: Path,
+) -> None:
+    # The provider prunes long-delisted members from newer weekly cohorts, so
+    # intervals only older cohorts still serve must survive, while an interval
+    # revised by a newer cohort (out_date closed) keeps the newer version.
+    old_store = ParquetStore(
+        tmp_path / "data",
+        clock=lambda: datetime(2026, 8, 25, 8, 0, tzinfo=UTC),
+    )
+    old_units = [
+        _write_unit(
+            old_store,
+            "index_member_all",
+            "w1-revised",
+            _member_rows("000918.SZ", "19990720", None),
+        ),
+        _write_unit(
+            old_store,
+            "index_member_all",
+            "w1-history",
+            _member_rows("600313.SH", "20010109", "20110107"),
+        ),
+    ]
+    new_store = ParquetStore(
+        tmp_path / "data",
+        clock=lambda: datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+    )
+    new_units = [
+        _write_unit(
+            new_store,
+            "index_member_all",
+            "w2-revised",
+            _member_rows("000918.SZ", "19990720", "20100115"),
+        ),
+    ]
+
+    snapshot = new_store.build_snapshot(
+        name="member-union",
+        successful_units={"index_member_all": [*old_units, *new_units]},
+        manifest_extra={},
+    )
+
+    frame = _dataset_frame(snapshot, "index_member_all")
+    assert len(frame) == 2
+    by_code = frame.set_index("ts_code")
+    # The revised interval keeps the newer cohort's closed out_date.
+    assert str(by_code.loc["000918.SZ", "out_date"].date()) == "2010-01-15"
+    assert by_code.loc["000918.SZ", "ingested_at"] == pd.Timestamp(
+        "2026-08-31 08:00:00+00:00"
+    )
+    # The pruned interval survives from the older cohort.
+    assert str(by_code.loc["600313.SH", "out_date"].date()) == "2011-01-07"

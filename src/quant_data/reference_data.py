@@ -190,6 +190,10 @@ def select_current_reference_units(
     Old work units remain append-only and old immutable snapshots keep their
     original manifests. A successor snapshot excludes superseded reference
     generations so changed master rows cannot appear twice.
+    index_member_all is the documented exception: its weekly cohorts union
+    (newest cohort alone is not history-complete because the provider prunes
+    long-delisted members), with row-level revision arbitration deferred to
+    the snapshot layer (row_identity.LATEST_GENERATION_KEYS).
     """
 
     materialized = [row for row in rows if not _retired_provider_request_contract(row)]
@@ -203,11 +207,15 @@ def select_current_reference_units(
         and _bucket_start(str(scope["reference_refresh_bucket"])) <= snapshot_end
     }
     if membership_buckets:
-        latest_membership_bucket = max(membership_buckets)
-        # index_member_all is one weekly cohort, not one independently sticky
-        # generation per L3/ts_code identity. Selecting only the newest whole
-        # cohort retires deleted L3 codes and forces residual successors to be
-        # explicitly present in every published week.
+        # The provider progressively prunes long-delisted members from
+        # index_member_all responses (measured on production 2026-09-02: the
+        # 2026-08-31 cohort silently dropped 346 codes and thousands of early
+        # in_date intervals that 2026-08-25 still served).  No single weekly
+        # cohort is history-complete any more, so every cohort at or before
+        # the snapshot end stays selected and the snapshot layer arbitrates
+        # revisions row-wise (LATEST_GENERATION_KEYS in row_identity.py):
+        # identical intervals collapse across generations, and a key present
+        # in several generations keeps the newest generation's out_date/name.
         materialized = [
             row
             for row in materialized
@@ -217,8 +225,9 @@ def select_current_reference_units(
                     "membership_cohort"
                 )
                 == INDEX_MEMBER_ALL_WEEKLY_COHORT
-                and str(scope.get("reference_refresh_bucket") or "")
-                == latest_membership_bucket
+                and scope.get("reference_refresh_bucket")
+                and _bucket_start(str(scope["reference_refresh_bucket"]))
+                <= snapshot_end
             )
         ]
     paginated_stk_surv_days = {
@@ -294,7 +303,15 @@ def select_current_reference_units(
 
     selected = list(plain)
     versioned_identities = set(versioned)
-    for _key, candidates in versioned.items():
+    for (dataset, _identity), candidates in versioned.items():
+        if dataset == "index_member_all":
+            # Weekly membership cohorts union instead of superseding: the
+            # provider prunes long-delisted members from newer responses, so
+            # every cohort at or before the snapshot end keeps its units and
+            # the snapshot layer arbitrates revisions row-wise
+            # (row_identity.LATEST_GENERATION_KEYS).
+            selected.extend(candidates)
+            continue
         latest = max(
             str(dict(item.get("scope_json") or {})["reference_refresh_bucket"])
             for item in candidates

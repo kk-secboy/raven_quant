@@ -2009,8 +2009,18 @@ def _snapshot_source_query(
             # duplicates already collapsed above with their earliest timestamp;
             # the rank tiebreak (field completeness, then full-row order) only
             # orders rows and never invents values.  Verification blocks
-            # publication when the top rank is not unique.
-            key_columns = ", ".join(_identifier(column) for column in latest_generation_key)
+            # publication when the top rank is not unique.  Sparse forensic
+            # fixtures may lack some key columns; the partition uses the
+            # available key columns and only refuses a keyless frame.
+            available_key = [
+                column for column in latest_generation_key if column in columns
+            ]
+            if not available_key:
+                raise ValueError(
+                    f"{dataset}: latest-generation key columns "
+                    f"{latest_generation_key} are absent from the source frame"
+                )
+            key_columns = ", ".join(_identifier(column) for column in available_key)
             completeness = provider_row_completeness_sql(dataset, columns)
             order_columns = ", ".join(_identifier(column) for column in provider_columns)
             base = (

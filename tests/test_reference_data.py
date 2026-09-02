@@ -207,7 +207,10 @@ def test_snapshot_selection_retires_ignored_index_member_request_shape() -> None
     assert [item["unit_key"] for item in selected] == ["current-l3"]
 
 
-def test_snapshot_selection_uses_latest_weekly_index_member_generation() -> None:
+def test_snapshot_selection_unions_weekly_index_member_generations() -> None:
+    # The provider prunes long-delisted members from newer weekly cohorts, so
+    # every cohort at or before the snapshot end stays selected; the snapshot
+    # layer arbitrates revisions row-wise (row_identity.LATEST_GENERATION_KEYS).
     def row(unit_key: str, bucket: str | None, l3_code: str) -> dict:
         scope = {"l3_code": l3_code, "is_new": "Y", "row_limit": 2_000}
         if bucket:
@@ -228,15 +231,18 @@ def test_snapshot_selection_uses_latest_weekly_index_member_generation() -> None
     selected = select_current_reference_units(
         [
             row("legacy", None, "850412.SI"),
-            row("week-1-retired", "2026-07-20", "850412.SI"),
+            row("week-1-history", "2026-07-20", "850412.SI"),
             row("week-1-retained", "2026-07-20", "850111.SI"),
             row("week-2-retained", "2026-07-27", "850111.SI"),
             row("week-2-new", "2026-07-27", "850112.SI"),
+            row("week-future", "2026-08-03", "850113.SI"),
         ],
         snapshot_end=date(2026, 7, 29),
     )
 
     assert {item["unit_key"] for item in selected} == {
+        "week-1-history",
+        "week-1-retained",
         "week-2-retained",
         "week-2-new",
     }

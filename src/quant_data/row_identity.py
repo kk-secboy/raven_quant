@@ -63,11 +63,19 @@ SNAPSHOT_QUARANTINE_KEYS: dict[str, tuple[str, ...]] = {
 # resolve to a unique latest generation; us_daily_adj had 2 same-generation
 # keys whose rows differ only by NULL-vs-filled derived fields (completeness
 # tiebreak resolves them deterministically).
+#
+# index_member_all joins this registry for a different reason: the weekly
+# cohort selection unions every cohort at or before the snapshot end because
+# the provider prunes long-delisted members from newer responses.  The
+# interval key keeps the newest cohort's out_date/name/is_new when several
+# cohorts carry the same interval (revision arbitration), and retains
+# intervals only older cohorts still serve (pruned history).
 LATEST_GENERATION_KEYS: dict[str, tuple[str, ...]] = {
     "us_daily": ("ts_code", "trade_date"),
     "us_daily_adj": ("ts_code", "trade_date"),
     "hk_daily_adj": ("ts_code", "trade_date"),
     "us_tbr": ("date",),
+    "index_member_all": ("ts_code", "in_date", "l1_code", "l2_code", "l3_code"),
 }
 
 
