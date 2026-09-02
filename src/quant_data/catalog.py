@@ -254,6 +254,34 @@ INDUSTRY_CATALOG: tuple[DatasetDefinition, ...] = (
     DatasetDefinition("index_classify", "index_classify", date_field=None),
 )
 
+# Peripheral reference markets (US/HK daily series, global broad indexes, US
+# treasury yields and the two trade calendars). They publish into the isolated
+# global-reference snapshot profile, never into the A-share snapshots or Qlib
+# datasets. Field lists stay empty: the provider columns are accepted as
+# downloaded and the verify layer enforces only keys and date sanity.
+GLOBAL_REFERENCE_DAILY: tuple[DatasetDefinition, ...] = (
+    DatasetDefinition("us_daily", "us_daily", primary_key=("ts_code", "trade_date")),
+    DatasetDefinition("us_daily_adj", "us_daily_adj", primary_key=("ts_code", "trade_date")),
+    DatasetDefinition("hk_daily", "hk_daily", primary_key=("ts_code", "trade_date")),
+    DatasetDefinition("hk_daily_adj", "hk_daily_adj", primary_key=("ts_code", "trade_date")),
+    DatasetDefinition("index_global", "index_global", primary_key=("ts_code", "trade_date")),
+    DatasetDefinition("us_tycr", "us_tycr", date_field="date", primary_key=("date",)),
+    DatasetDefinition("us_tbr", "us_tbr", date_field="date", primary_key=("date",)),
+    DatasetDefinition("us_tltr", "us_tltr", date_field="date", primary_key=("date",)),
+    DatasetDefinition("us_trltr", "us_trltr", date_field="date", primary_key=("date",)),
+    DatasetDefinition("us_trycr", "us_trycr", date_field="date", primary_key=("date",)),
+    DatasetDefinition(
+        "us_tradecal", "us_tradecal", date_field="cal_date", primary_key=("cal_date",)
+    ),
+    DatasetDefinition(
+        "hk_tradecal", "hk_tradecal", date_field="cal_date", primary_key=("cal_date",)
+    ),
+)
+GLOBAL_REFERENCE_DATASETS = frozenset(item.name for item in GLOBAL_REFERENCE_DAILY)
+# Trade calendars legitimately extend past the snapshot end date; the OHLC and
+# future-date checks below must not flag their forward sessions.
+GLOBAL_REFERENCE_CALENDARS = frozenset({"us_tradecal", "hk_tradecal"})
+
 DISCLOSURE_FIELDS = (
     "ts_code",
     "ann_date",
@@ -327,6 +355,7 @@ ALL_DEFINITIONS = {
         *FUNDAMENTALS,
         *CORPORATE_EVENTS,
         *INDUSTRY_CATALOG,
+        *GLOBAL_REFERENCE_DAILY,
         INDEX_DAILY_BASIC,
     )
 }

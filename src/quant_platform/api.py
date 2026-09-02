@@ -318,7 +318,9 @@ class LegacyMarketBackfillRequest(BaseModel):
 class DataFinalizeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    profile: Literal["core", "research", "full", "research-assets"] = "full"
+    profile: Literal["core", "research", "full", "research-assets", "global-reference"] = (
+        "full"
+    )
     start: date = Field(default=date(2008, 1, 1))
     end: date | Literal["latest"] = "latest"
     snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
@@ -327,10 +329,11 @@ class DataFinalizeRequest(BaseModel):
     def validate_range(self) -> DataFinalizeRequest:
         if isinstance(self.end, date) and self.end < self.start:
             raise ValueError("end must not be before start")
-        if self.profile not in {"full", "research-assets"}:
+        if self.profile not in {"full", "research-assets", "global-reference"}:
             raise ValueError(
-                "publication requires the full data profile for Qlib or the isolated "
-                "research-assets profile; core/research are download-only subsets"
+                "publication requires the full data profile for Qlib or an isolated "
+                "research-assets/global-reference profile; core/research are "
+                "download-only subsets"
             )
         return self
 

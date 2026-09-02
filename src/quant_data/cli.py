@@ -48,6 +48,7 @@ from .catalog import (
     CORPORATE_EVENTS,
     ETF_DAILY,
     FUNDAMENTALS,
+    GLOBAL_REFERENCE_DATASETS,
     REFERENCE_FIELDS,
     RESEARCH_DAILY,
 )
@@ -146,8 +147,16 @@ EXECUTION_SNAPSHOT_CONTRACT_VERSION = (
 )
 QLIB_SNAPSHOT_PROFILES = frozenset({"core", "research", "full"})
 RESEARCH_ASSET_SNAPSHOT_PROFILE = "research-assets"
+# Isolated peripheral-markets snapshot (US/HK dailies, global indexes, US
+# treasury yields, US/HK trade calendars). Never joins the A-share profiles or
+# feeds the Qlib builder.
+GLOBAL_REFERENCE_SNAPSHOT_PROFILE = "global-reference"
 SNAPSHOT_PROFILES = frozenset(
-    {*QLIB_SNAPSHOT_PROFILES, RESEARCH_ASSET_SNAPSHOT_PROFILE}
+    {
+        *QLIB_SNAPSHOT_PROFILES,
+        RESEARCH_ASSET_SNAPSHOT_PROFILE,
+        GLOBAL_REFERENCE_SNAPSHOT_PROFILE,
+    }
 )
 INDUSTRY_HISTORY_CARRY_RULE_VERSION = "index-member-delisted-parent-carry-v1"
 
@@ -1889,7 +1898,8 @@ def verify(
             "--profile",
             help=(
                 "Strictly verify only the datasets that the selected snapshot "
-                "profile will publish: core, research, full, or research-assets"
+                "profile will publish: core, research, full, research-assets, or "
+                "global-reference"
             ),
         ),
     ] = None,
@@ -1903,7 +1913,8 @@ def verify(
         )
     if profile is not None and profile not in SNAPSHOT_PROFILES:
         raise typer.BadParameter(
-            "profile must be core, research, full, or research-assets"
+            "profile must be core, research, full, research-assets, or "
+            "global-reference"
         )
     dataset_filter = (
         _snapshot_datasets(profile, available=set(context.checkpoint.datasets()))
@@ -1939,8 +1950,9 @@ def snapshot(
         str,
         typer.Option(
             help=(
-                "core, research, full, or the isolated research-assets "
-                "profile (trade_cal + research_report only)"
+                "core, research, full, the isolated research-assets "
+                "profile (trade_cal + research_report only), or the isolated "
+                "global-reference profile (peripheral markets only)"
             )
         ),
     ] = "core",
@@ -1959,7 +1971,11 @@ def snapshot(
     context = load_context(require_credentials=False)
     start_date = parse_date(start)
     end_date = parse_date(end, latest=today_cn())
-    name = name or f"cn-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    if name is None:
+        prefix = (
+            "global" if profile == GLOBAL_REFERENCE_SNAPSHOT_PROFILE else "cn"
+        )
+        name = f"{prefix}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     # Verify before building so every snapshot manifest records an explicit
     # quality gate; Qlib builds refuse snapshots without quality_gate.ok=true.
     selected_datasets = _snapshot_datasets(
@@ -3603,7 +3619,12 @@ def _build_snapshot(
         raise ValueError("snapshot publication requires a passing bound quality gate")
     module_root = Path(__file__).resolve().parent
     is_research_asset_source = profile == RESEARCH_ASSET_SNAPSHOT_PROFILE
-    mixed_legacy_source = not is_research_asset_source and start_date < date(2016, 1, 1)
+    is_global_reference_source = profile == GLOBAL_REFERENCE_SNAPSHOT_PROFILE
+    mixed_legacy_source = (
+        not is_research_asset_source
+        and not is_global_reference_source
+        and start_date < date(2016, 1, 1)
+    )
     provider_contract = (
         "tushare-compatible+baostock-audited-legacy"
         if mixed_legacy_source
@@ -3619,6 +3640,13 @@ def _build_snapshot(
             {
                 "catalog": module_root / "catalog.py",
                 "research_assets": module_root / "research_assets.py",
+            }
+        )
+    if is_global_reference_source:
+        contract_files.update(
+            {
+                "catalog": module_root / "catalog.py",
+                "availability": module_root / "availability.py",
             }
         )
     if mixed_legacy_source:
@@ -3638,14 +3666,20 @@ def _build_snapshot(
         ),
         "industry_history_carry_rule_version": (
             INDUSTRY_HISTORY_CARRY_RULE_VERSION
-            if not is_research_asset_source
+            if not is_research_asset_source and not is_global_reference_source
             else None
         ),
         "ingestion_contract_sha256": file_contract_sha256(contract_files),
     }
     lineage_contract = {
         "kind": (
-            "research_asset_source" if is_research_asset_source else "qlib_daily_source"
+            "research_asset_source"
+            if is_research_asset_source
+            else (
+                "global_reference_source"
+                if is_global_reference_source
+                else "qlib_daily_source"
+            )
         ),
         "configuration": lineage_configuration,
     }
@@ -3656,9 +3690,9 @@ def _build_snapshot(
     industry_anchor_path: Path | None = None
     industry_anchor_evidence: dict[str, Any] | None = None
     if industry_history_anchor is not None:
-        if is_research_asset_source:
+        if is_research_asset_source or is_global_reference_source:
             raise ValueError(
-                "industry history anchor is not valid for research-assets snapshots"
+                "industry history anchor is only valid for A-share snapshots"
             )
         if industry_history_anchor == name:
             raise ValueError("industry history anchor must differ from the target snapshot")
@@ -3817,6 +3851,11 @@ def _build_qlib(
     if snapshot_manifest.get("profile") == RESEARCH_ASSET_SNAPSHOT_PROFILE:
         raise ValueError(
             "research-assets snapshots are isolated PDF acquisition sources and "
+            "cannot be normalized into a Qlib market dataset"
+        )
+    if snapshot_manifest.get("profile") == GLOBAL_REFERENCE_SNAPSHOT_PROFILE:
+        raise ValueError(
+            "global-reference snapshots are isolated peripheral-market sources and "
             "cannot be normalized into a Qlib market dataset"
         )
     # Production Qlib artifacts must carry the governed domestic-equity ETF
@@ -4511,6 +4550,8 @@ def _build_execution_snapshot(
 def _profile_datasets(profile: str) -> set[str]:
     if profile == RESEARCH_ASSET_SNAPSHOT_PROFILE:
         return {"trade_cal", "research_report"}
+    if profile == GLOBAL_REFERENCE_SNAPSHOT_PROFILE:
+        return set(GLOBAL_REFERENCE_DATASETS)
     datasets = {
         "stock_basic",
         "trade_cal",
@@ -4546,7 +4587,8 @@ def _snapshot_datasets(profile: str, *, available: set[str]) -> set[str]:
 
     if profile not in SNAPSHOT_PROFILES:
         raise typer.BadParameter(
-            "profile must be core, research, full, or research-assets"
+            "profile must be core, research, full, research-assets, or "
+            "global-reference"
         )
     datasets = _profile_datasets(profile) | set(_required_profile_datasets(profile))
     # The profile is an explicit publication contract. Unrelated supplemental,
@@ -4560,6 +4602,10 @@ def _required_profile_datasets(profile: str) -> frozenset[str]:
 
     if profile == RESEARCH_ASSET_SNAPSHOT_PROFILE:
         return frozenset({"trade_cal", "research_report"})
+    if profile == GLOBAL_REFERENCE_SNAPSHOT_PROFILE:
+        # The profile is an explicit publication contract: every registered
+        # peripheral dataset must be present before the snapshot publishes.
+        return GLOBAL_REFERENCE_DATASETS
     return (
         QLIB_RESEARCH_REQUIRED_DATASETS
         if profile == "full"

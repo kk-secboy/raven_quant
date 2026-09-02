@@ -31,6 +31,13 @@ AVAILABILITY_POLICY_VERSION = 1
 STRICTLY_AFTER_ANNOUNCEMENT_DATE = "strictly_after_announcement_date"
 SAME_TRADE_DATE_AFTER_CLOSE = "same_trade_date_after_close"
 EFFECTIVE_DATE_WITH_LAG = "effective_date_with_lag"
+# Peripheral markets (US/HK sessions, global indexes, US treasury yields): the
+# session labeled D closes during the A-share evening/night of D (HK closes
+# 16:00 Beijing time, the US session closes early on D+1 Beijing time), so a
+# row dated D is conservatively knowable for A-share decisions from the next
+# calendar day — i.e. the next A-share pre-open.  Whole-date comparison is the
+# strict `< cutoff` branch shared with strictly_after_announcement_date.
+FOREIGN_CLOSE_NEXT_CALENDAR_DAY = "foreign_close_next_calendar_day"
 
 NATIVE_HISTORY = "native_history"
 RECONSTRUCTED = "reconstructed"
@@ -137,6 +144,24 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
     # research-asset acquisition layer applies the same rule concretely as the
     # first open trading day after trade_date before a PDF can be selected.
     "research_report": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("trade_date",)),
+    # Peripheral daily series (US/HK stocks, global indexes, US treasury
+    # yields): the dated foreign session closes after the A-share close, so the
+    # row is usable for A-share research from the next calendar day (the next
+    # pre-open).  See the policy constant's note for the timezone rationale.
+    "us_daily": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("trade_date",)),
+    "us_daily_adj": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("trade_date",)),
+    "hk_daily": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("trade_date",)),
+    "hk_daily_adj": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("trade_date",)),
+    "index_global": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("trade_date",)),
+    "us_tycr": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("date",)),
+    "us_tbr": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("date",)),
+    "us_tltr": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("date",)),
+    "us_trltr": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("date",)),
+    "us_trycr": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("date",)),
+    # US/HK trade calendars are pre-published reference data; the registered
+    # floor keeps any PIT read conservative without pretending revisions exist.
+    "us_tradecal": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("cal_date",)),
+    "hk_tradecal": AvailabilityPolicy(FOREIGN_CLOSE_NEXT_CALENDAR_DAY, ("cal_date",)),
 }
 
 # Recoverability level per dataset (design draft 3.3). Datasets not listed are
@@ -168,7 +193,6 @@ RECOVERABILITY_LEVELS: dict[str, str] = {
     "fut_daily": NATIVE_HISTORY,
     "shibor": NATIVE_HISTORY,
     "shibor_lpr": NATIVE_HISTORY,
-    "us_tycr": NATIVE_HISTORY,
     # Monthly constituent weights stay re-pullable for historical months.
     "index_weight": NATIVE_HISTORY,
     # Financial reports keep announcement-versioned rows (ann_date plus
@@ -227,6 +251,23 @@ RECOVERABILITY_LEVELS: dict[str, str] = {
     "stock_basic": CURRENT_ONLY,
     "index_classify": CURRENT_ONLY,
     **{dataset: CURRENT_ONLY for dataset in AUDITED_REFERENCE_DATASETS},
+    # Peripheral instrument masters expose only the latest revision upstream.
+    "us_basic": CURRENT_ONLY,
+    "hk_basic": CURRENT_ONLY,
+    # Peripheral daily series and trade calendars stay re-pullable keyed by
+    # business date; the provider does not rewrite old rows.  Registered after
+    # the audited-reference spread so these levels win for the overlap.
+    "us_tycr": NATIVE_HISTORY,
+    "us_daily": NATIVE_HISTORY,
+    "us_daily_adj": NATIVE_HISTORY,
+    "hk_daily": NATIVE_HISTORY,
+    "hk_daily_adj": NATIVE_HISTORY,
+    "us_tbr": NATIVE_HISTORY,
+    "us_tltr": NATIVE_HISTORY,
+    "us_trltr": NATIVE_HISTORY,
+    "us_trycr": NATIVE_HISTORY,
+    "us_tradecal": NATIVE_HISTORY,
+    "hk_tradecal": NATIVE_HISTORY,
 }
 
 
@@ -305,7 +346,7 @@ def filter_available(
             f"{policy.date_columns}"
         )
     dates = _normalized_dates(frame[column])
-    if policy.kind == STRICTLY_AFTER_ANNOUNCEMENT_DATE:
+    if policy.kind in {STRICTLY_AFTER_ANNOUNCEMENT_DATE, FOREIGN_CLOSE_NEXT_CALENDAR_DAY}:
         available = dates < cutoff
     elif policy.kind in {SAME_TRADE_DATE_AFTER_CLOSE, EFFECTIVE_DATE_WITH_LAG}:
         available = dates <= cutoff

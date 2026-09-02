@@ -8,7 +8,11 @@ from typing import Any
 
 import duckdb
 
-from .catalog import ALL_DEFINITIONS
+from .catalog import (
+    ALL_DEFINITIONS,
+    GLOBAL_REFERENCE_CALENDARS,
+    GLOBAL_REFERENCE_DATASETS,
+)
 from .checkpoint import CheckpointStore
 from .coverage_data import COVERAGE_DATASETS, coverage_primary_key_candidates
 from .execution_contract import (
@@ -324,6 +328,16 @@ def verify_downloads(
         )
         errors.extend(ohlc_errors)
         warnings.extend(ohlc_warnings)
+        global_errors, global_warnings, global_reference_checks = (
+            _verify_global_reference_frames(
+                connection,
+                selected_by_dataset,
+                data_root,
+                snapshot_end=effective_snapshot_end,
+            )
+        )
+        errors.extend(global_errors)
+        warnings.extend(global_warnings)
         minute_errors, minute_warnings, minute_daily_checks = _verify_minute_daily_consistency(
             connection,
             selected_by_dataset,
@@ -381,6 +395,7 @@ def verify_downloads(
         "quarantined_conflict_checks": quarantined_conflict_checks,
         "completeness_checks": completeness_checks,
         "ohlc_checks": ohlc_checks,
+        "global_reference_checks": global_reference_checks,
         "minute_daily_checks": minute_daily_checks,
         "minute_source_audits": minute_source_audits,
         "disclosure_checks": disclosure_checks,
@@ -685,6 +700,142 @@ def _verify_daily_ohlc(
         )
     return errors, warnings, checks
 
+
+
+# Peripheral global-reference datasets (us/hk dailies, global indexes, US
+# treasury yields, us/hk trade calendars): primary-key duplicates are already
+# covered by the generic catalog-driven check; this layer adds date and OHLC
+# sanity so a peripheral snapshot cannot publish unparseable, future-dated or
+# structurally impossible rows.
+GLOBAL_REFERENCE_OHLC_DATASETS = frozenset(
+    {"us_daily", "us_daily_adj", "hk_daily", "hk_daily_adj", "index_global"}
+)
+
+
+def _verify_global_reference_frames(
+    connection: duckdb.DuckDBPyConnection,
+    selected_by_dataset: dict[str, list[dict[str, Any]]],
+    data_root: Path,
+    *,
+    snapshot_end: date,
+) -> tuple[list[str], list[str], dict[str, int]]:
+    """Date/OHLC sanity for selected peripheral units; fail closed."""
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    checks = {
+        "global_reference_rows": 0,
+        "global_reference_bad_date_rows": 0,
+        "global_reference_future_rows": 0,
+        "global_reference_missing_ohlc_datasets": 0,
+        "global_reference_nonpositive_price_rows": 0,
+        "global_reference_high_below_low_rows": 0,
+        "global_reference_open_close_outside_range_rows": 0,
+        "global_reference_large_pct_chg_rows": 0,
+    }
+    for dataset in sorted(GLOBAL_REFERENCE_DATASETS & set(selected_by_dataset)):
+        paths = _selected_parquet_paths(selected_by_dataset, dataset, data_root)
+        if not paths:
+            continue
+        definition = ALL_DEFINITIONS[dataset]
+        date_column = str(definition.date_field or "trade_date")
+        relation = _parquet_relation(paths)
+        columns = {
+            str(row[0])
+            for row in connection.execute(
+                f"DESCRIBE SELECT * FROM {relation}"
+            ).fetchall()
+        }
+        if date_column not in columns:
+            errors.append(
+                f"{dataset}: availability date column {date_column!r} is missing"
+            )
+            continue
+        date_sql = _date_sql(date_column)
+        base = (
+            f"SELECT *, {date_sql} AS _parsed_date, "
+            f'CAST("{date_column}" AS VARCHAR) AS _raw_date FROM {relation}'
+        )
+        total = int(connection.execute(f"SELECT count(*) FROM ({base})").fetchone()[0])
+        checks["global_reference_rows"] += total
+        bad_dates = int(
+            connection.execute(
+                f"SELECT count(*) FROM ({base}) "
+                "WHERE _raw_date IS NULL OR _parsed_date IS NULL"
+            ).fetchone()[0]
+        )
+        checks["global_reference_bad_date_rows"] += bad_dates
+        if bad_dates:
+            errors.append(
+                f"{dataset}: {bad_dates} rows have a missing or unparseable "
+                f"{date_column}"
+            )
+        # Trade calendars legitimately carry future sessions; market data must not.
+        if dataset not in GLOBAL_REFERENCE_CALENDARS:
+            future = int(
+                connection.execute(
+                    f"SELECT count(*) FROM ({base}) "
+                    f"WHERE _parsed_date > DATE {_sql_string(snapshot_end.isoformat())}"
+                ).fetchone()[0]
+            )
+            checks["global_reference_future_rows"] += future
+            if future:
+                errors.append(
+                    f"{dataset}: {future} rows are dated after the snapshot end"
+                )
+        if dataset not in GLOBAL_REFERENCE_OHLC_DATASETS:
+            continue
+        ohlc = {"open", "high", "low", "close"}
+        if not ohlc <= columns:
+            checks["global_reference_missing_ohlc_datasets"] += 1
+            errors.append(
+                f"{dataset}: provider columns lack the expected OHLC fields: "
+                f"{sorted(ohlc - columns)}"
+            )
+            continue
+        price_sql = f"""
+            SELECT {date_sql} AS _parsed_date,
+                   try_cast(open AS DOUBLE) AS open,
+                   try_cast(high AS DOUBLE) AS high,
+                   try_cast(low AS DOUBLE) AS low,
+                   try_cast(close AS DOUBLE) AS close
+            FROM {relation}
+            WHERE {date_sql} IS NOT NULL
+        """
+        violations = {
+            "global_reference_nonpositive_price_rows": (
+                "open <= 0 OR high <= 0 OR low <= 0 OR close <= 0",
+                "non-positive OHLC prices",
+            ),
+            "global_reference_high_below_low_rows": ("high < low", "high below low"),
+            "global_reference_open_close_outside_range_rows": (
+                "open > high OR open < low OR close > high OR close < low",
+                "open/close outside the [low, high] range",
+            ),
+        }
+        for check, (predicate, label) in violations.items():
+            count = int(
+                connection.execute(
+                    f"SELECT count(*) FROM ({price_sql}) WHERE {predicate}"
+                ).fetchone()[0]
+            )
+            checks[check] += count
+            if count:
+                errors.append(f"{dataset}: {count} rows have {label}")
+        if "pct_chg" in columns:
+            jumps = int(
+                connection.execute(
+                    f"SELECT count(*) FROM {relation} "
+                    "WHERE abs(try_cast(pct_chg AS DOUBLE)) > 35.0"
+                ).fetchone()[0]
+            )
+            checks["global_reference_large_pct_chg_rows"] += jumps
+            if jumps:
+                warnings.append(
+                    f"{dataset}: {jumps} rows move more than 35% in one session "
+                    "(peripheral boards differ; review before factor use)"
+                )
+    return errors, warnings, checks
 
 # 设计 §3.5 质量门：日线↔分钟聚合一致性。只比对换算契约明确的股票/ETF
 # 分钟数据集（execution_contract.SIMULATION_MINUTE_SOURCE_DATASETS，分钟
