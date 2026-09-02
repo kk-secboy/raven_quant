@@ -104,12 +104,11 @@ DATASET_CCTV_NEWS = "cctv_news"
 IRM_QA_DATASETS = (DATASET_IRM_QA_SH, DATASET_IRM_QA_SZ)
 POLICY_DATASETS = (DATASET_NPR, DATASET_CCTV_NEWS)
 SUPPORTED_CORPUS_DATASETS = (DATASET_MAJOR_NEWS, *POLICY_DATASETS, *IRM_QA_DATASETS)
-# npr has no persisted production rows as of the audited 2026-08-08 source
-# boundary. It remains explicitly supported for future/native backfills, but a
-# default production run must not fail merely because that unavailable source
-# is absent. Its absence is documented as a source gap rather than fabricated.
+# npr production rows landed on 2026-09-02 (relay requires datetime-form
+# dates plus an explicit content_html field). It joins the default set.
 DEFAULT_CORPUS_DATASETS = (
     DATASET_MAJOR_NEWS,
+    DATASET_NPR,
     DATASET_CCTV_NEWS,
     *IRM_QA_DATASETS,
 )

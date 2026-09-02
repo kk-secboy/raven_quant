@@ -845,23 +845,21 @@ def test_process_missing_corpus_fail_closed(tmp_path: Path) -> None:
         _run(tmp_path, FakeChatClient([]))
 
 
-def test_process_default_excludes_audited_unavailable_npr(tmp_path: Path) -> None:
+def test_process_default_fails_closed_when_npr_missing(tmp_path: Path) -> None:
+    # npr joined the default set on 2026-09-02; a missing member must stop the
+    # run rather than silently narrowing the policy corpus.
     _seed_corpus(tmp_path)
     (tmp_path / "units" / "npr" / "data.parquet").unlink()
     _seed_trade_cal(tmp_path)
 
-    summary = corpus.process_corpus(
-        tmp_path,
-        secret_store=FakeSecretStore(STORE_RECORD),
-        chat_client=FakeChatClient([_payload()] * 6),
-        now=lambda: NOW,
-        environ={},
-    )
-
-    assert summary.planned == 6
-    policy_manifest = summary.factors[corpus.POLICY_FACTOR_NAME]["manifest"]
-    assert policy_manifest["source"]["source_datasets"] == ["cctv_news"]
-
+    with pytest.raises(RuntimeError, match="corpus parquet is unavailable"):
+        corpus.process_corpus(
+            tmp_path,
+            secret_store=FakeSecretStore(STORE_RECORD),
+            chat_client=FakeChatClient([_payload()] * 6),
+            now=lambda: NOW,
+            environ={},
+        )
 
 def test_process_missing_trade_cal_fail_closed(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
@@ -1167,17 +1165,18 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     assert payload["dataset"] == "corpus_nlp"
     assert payload["datasets"] == [
         "major_news",
+        "npr",
         "cctv_news",
         "irm_qa_sh",
         "irm_qa_sz",
     ]
-    assert payload["planned"] == 6
-    assert payload["processed"] == 6
+    assert payload["planned"] == 7
+    assert payload["processed"] == 7
     assert payload["failed"] == 0
     assert payload["llm_calls"] == 1
     assert payload["factors"]["news_sentiment_daily"]["rows"] == 3
     assert payload["factors"]["irm_qa_sentiment_daily"]["rows"] == 2
-    assert payload["factors"]["policy_sentiment_daily"]["rows"] == 1
+    assert payload["factors"]["policy_sentiment_daily"]["rows"] == 2
     assert len(chat.calls) == 1
     assert Path(payload["fields_path"]).is_file()
 
