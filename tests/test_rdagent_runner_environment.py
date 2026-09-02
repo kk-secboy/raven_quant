@@ -195,42 +195,7 @@ def test_disposable_qlib_container_allows_local_mlflow_tracking(
     }
 
 
-def test_configured_embeddings_are_routed_to_the_embedding_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from scripts import run_rdagent_module
-
-    backend = ModuleType("rdagent.oai.backend.litellm")
-    calls: list[dict] = []
-
-    def fake_embedding(*args, **kwargs):
-        calls.append(kwargs)
-        return kwargs
-
-    backend.embedding = fake_embedding
-    monkeypatch.setitem(sys.modules, "rdagent", ModuleType("rdagent"))
-    monkeypatch.setitem(sys.modules, "rdagent.oai", ModuleType("rdagent.oai"))
-    monkeypatch.setitem(
-        sys.modules, "rdagent.oai.backend", ModuleType("rdagent.oai.backend")
-    )
-    monkeypatch.setitem(sys.modules, "rdagent.oai.backend.litellm", backend)
-
-    monkeypatch.setenv("EMBEDDING_OPENAI_API_KEY", "emb-key")
-    monkeypatch.setenv("EMBEDDING_OPENAI_API_BASE", "https://emb.invalid/v4")
-    run_rdagent_module._route_embedding_calls()
-
-    backend.embedding(model="openai/embedding-3", input=["x"])
-    assert calls == [
-        {
-            "model": "openai/embedding-3",
-            "input": ["x"],
-            "api_key": "emb-key",
-            "api_base": "https://emb.invalid/v4",
-        }
-    ]
-
-
-def test_embedding_environment_injects_configured_provider() -> None:
+def test_embedding_environment_uses_hosted_vllm_env_without_patches() -> None:
     from quant_platform.job_commands.research import _embedding_environment
 
     assert _embedding_environment({}) == {}
@@ -241,10 +206,12 @@ def test_embedding_environment_injects_configured_provider() -> None:
             "embedding_model": "embedding-3",
         }
     )
+    # LiteLLM's hosted_vllm provider carries its own credentials, so embedding
+    # traffic reaches the embedding provider without any code patching.
     assert env == {
-        "EMBEDDING_MODEL": "openai/embedding-3",
-        "EMBEDDING_OPENAI_API_KEY": "emb-key",
-        "EMBEDDING_OPENAI_API_BASE": "https://emb.invalid/v4",
+        "EMBEDDING_MODEL": "hosted_vllm/embedding-3",
+        "HOSTED_VLLM_API_KEY": "emb-key",
+        "HOSTED_VLLM_API_BASE": "https://emb.invalid/v4",
     }
 
 

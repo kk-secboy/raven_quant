@@ -15,6 +15,7 @@ def _embedding_is_configured(env: dict[str, str]) -> bool:
     return bool(
         str(env.get("EMBEDDING_OPENAI_API_KEY") or "").strip()
         or str(env.get("EMBEDDING_AZURE_API_BASE") or "").strip()
+        or str(env.get("HOSTED_VLLM_API_KEY") or "").strip()
     )
 
 
@@ -33,29 +34,6 @@ def _costeer_knowledge_status(env: dict[str, str], *, module: str) -> dict[str, 
         ),
         "strategy_compiler": "deterministic_allowlist" if strategy_compiler else None,
     }
-
-
-def _route_embedding_calls() -> None:
-    """Send CoSTEER embedding calls to the configured embedding provider.
-
-    Chat stays on the governed relay (OPENAI_API_BASE).  LiteLLM resolves
-    openai/* embedding models from that same global base, so the embedding
-    credentials arrive via EMBEDDING_OPENAI_* and are applied per call.
-    """
-    from rdagent.oai.backend import litellm as rdagent_litellm
-
-    api_key = str(os.environ.get("EMBEDDING_OPENAI_API_KEY") or "").strip()
-    api_base = str(os.environ.get("EMBEDDING_OPENAI_API_BASE") or "").strip().rstrip("/")
-    original = rdagent_litellm.embedding
-
-    def routed(*args: Any, **kwargs: Any) -> Any:
-        if api_key:
-            kwargs.setdefault("api_key", api_key)
-        if api_base:
-            kwargs.setdefault("api_base", api_base)
-        return original(*args, **kwargs)
-
-    rdagent_litellm.embedding = routed  # type: ignore[assignment]
 
 
 def _enable_qlib_file_tracking_compatibility() -> None:
@@ -180,7 +158,6 @@ def main(argv: list[str]) -> int:
             "embedding retrieval is not configured; set the llm secret record's "
             "embedding_api_key / embedding_api_base / embedding_model fields first"
         )
-    _route_embedding_calls()
     target = importlib.import_module(module)
     if module == "rdagent.app.qlib_rd_loop.quant":
         _enable_fin_quant_arm_coverage()

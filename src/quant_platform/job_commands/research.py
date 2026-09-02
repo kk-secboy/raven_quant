@@ -17,19 +17,20 @@ from ._shared import _require_supported_rdagent_execution
 def _embedding_environment(llm: dict) -> dict[str, str]:
     """Route CoSTEER embedding retrieval to the configured embedding provider.
 
-    Chat stays on the governed relay (OPENAI_API_BASE); embedding credentials
-    arrive via EMBEDDING_OPENAI_* and run_rdagent_module applies them per call.
+    Chat stays on the governed relay (OPENAI_API_BASE); LiteLLM's hosted_vllm
+    provider carries its own HOSTED_VLLM_* credentials, so embedding traffic
+    needs no code patch — pure environment configuration.
     """
     key = str(llm.get("embedding_api_key") or "").strip()
     if not key:
         return {}
     model = str(llm.get("embedding_model") or "embedding-3").strip()
     if "/" not in model:
-        model = f"openai/{model}"
+        model = f"hosted_vllm/{model}"
     return {
         "EMBEDDING_MODEL": model,
-        "EMBEDDING_OPENAI_API_KEY": key,
-        "EMBEDDING_OPENAI_API_BASE": str(llm.get("embedding_api_base") or "")
+        "HOSTED_VLLM_API_KEY": key,
+        "HOSTED_VLLM_API_BASE": str(llm.get("embedding_api_base") or "")
         .strip()
         .rstrip("/"),
     }

@@ -501,6 +501,7 @@ def run(args: argparse.Namespace) -> None:
     embeddings_configured = bool(
         str(env.get("EMBEDDING_OPENAI_API_KEY") or "").strip()
         or str(env.get("EMBEDDING_AZURE_API_BASE") or "").strip()
+        or str(env.get("HOSTED_VLLM_API_KEY") or "").strip()
     )
     env["QUANTLAB_COSTEER_KNOWLEDGE_STATUS_JSON"] = json.dumps(
         {
