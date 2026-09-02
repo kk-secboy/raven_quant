@@ -122,7 +122,16 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         CoverageRule("us_trltr", "year", 2_000, 8),
     ),
     "research_corpus": (
-        CoverageRule("npr", "calendar_daily_range", 500, 8, date_field="pub_time"),
+        # The relay only returns npr rows when content_html is explicitly
+        # requested; default-field requests silently return zero items.
+        CoverageRule(
+            "npr",
+            "calendar_daily_range",
+            500,
+            8,
+            date_field="pub_time",
+            fields=("pubtime", "url", "title", "content_html", "pcode", "puborg", "ptype"),
+        ),
         CoverageRule(
             "research_report",
             "calendar_daily",
