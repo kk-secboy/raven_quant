@@ -148,6 +148,11 @@ def _load_market_frame(
     select_parts = [_date_select(key_column)]
     if "ts_code" in required:
         select_parts.insert(0, "CAST(ts_code AS VARCHAR) AS ts_code")
+    # ingested_at drives generation-aware deduplication below; legacy fixture
+    # parquets without it fall back to a plain deterministic collapse.
+    has_ingested_at = "ingested_at" in available
+    if has_ingested_at:
+        select_parts.append("ingested_at")
     observed_values: list[str] = []
     for column in value_columns:
         if column in available:
@@ -161,14 +166,23 @@ def _load_market_frame(
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=[key_column])
     frame[key_column] = pd.to_datetime(frame[key_column]).dt.normalize()
+    subset = ["ts_code", key_column] if "ts_code" in frame.columns else [key_column]
     if "ts_code" in frame.columns:
         frame["ts_code"] = frame["ts_code"].astype(str).str.strip().str.upper()
         frame = frame[frame["ts_code"] != ""]
-        # Identical rows can live in both the units and the snapshots layout.
-        frame = frame.drop_duplicates(subset=["ts_code", key_column])
+    # The same provider row can live in both the units and the snapshots
+    # layout, and revisioned peripheral datasets (adjusted prices, backfilled
+    # fields) republish a business key across ingestion generations.  Keep the
+    # latest generation per key, mirroring storage._snapshot_source_query's
+    # LATEST_GENERATION_KEYS rule; identical rows always collapse.
+    if has_ingested_at:
+        frame = frame.sort_values(
+            [*subset, "ingested_at"], na_position="first", kind="stable"
+        )
     else:
-        frame = frame.drop_duplicates(subset=[key_column])
-    return frame.sort_values(list(required), kind="stable").reset_index(drop=True)
+        frame = frame.sort_values(subset, kind="stable")
+    frame = frame.drop_duplicates(subset=subset, keep="last")
+    return frame.sort_values(subset, kind="stable").reset_index(drop=True)
 
 
 def _daily_return(frame: pd.DataFrame, *, dataset: str) -> pd.Series:
@@ -192,11 +206,19 @@ def _to_market_series(
 
     if rows.empty:
         raise RuntimeError(f"{name}: no source rows survive the requested window")
-    factor_dates = [
+    frame = rows.copy()
+    frame["factor_date"] = [
         # next_trading_day works on plain dates; normalize the pandas key type.
         next_trading_day(day.date() if isinstance(day, pd.Timestamp) else day, open_days)
-        for day in rows["source_date"]
+        for day in frame["source_date"]
     ]
+    # A-share holidays compress several foreign sessions onto one A-share open
+    # day (e.g. a US Monday session when A-shares are closed).  All of them are
+    # knowable by that pre-open; keep the latest source session's value.
+    frame = frame.sort_values("source_date", kind="stable")
+    frame = frame.drop_duplicates(subset=["factor_date"], keep="last")
+    factor_dates = list(frame["factor_date"])
+    rows = frame
     series = pd.Series(
         rows["value"].to_numpy(dtype=float),
         index=pd.MultiIndex.from_arrays(

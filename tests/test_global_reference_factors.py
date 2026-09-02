@@ -395,3 +395,98 @@ def test_register_is_idempotent_for_same_sha256(database_url: str, tmp_path: Pat
     assert second["created"] is False
     assert second["candidate_id"] == first["candidate_id"]
     assert second["run_id"] == first["run_id"]
+
+
+# ---------------------------------------------------------------------------
+# Dual-layer / generational deduplication
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_database
+def test_dual_layer_and_generational_duplicates_collapse(tmp_path: Path) -> None:
+    """The same provider row in units and snapshots plus an older revised row.
+
+    The units layer holds the current generation, the snapshots layer an exact
+    copy of it, and a second unit file carries an older generation of the same
+    business key with a different value.  The output must contain one row per
+    (datetime, instrument) and keep the latest generation's value.
+    """
+
+    _seed_full(tmp_path)
+    index_dir = tmp_path / "units" / "index_global"
+    for stale in index_dir.glob("*.parquet"):
+        stale.unlink()
+    older = {
+        "ts_code": "SPX",
+        "trade_date": "20260824",
+        "close": 1000.0,
+        "pct_chg": 0.5,
+        "ingested_at": pd.Timestamp("2026-08-25T08:00:00Z"),
+    }
+    newer = {**older, "pct_chg": 0.9, "ingested_at": pd.Timestamp("2026-08-26T08:00:00Z")}
+    peers = [
+        {
+            "ts_code": code,
+            "trade_date": "20260824",
+            "close": 1000.0,
+            "pct_chg": 0.5,
+            "ingested_at": pd.Timestamp("2026-08-26T08:00:00Z"),
+        }
+        for code in ("IXIC", "HSI")
+    ]
+    pd.DataFrame([older]).to_parquet(index_dir / "older.parquet", index=False)
+    pd.DataFrame([newer, *peers]).to_parquet(index_dir / "newer.parquet", index=False)
+    # The exact same current-generation row also lives in the snapshot layer.
+    snapshot_dir = tmp_path / "snapshots" / "snap1" / "parquet" / "index_global"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([newer]).to_parquet(snapshot_dir / "snap.parquet", index=False)
+
+    series = m.build_global_reference_series(tmp_path)
+    spx = series[m.SPX_OVERNIGHT_FACTOR_NAME]
+    assert len(spx) == 1
+    assert spx.iloc[0] == pytest.approx(0.009)
+
+
+@pytest.mark.no_database
+def test_holiday_compression_keeps_the_latest_source_session(tmp_path: Path) -> None:
+    """A-share holidays compress several foreign sessions onto one open day.
+
+    trade_cal opens only Mon 2026-08-24 and Thu 2026-08-27; index_global has
+    US sessions Mon-Wed.  All three map to Thursday; the newest source
+    session's value wins and no duplicate factor dates survive.
+    """
+
+    open_days = [date(2026, 8, 24), date(2026, 8, 27)]
+    _write_parquet(
+        tmp_path / "units" / "trade_cal",
+        [{"cal_date": day.strftime("%Y%m%d"), "is_open": 1} for day in open_days],
+    )
+    days = [date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)]
+    pcts = {"SPX": (0.1, 0.2, 0.3), "IXIC": (0.4, 0.5, 0.6), "HSI": (0.7, 0.8, 0.9)}
+    _write_parquet(
+        tmp_path / "units" / "index_global",
+        [
+            _index_row(code, day, pct)
+            for day, _ in zip(days, (0, 0, 0), strict=True)
+            for code in ("SPX", "IXIC", "HSI")
+            for pct in (pcts[code][days.index(day)],)
+        ],
+    )
+    members = sorted(
+        {code for _label, codes in SECTOR_LEADERS.values() for code in codes}
+    )
+    _write_parquet(
+        tmp_path / "units" / "us_daily",
+        [_us_row(code, days[0], 1.0) for code in members],
+    )
+    _write_parquet(
+        tmp_path / "units" / "us_tycr",
+        [{"date": days[0].isoformat(), "y10": 4.10}, {"date": days[1].isoformat(), "y10": 4.15}],
+    )
+
+    series = m.build_global_reference_series(tmp_path)
+    spx = series[m.SPX_OVERNIGHT_FACTOR_NAME]
+    assert len(spx) == 1
+    assert spx.index.get_level_values("datetime").tolist() == [pd.Timestamp("2026-08-27")]
+    # Wednesday's session (the latest knowable one) wins the compressed slot.
+    assert spx.iloc[0] == pytest.approx(0.003)
