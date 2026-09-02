@@ -25,6 +25,16 @@ from quant_platform.corpus_nlp import (
 from quant_platform.corpus_nlp import (
     default_factors_dir as corpus_factors_dir,
 )
+from quant_platform.global_reference_factors import (
+    FACTOR_NAMES as GLOBAL_REFERENCE_FACTOR_NAMES,
+)
+from quant_platform.global_reference_factors import (
+    IMPORT_ACTOR as GLOBAL_REFERENCE_IMPORT_ACTOR,
+)
+from quant_platform.global_reference_factors import (
+    global_reference_factors_dir,
+    register_global_reference_factor,
+)
 from quant_platform.major_news_mentions import (
     FACTOR_NAMES as MENTIONS_FACTOR_NAMES,
 )
@@ -150,6 +160,34 @@ def register_report_rc_factor_command(
     factors_dir = report_rc_factors_dir(settings.data_root)
     results = [
         register_report_rc_factor(store, factors_dir, factor_name=name, actor=actor)
+        for name in names
+    ]
+    typer.echo(json.dumps({"factors": results}, ensure_ascii=False, indent=2))
+
+
+@app.command("register-global-reference-factor")
+def register_global_reference_factor_command(
+    factor_name: Annotated[
+        str,
+        typer.Option(
+            help="global-reference factor artifact name, or 'all' for every produced factor"
+        ),
+    ] = "all",
+    actor: Annotated[
+        str, typer.Option(help="Actor recorded on the research run and events")
+    ] = GLOBAL_REFERENCE_IMPORT_ACTOR,
+) -> None:
+    """Register global-reference factor artifacts into factor_candidates (idempotent)."""
+    settings = Settings.from_env(project_root() / ".env")
+    names = (
+        list(GLOBAL_REFERENCE_FACTOR_NAMES)
+        if factor_name == "all"
+        else [part.strip() for part in factor_name.split(",") if part.strip()]
+    )
+    store = ResearchStore(settings.database_url)
+    factors_dir = global_reference_factors_dir(settings.data_root)
+    results = [
+        register_global_reference_factor(store, factors_dir, factor_name=name, actor=actor)
         for name in names
     ]
     typer.echo(json.dumps({"factors": results}, ensure_ascii=False, indent=2))

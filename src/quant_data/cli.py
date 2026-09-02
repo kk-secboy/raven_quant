@@ -37,6 +37,7 @@ from quant_platform.event_market_response import (
     DEFAULT_HORIZONS,
     process_event_market_response,
 )
+from quant_platform.global_reference_factors import process_global_reference
 from quant_platform.major_news_mentions import process_major_news_mentions
 from quant_platform.news_flash_factors import process_news_flash
 from quant_platform.report_rc_factors import process_report_rc
@@ -3004,6 +3005,51 @@ def report_rc_factors_command(
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "ts_codes": _split_codes(ts_code),
+        **summary.as_dict(),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+
+@app.command("global-reference-factors")
+def global_reference_factors_command(
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD source session date")] = "2008-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Build structured factor artifacts from peripheral global-reference datasets."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "global_reference_factors",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress(
+        "processing",
+        "global-reference structured factor production",
+        {"index_global", "us_daily", "us_tycr", "trade_cal"},
+        force=True,
+    )
+    summary = _produce_factors(
+        "global-reference-factors",
+        lambda: process_global_reference(
+            context.settings.data_root,
+            start=start_date,
+            end=end_date,
+        ),
+    )
+    result = {
+        "dataset": "global_reference",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
         **summary.as_dict(),
     }
     _write_optional_result(result_path, result)
