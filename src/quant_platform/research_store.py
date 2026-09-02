@@ -312,38 +312,44 @@ EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v3-walk-forward"
 EXTERNAL_GATE_INSUFFICIENT = "insufficient_evidence"
 
 
-def _shared_sign_check_reasons(metrics: dict[str, Any]) -> list[str]:
-    reasons: list[str] = []
-    raw_valid_ic = metrics.get("raw_valid_ic")
-    raw_selection_ic = metrics.get("raw_selection_ic")
-    ic = metrics.get("ic")
-    rank_ic = metrics.get("rank_ic")
-    if raw_valid_ic is None or raw_selection_ic is None:
-        reasons.append("raw direction and selection IC are required")
-    elif float(raw_valid_ic) * float(raw_selection_ic) <= 0:
-        reasons.append("raw direction and selection IC must have the same sign")
-    if ic is not None and rank_ic is not None and float(ic) * float(rank_ic) <= 0:
-        reasons.append("IC and RankIC must have the same direction")
-    return reasons
+def _external_rolling_gate(
+    metrics: dict[str, Any],
+) -> tuple[str | None, list[str], list[str]]:
+    """Classify rolling walk-forward evidence into hard/report-only layers.
 
+    Malformed rolling evidence stays fail-closed and insufficient history
+    keeps the ``insufficient_evidence`` state; a completed stability verdict
+    that did not pass is a report-only effect-layer observation, never a
+    veto (wide-in, strict-out).
+    """
 
-def _external_rolling_gate(metrics: dict[str, Any]) -> tuple[str | None, list[str]]:
     rolling = metrics.get("rolling_walk_forward")
     if rolling is None:
-        return None, []
-    if not isinstance(rolling, dict):
-        return "failed", ["rolling walk-forward evidence is malformed"]
+        return None, [], []
+    if not isinstance(rolling, dict) or rolling.get("status") not in {
+        "insufficient_evidence",
+        "completed",
+    }:
+        return "failed", ["rolling walk-forward evidence is malformed"], []
     if rolling.get("status") == "insufficient_evidence":
-        return EXTERNAL_GATE_INSUFFICIENT, [
-            *[str(item) for item in rolling.get("reasons") or []],
-            "rolling walk-forward evidence is insufficient",
-        ]
-    if rolling.get("status") != "completed" or rolling.get("passed") is not True:
-        return "failed", [
-            *[str(item) for item in rolling.get("reasons") or []],
-            "rolling walk-forward stability gate did not pass",
-        ]
-    return None, []
+        return (
+            EXTERNAL_GATE_INSUFFICIENT,
+            [
+                *[str(item) for item in rolling.get("reasons") or []],
+                "rolling walk-forward evidence is insufficient",
+            ],
+            [],
+        )
+    if rolling.get("passed") is not True:
+        return (
+            None,
+            [],
+            [
+                *[str(item) for item in rolling.get("reasons") or []],
+                "rolling walk-forward stability verdict did not pass (report-only)",
+            ],
+        )
+    return None, [], []
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +362,13 @@ class ExternalEventGatePolicy:
     is gated on the number of independent event days (effective decisions)
     instead of daily universe coverage; when that count is too low the gate
     reports "insufficient_evidence" rather than relaxing thresholds.
+
+    Wide-in, strict-out recalibration: only structural evidence checks veto
+    admission — complete finite metrics, the independent event-day floor,
+    redundancy versus the existing library and well-formed rolling
+    walk-forward evidence.  Effect direction/magnitude, turnover, cost and
+    HAC/BH significance are still computed and archived as the report-only
+    effect layer; the forward paper gate is the single life-or-death gate.
 
     候选参数：以下阈值均为保守默认值，需预注册评审后冻结，不作为已评审依据。
     """
@@ -371,8 +384,24 @@ class ExternalEventGatePolicy:
     min_event_days: int = 30
     max_bh_q_value: float = 0.10
 
-    def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
-        checks = (
+    def evaluate_layers(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        """Separate structural vetoes from report-only effect evidence.
+
+        Complete finite metrics, the independent event-day floor, library
+        redundancy and well-formed rolling walk-forward evidence are the
+        *hard* layer.  Effect direction/magnitude, turnover, cost and HAC/BH
+        significance are still computed and archived as the effect layer,
+        but they are report-only and never veto admission.
+        """
+
+        hard_checks = (
+            (
+                "max_correlation",
+                lambda value: abs(value) <= self.max_correlation,
+                f"|correlation| <= {self.max_correlation}",
+            ),
+        )
+        effect_checks = (
             ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
             (
                 "icir",
@@ -395,11 +424,6 @@ class ExternalEventGatePolicy:
                 f"turnover <= {self.max_turnover}",
             ),
             (
-                "max_correlation",
-                lambda value: abs(value) <= self.max_correlation,
-                f"|correlation| <= {self.max_correlation}",
-            ),
-            (
                 "cost_adjusted_return",
                 lambda value: value > self.min_cost_adjusted_return,
                 f"cost-adjusted return > {self.min_cost_adjusted_return}",
@@ -415,33 +439,87 @@ class ExternalEventGatePolicy:
                 f"BH-FDR q-value <= {self.max_bh_q_value}",
             ),
         )
-        reasons: list[str] = []
-        for name, predicate, expectation in checks:
+        hard_reasons: list[str] = []
+        effect_reasons: list[str] = []
+        required_numeric = {
+            name for name, _, _ in (*hard_checks, *effect_checks)
+        } | {"raw_valid_ic", "raw_selection_ic", "selection_days"}
+        for name in sorted(required_numeric):
             value = metrics.get(name)
             if value is None:
-                reasons.append(f"{name} is missing; expected {expectation}")
-            elif not predicate(float(value)):
-                reasons.append(f"{name}={value:g} failed; expected {expectation}")
-        reasons.extend(_shared_sign_check_reasons(metrics))
-        selection_days = metrics.get("selection_days")
-        if selection_days is None:
-            reasons.append(
-                "selection_days is missing; expected "
-                f"independent event days >= {self.min_event_days}"
-            )
-        elif float(selection_days) < self.min_event_days:
-            return (
-                EXTERNAL_GATE_INSUFFICIENT,
-                [
-                    f"independent event days={selection_days:g} below {self.min_event_days}; "
-                    "evidence is insufficient and gate thresholds were not relaxed",
-                    *reasons,
-                ],
-            )
-        rolling_status, rolling_reasons = _external_rolling_gate(metrics)
+                hard_reasons.append(f"{name} is missing from the independent evaluation")
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                hard_reasons.append(f"{name} is not numeric")
+                continue
+            if not math.isfinite(numeric):
+                hard_reasons.append(f"{name} is not finite")
+        invalid_names = {
+            reason.split(" ", 1)[0] for reason in hard_reasons
+        }
+        for name, predicate, expectation in hard_checks:
+            if name in invalid_names:
+                continue
+            value = float(metrics[name])
+            if not predicate(value):
+                hard_reasons.append(f"{name}={value:g} failed; expected {expectation}")
+        for name, predicate, expectation in effect_checks:
+            if name in invalid_names:
+                continue
+            value = float(metrics[name])
+            if not predicate(value):
+                effect_reasons.append(f"{name}={value:g} failed; expected {expectation}")
+        raw_valid_ic = metrics.get("raw_valid_ic")
+        raw_selection_ic = metrics.get("raw_selection_ic")
+        ic = metrics.get("ic")
+        rank_ic = metrics.get("rank_ic")
+        if not ({"raw_valid_ic", "raw_selection_ic"} & invalid_names):
+            if float(raw_valid_ic) * float(raw_selection_ic) <= 0:
+                effect_reasons.append("raw direction and selection IC must have the same sign")
+        if not ({"ic", "rank_ic"} & invalid_names):
+            if float(ic) * float(rank_ic) <= 0:
+                effect_reasons.append("IC and RankIC must have the same direction")
+        rolling_status, rolling_hard, rolling_effect = _external_rolling_gate(metrics)
+        effect_reasons.extend(rolling_effect)
+        effect_status = "passed" if not effect_reasons else "failed"
         if rolling_status == EXTERNAL_GATE_INSUFFICIENT:
-            return rolling_status, [*rolling_reasons, *reasons]
-        reasons.extend(rolling_reasons)
+            return {
+                "hard_status": EXTERNAL_GATE_INSUFFICIENT,
+                "hard_reasons": [*rolling_hard, *hard_reasons],
+                "effect_status": effect_status,
+                "effect_reasons": effect_reasons,
+            }
+        hard_reasons.extend(rolling_hard)
+        if "selection_days" not in invalid_names and (
+            float(metrics["selection_days"]) < self.min_event_days
+        ):
+            return {
+                "hard_status": EXTERNAL_GATE_INSUFFICIENT,
+                "hard_reasons": [
+                    f"independent event days={float(metrics['selection_days']):g} "
+                    f"below {self.min_event_days}; "
+                    "evidence is insufficient and gate thresholds were not relaxed",
+                    *hard_reasons,
+                ],
+                "effect_status": effect_status,
+                "effect_reasons": effect_reasons,
+            }
+        return {
+            "hard_status": "passed" if not hard_reasons else "failed",
+            "hard_reasons": hard_reasons,
+            "effect_status": effect_status,
+            "effect_reasons": effect_reasons,
+        }
+
+    def evaluate(self, metrics: dict[str, Any]) -> tuple[str, list[str]]:
+        # Wide-in, strict-out: only the structural hard layer vetoes.
+        # Effect/significance layers are archived report-only.
+        layers = self.evaluate_layers(metrics)
+        if layers["hard_status"] == EXTERNAL_GATE_INSUFFICIENT:
+            return EXTERNAL_GATE_INSUFFICIENT, list(layers["hard_reasons"])
+        reasons = list(layers["hard_reasons"])
         return ("passed" if not reasons else "failed", reasons)
 
 
@@ -454,6 +532,13 @@ class MarketTimeseriesGatePolicy:
     forward returns and gated on the number of independent signal days (design
     draft 4.3 effective decisions), never on cross-sectional coverage.
 
+    Wide-in, strict-out recalibration: only structural evidence checks veto
+    admission — complete finite metrics, the independent signal-day floor and
+    well-formed rolling walk-forward evidence.  Effect direction/magnitude,
+    turnover, cost and HAC/BH significance are still computed and archived as
+    the report-only effect layer; the forward paper gate is the single
+    life-or-death gate.
+
     候选参数：以下阈值均为保守默认值，需预注册评审后冻结，不作为已评审依据。
     """
 
@@ -465,8 +550,17 @@ class MarketTimeseriesGatePolicy:
     min_signal_days: int = 60
     max_bh_q_value: float = 0.10
 
-    def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
-        checks = (
+    def evaluate_layers(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        """Separate structural vetoes from report-only effect evidence.
+
+        Complete finite metrics, the independent signal-day floor and
+        well-formed rolling walk-forward evidence are the *hard* layer.
+        Effect direction/magnitude, turnover, cost and HAC/BH significance
+        are still computed and archived as the effect layer, but they are
+        report-only and never veto admission.
+        """
+
+        effect_checks = (
             ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
             (
                 "rank_ic",
@@ -494,33 +588,83 @@ class MarketTimeseriesGatePolicy:
                 f"BH-FDR q-value <= {self.max_bh_q_value}",
             ),
         )
-        reasons: list[str] = []
-        for name, predicate, expectation in checks:
+        hard_reasons: list[str] = []
+        effect_reasons: list[str] = []
+        required_numeric = {name for name, _, _ in effect_checks} | {
+            "raw_valid_ic",
+            "raw_selection_ic",
+            "selection_days",
+        }
+        for name in sorted(required_numeric):
             value = metrics.get(name)
             if value is None:
-                reasons.append(f"{name} is missing; expected {expectation}")
-            elif not predicate(float(value)):
-                reasons.append(f"{name}={value:g} failed; expected {expectation}")
-        reasons.extend(_shared_sign_check_reasons(metrics))
-        selection_days = metrics.get("selection_days")
-        if selection_days is None:
-            reasons.append(
-                "selection_days is missing; expected "
-                f"independent signal days >= {self.min_signal_days}"
-            )
-        elif float(selection_days) < self.min_signal_days:
-            return (
-                EXTERNAL_GATE_INSUFFICIENT,
-                [
-                    f"independent signal days={selection_days:g} below {self.min_signal_days}; "
-                    "evidence is insufficient and gate thresholds were not relaxed",
-                    *reasons,
-                ],
-            )
-        rolling_status, rolling_reasons = _external_rolling_gate(metrics)
+                hard_reasons.append(f"{name} is missing from the independent evaluation")
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                hard_reasons.append(f"{name} is not numeric")
+                continue
+            if not math.isfinite(numeric):
+                hard_reasons.append(f"{name} is not finite")
+        invalid_names = {
+            reason.split(" ", 1)[0] for reason in hard_reasons
+        }
+        for name, predicate, expectation in effect_checks:
+            if name in invalid_names:
+                continue
+            value = float(metrics[name])
+            if not predicate(value):
+                effect_reasons.append(f"{name}={value:g} failed; expected {expectation}")
+        raw_valid_ic = metrics.get("raw_valid_ic")
+        raw_selection_ic = metrics.get("raw_selection_ic")
+        ic = metrics.get("ic")
+        rank_ic = metrics.get("rank_ic")
+        if not ({"raw_valid_ic", "raw_selection_ic"} & invalid_names):
+            if float(raw_valid_ic) * float(raw_selection_ic) <= 0:
+                effect_reasons.append("raw direction and selection IC must have the same sign")
+        if not ({"ic", "rank_ic"} & invalid_names):
+            if float(ic) * float(rank_ic) <= 0:
+                effect_reasons.append("IC and RankIC must have the same direction")
+        rolling_status, rolling_hard, rolling_effect = _external_rolling_gate(metrics)
+        effect_reasons.extend(rolling_effect)
+        effect_status = "passed" if not effect_reasons else "failed"
         if rolling_status == EXTERNAL_GATE_INSUFFICIENT:
-            return rolling_status, [*rolling_reasons, *reasons]
-        reasons.extend(rolling_reasons)
+            return {
+                "hard_status": EXTERNAL_GATE_INSUFFICIENT,
+                "hard_reasons": [*rolling_hard, *hard_reasons],
+                "effect_status": effect_status,
+                "effect_reasons": effect_reasons,
+            }
+        hard_reasons.extend(rolling_hard)
+        if "selection_days" not in invalid_names and (
+            float(metrics["selection_days"]) < self.min_signal_days
+        ):
+            return {
+                "hard_status": EXTERNAL_GATE_INSUFFICIENT,
+                "hard_reasons": [
+                    f"independent signal days={float(metrics['selection_days']):g} "
+                    f"below {self.min_signal_days}; "
+                    "evidence is insufficient and gate thresholds were not relaxed",
+                    *hard_reasons,
+                ],
+                "effect_status": effect_status,
+                "effect_reasons": effect_reasons,
+            }
+        return {
+            "hard_status": "passed" if not hard_reasons else "failed",
+            "hard_reasons": hard_reasons,
+            "effect_status": effect_status,
+            "effect_reasons": effect_reasons,
+        }
+
+    def evaluate(self, metrics: dict[str, Any]) -> tuple[str, list[str]]:
+        # Wide-in, strict-out: only the structural hard layer vetoes.
+        # Effect/significance layers are archived report-only.
+        layers = self.evaluate_layers(metrics)
+        if layers["hard_status"] == EXTERNAL_GATE_INSUFFICIENT:
+            return EXTERNAL_GATE_INSUFFICIENT, list(layers["hard_reasons"])
+        reasons = list(layers["hard_reasons"])
         return ("passed" if not reasons else "failed", reasons)
 
 
@@ -1358,7 +1502,10 @@ class ResearchStore:
         evidence instead of a factor-recompute proof. Gate outcomes advance the
         candidate through the same state machine, plus the explicit
         ``insufficient_evidence`` state when independent events/signal days are
-        too few (fail-closed, thresholds are not relaxed).
+        too few (fail-closed, thresholds are not relaxed).  Wide-in,
+        strict-out: only the structural hard layer advances or vetoes; effect
+        and significance layers are archived on the event as report-only
+        evidence.
         """
 
         if not (train_start <= train_end < valid_start <= valid_end < test_start <= test_end):
@@ -1441,12 +1588,14 @@ class ResearchStore:
         if not _is_sha256(str(external_evidence.get("input_data_sha256") or "")):
             raise ValueError("external evaluation evidence is not bound to the price input")
         metrics = dict(metrics) if metrics is not None else None
+        gate_layers: dict[str, Any] | None = None
         if metrics is None:
             gate_status = EXTERNAL_GATE_INSUFFICIENT
             reasons = [str(reason) for reason in (insufficient_reasons or []) if str(reason)]
             if not reasons:
                 raise ValueError("insufficient-evidence evaluations require explicit reasons")
         else:
+            gate_layers = policy.evaluate_layers(metrics)
             gate_status, reasons = policy.evaluate(metrics)
         if gate_status == "passed" and not artifact_path:
             raise ValueError("passed external evaluation requires a durable result artifact")
@@ -1560,6 +1709,10 @@ class ResearchStore:
                     "reasons": reasons,
                     "evidence_sha256": evidence_sha256,
                     "evaluation_shape": evaluation_shape,
+                    "hard_gate_status": (gate_layers or {}).get("hard_status"),
+                    "effect_gate_status": (gate_layers or {}).get("effect_status"),
+                    "effect_gate_reasons": (gate_layers or {}).get("effect_reasons") or [],
+                    "statistical_evidence_role": "report_only",
                 },
             )
         return self.get_evaluation(evaluation_id)

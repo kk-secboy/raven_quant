@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -27,6 +28,7 @@ from quant_platform.data_automation import (
     normalize_data_automation_config,
 )
 from quant_platform.job_store import research_asset_acquisition_idempotency_key
+from quant_platform.model_research_governance import file_sha256
 from quant_platform.research_tournament import (
     FEATURE_SET_COMMON_WINDOW_POLICY,
     FULL_PROFILES,
@@ -1150,3 +1152,419 @@ def test_model_tournament_closes_when_all_cross_family_pairs_are_too_correlated(
         "no_admissible_combinations"
     )
     assert controller.store.stage == "joint_optimization"
+
+
+# ---------------------------------------------------------------------------
+# Wide-in, strict-out: tournament Holm/PBO verdicts archive report-only and
+# never block champion selection.
+# ---------------------------------------------------------------------------
+
+
+def _weak_portfolio_report(tmp_path, name: str, *, seed: int) -> tuple[str, str]:
+    """One statistically insignificant portfolio report (negative mean net)."""
+    rng = np.random.default_rng(seed)
+    report = pd.DataFrame(
+        {
+            "return": rng.standard_normal(120) * 0.0001 - 0.001,
+            "bench": np.zeros(120),
+            "cost": np.zeros(120),
+        },
+        index=pd.date_range("2025-01-01", periods=120),
+    )
+    path = tmp_path / name
+    report.to_parquet(path)
+    return str(path), file_sha256(path)
+
+
+class _RecordingTournaments:
+    def __init__(self, tournament: dict) -> None:
+        self.tournament = tournament
+        self.blocked: list[str] = []
+        self.completed: dict | None = None
+
+    def get_for_cycle(self, _cycle_id):
+        return self.tournament
+
+    def get_tournament(self, _tournament_id):
+        return self.tournament
+
+    def get_trial(self, trial_id):
+        return next(
+            item for item in self.tournament["trials"] if item["id"] == trial_id
+        )
+
+    def block(self, tournament_id, *, reason):
+        self.blocked.append(reason)
+
+    def transition_trial(self, trial_id, status, **kwargs):
+        trial = self.get_trial(trial_id)
+        trial["status"] = status
+
+    def complete_selection(self, tournament_id, *, selected_trial_ids, multiple_testing):
+        self.completed = {
+            "tournament_id": tournament_id,
+            "selected_trial_ids": selected_trial_ids,
+            "multiple_testing": multiple_testing,
+        }
+
+
+class _RecordingCycleStore:
+    def __init__(self, cycle: dict) -> None:
+        self.cycle = cycle
+        self.stage = ""
+
+    def get_cycle(self, _cycle_id):
+        return self.cycle
+
+    def patch_cycle_state(self, _cycle_id, *, state_patch, stage=None):
+        self.cycle.setdefault("state", {}).update(state_patch)
+        if stage is not None:
+            self.stage = stage
+        return self.cycle
+
+
+def test_feature_screen_selects_by_score_when_no_trial_survives_holm(tmp_path) -> None:
+    dataset_identity = "d" * 64
+    ridge_report = _weak_portfolio_report(tmp_path, "screen-ridge.parquet", seed=31)
+    lgbm_report = _weak_portfolio_report(tmp_path, "screen-lgbm.parquet", seed=37)
+
+    def trial(
+        trial_id: str,
+        candidate_id: str,
+        feature_set_id: str,
+        score_return: float,
+        rank_ic: float,
+        report: tuple[str, str],
+    ) -> dict:
+        path, digest = report
+        return {
+            "id": trial_id,
+            "trial_kind": "model",
+            "status": "passed",
+            "candidate_id": candidate_id,
+            "feature_set_id": feature_set_id,
+            "spec": {"round": "feature_screen"},
+            "evidence": {
+                "contract_version": "model-feature-screen-v1",
+                "candidate_id": candidate_id,
+                "dataset_identity_sha256": dataset_identity,
+                "selection_profile": "recent_3y",
+                "selection_seed": 11,
+                "final_oos_opened": False,
+                "cells": [
+                    {
+                        "profile_id": "recent_3y",
+                        "seed": 11,
+                        "gate_status": "passed",
+                        "metrics": {
+                            "annualized_excess_return_with_cost": score_return,
+                            "rank_ic": rank_ic,
+                        },
+                        "portfolio_report_path": path,
+                        "portfolio_report_sha256": digest,
+                    }
+                ],
+            },
+        }
+
+    tournament = {
+        "id": "tournament-screen",
+        "dataset_identity_sha256": dataset_identity,
+        "status": "running",
+        "trials": [
+            trial("trial-ridge", "ridge-1", "qlib-alpha158", 0.05, 0.06, ridge_report),
+            trial("trial-lgbm", "lgbm-1", "qlib-alpha360", 0.03, 0.04, lgbm_report),
+        ],
+    }
+    cycle = {"id": "cycle-screen", "state": {}}
+    tournaments = _RecordingTournaments(tournament)
+    store = _RecordingCycleStore(cycle)
+
+    class PlatformModels:
+        class candidates:
+            invalidated: list[str] = []
+
+            @staticmethod
+            def transition_candidate(kind, candidate_id, **kwargs):
+                PlatformModels.candidates.invalidated.append(candidate_id)
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.store = store
+    controller.tournaments = tournaments
+    controller.platform_models = PlatformModels()
+    controller.settings = SimpleNamespace(data_root=tmp_path)
+
+    selected = controller._screen_selected_feature_sets(cycle, tournament)
+
+    # No trial survives Holm/PBO on insignificant reports, yet the screen still
+    # ranks by the frozen score order instead of blocking the tournament.
+    assert tournaments.blocked == []
+    assert selected == ["qlib-alpha158", "qlib-alpha360"]
+    assert store.stage == "model_full"
+    assert cycle["state"]["screen_selected_feature_set_ids"] == selected
+    evidence = cycle["state"]["feature_screen_evidence"]
+    assert evidence["statistical_evidence_role"] == "report_only"
+    multiple = evidence["multiple_testing"]
+    assert multiple["gate_passed"] is False
+    assert multiple["eligible_trial_names"] == []
+    assert multiple["statistical_evidence_role"] == "report_only"
+
+
+def test_model_champions_freeze_by_score_when_no_trial_survives_holm(tmp_path) -> None:
+    report_path, report_sha = _weak_portfolio_report(tmp_path, "full-weak.parquet", seed=41)
+
+    def admission(candidate_id: str) -> dict:
+        return {
+            "candidate_id": candidate_id,
+            "profiles": {
+                profile_id: {
+                    "seeds": {
+                        str(seed): {
+                            "portfolio_report_path": report_path,
+                            "portfolio_report_sha256": report_sha,
+                        }
+                        for seed in FULL_SEEDS
+                    }
+                }
+                for profile_id in FULL_PROFILES
+            },
+        }
+
+    def candidate_record(candidate_id: str) -> dict:
+        adm = admission(candidate_id)
+        return {
+            "admission_evidence_json": adm,
+            "admission_evidence_sha256": canonical_sha256(adm),
+        }
+
+    def candidate_evidence(candidate_id: str, value: float, sha: str) -> dict:
+        return {
+            "candidate_status": "research_admitted",
+            "cells": [
+                {
+                    "profile_id": profile_id,
+                    "seed": seed,
+                    "gate_status": "passed",
+                    "metrics": {
+                        "annualized_excess_return_with_cost": value,
+                        "information_ratio": value * 5,
+                        "rank_ic": value / 2,
+                        "average_turnover": 0.10,
+                        "max_drawdown": -0.12,
+                    },
+                }
+                for profile_id in FULL_PROFILES
+                for seed in FULL_SEEDS
+            ],
+            "evidence_sha256": sha,
+            "candidate_manifest_sha256": "m" * 64,
+            "admission_evidence_sha256": candidate_record(candidate_id)[
+                "admission_evidence_sha256"
+            ],
+        }
+
+    tournament = {
+        "id": "tournament-full",
+        "dataset_identity_sha256": "d" * 64,
+        "status": "running",
+        "trials": [
+            {
+                "id": "trial-ridge",
+                "trial_kind": "model",
+                "status": "passed",
+                "candidate_id": "ridge-1",
+                "feature_set_id": "qlib-alpha158",
+                "model_family": "ridge",
+                "spec": {"round": "model_full"},
+            },
+            {
+                "id": "trial-lgbm",
+                "trial_kind": "model",
+                "status": "passed",
+                "candidate_id": "lgbm-1",
+                "feature_set_id": "qlib-alpha158",
+                "model_family": "lightgbm",
+                "spec": {"round": "model_full"},
+            },
+        ],
+    }
+    cycle = {
+        "id": "cycle-full",
+        "state": {},
+        "branches": [
+            {
+                "scenario": "fin_model",
+                "scope_key": "platform:model_full:qlib-alpha158",
+                "status": "succeeded",
+                "details": {
+                    "branch_kind": "platform_model_model_full",
+                    "tournament_id": "tournament-full",
+                    "feature_set_id": "qlib-alpha158",
+                },
+            }
+        ],
+    }
+    tournaments = _RecordingTournaments(tournament)
+    store = _RecordingCycleStore(cycle)
+
+    class PlatformModels:
+        class candidates:
+            @staticmethod
+            def get_model_candidate(candidate_id, verify=True):
+                return candidate_record(candidate_id)
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.store = store
+    controller.tournaments = tournaments
+    controller.platform_models = PlatformModels()
+    controller.settings = SimpleNamespace(data_root=tmp_path)
+    evidences = {
+        "ridge-1": candidate_evidence("ridge-1", 0.12, "a" * 64),
+        "lgbm-1": candidate_evidence("lgbm-1", 0.10, "b" * 64),
+    }
+    controller._candidate_tournament_evidence = lambda candidate_id: evidences[candidate_id]
+
+    champions = controller._model_champions(cycle, tournament, ["qlib-alpha158"])
+
+    assert tournaments.blocked == []
+    assert [item["candidate_id"] for item in champions] == ["ridge-1", "lgbm-1"]
+    assert store.stage == "ensemble"
+    selection = cycle["state"]["model_champion_evidence"]
+    assert selection["statistical_evidence_role"] == "report_only"
+    multiple = selection["multiple_testing"]
+    assert multiple["gate_passed"] is False
+    assert multiple["eligible_trial_names"] == []
+    assert multiple["statistical_evidence_role"] == "report_only"
+
+
+def test_finalist_selection_completes_when_holm_finds_no_eligible(tmp_path) -> None:
+    trial_names = ["model-full:trial-ridge", "model-full:trial-gru"]
+    rng = np.random.default_rng(17)
+    returns_path = tmp_path / "model-returns.parquet"
+    pd.DataFrame(
+        {
+            trial_names[0]: rng.standard_normal(120) * 0.0001 - 0.001,
+            trial_names[1]: rng.standard_normal(120) * 0.0001 - 0.0012,
+        },
+        index=pd.date_range("2025-01-01", periods=120),
+    ).to_parquet(returns_path)
+    returns = pd.read_parquet(returns_path)
+    definitions = [
+        {
+            "name": trial_names[0],
+            "candidate_id": "ridge-1",
+            "trial_id": "trial-ridge",
+            "kind": "model",
+        },
+        {
+            "name": trial_names[1],
+            "candidate_id": "gru-1",
+            "trial_id": "trial-gru",
+            "kind": "model",
+        },
+    ]
+    model_multiple = _profile_family_multiple_testing(
+        research_run_id="tournament:tournament-weak:model_full",
+        trial_series_by_profile={
+            profile_id: [
+                (definitions[0], returns[trial_names[0]]),
+                (definitions[1], returns[trial_names[1]]),
+            ]
+            for profile_id in FULL_PROFILES
+        },
+        family_definitions=definitions,
+        output=tmp_path / "model-multiple",
+        contract_version="model-full-multiple-testing-v2",
+    )
+    # The weak grid produces no statistically eligible finalist.
+    assert model_multiple["gate_passed"] is False
+    assert model_multiple["statistical_evidence_role"] == "report_only"
+    model_selection = {
+        "contract_version": "model-family-champions-v2",
+        "dataset_identity_sha256": "d" * 64,
+        "champions": [],
+        "multiple_testing": model_multiple,
+        "multiple_testing_evidence_sha256": model_multiple["evidence_sha256"],
+    }
+    model_selection["evidence_sha256"] = canonical_sha256(model_selection)
+    cycle = {
+        "id": "cycle-weak",
+        "state": {"model_champion_evidence": model_selection},
+    }
+
+    class Ensembles:
+        @staticmethod
+        def ensure_candidates(**_kwargs):
+            return {
+                "status": "no_admissible_combinations",
+                "candidate_count": 0,
+                "candidates": [],
+                "pairwise_correlation_evidence": [],
+            }
+
+    tournament = {
+        "id": "tournament-weak",
+        "status": "running",
+        "trials": [
+            {
+                "id": "trial-ridge",
+                "trial_kind": "model",
+                "candidate_id": "ridge-1",
+                "status": "selected",
+            },
+            {
+                "id": "trial-gru",
+                "trial_kind": "model",
+                "candidate_id": "gru-1",
+                "status": "selected",
+            },
+        ],
+    }
+    tournaments = _RecordingTournaments(tournament)
+    store = _RecordingCycleStore(cycle)
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.store = store
+    controller.model_ensembles = Ensembles()
+    controller.tournaments = tournaments
+    controller.settings = SimpleNamespace(data_root=tmp_path)
+    champions = [
+        {
+            "trial_id": "trial-ridge",
+            "candidate_id": "ridge-1",
+            "model_family": "ridge",
+            "feature_set_id": "qlib-alpha158",
+            "score": [0.12, 0.03],
+            "evidence_sha256": "a" * 64,
+            "trial_name": trial_names[0],
+        },
+        {
+            "trial_id": "trial-gru",
+            "candidate_id": "gru-1",
+            "model_family": "gru",
+            "feature_set_id": "qlib-alpha360",
+            "score": [0.10, 0.04],
+            "evidence_sha256": "b" * 64,
+            "trial_name": trial_names[1],
+        },
+    ]
+
+    created, failed = controller._reconcile_model_ensembles(
+        cycle,
+        {
+            "name": "snapshot-v1",
+            "provenance": {"dataset_identity_sha256": "d" * 64},
+        },
+        {"id": "tournament-weak", "status": "running"},
+        champions,
+    )
+
+    assert (created, failed) == (0, 0)
+    assert tournaments.blocked == []
+    assert tournaments.completed is not None
+    assert cycle["state"]["prediction_champion"]["candidate_id"] == "ridge-1"
+    selection = cycle["state"]["prediction_champion_evidence"]
+    assert selection["statistical_evidence_role"] == "report_only"
+    final_multiple = selection["global_multiple_testing"]
+    assert final_multiple["gate_passed"] is False
+    assert final_multiple["eligible_trial_names"] == []
+    assert final_multiple["statistical_evidence_role"] == "report_only"

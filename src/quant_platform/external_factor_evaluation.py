@@ -24,7 +24,10 @@ Two shapes are recognized, everything else fails closed:
 Gate outcomes are recorded through
 :meth:`quant_platform.research_store.ResearchStore.record_external_evaluation`;
 multiple-testing correction reuses ``benjamini_hochberg`` exactly like
-``scripts/evaluate_factor_batch.py``.
+``scripts/evaluate_factor_batch.py``.  Wide-in, strict-out: the gates veto only
+on structural evidence (complete finite metrics, the independent-day floors,
+library redundancy, well-formed rolling evidence); effect and HAC/BH
+significance layers are archived report-only and never veto admission.
 """
 
 from __future__ import annotations

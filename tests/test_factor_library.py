@@ -190,10 +190,10 @@ def test_incremental_evidence_rejects_linear_proxy_and_point_estimates() -> None
     with pytest.raises(ValueError, match="linear score proxy"):
         validate_incremental_evidence(evidence)
 
+    # Malformed/missing statistical evidence still fails closed; only the
+    # significance *thresholds* moved to report-only.
     evidence = _incremental_evidence()
-    evidence["profiles"]["recent_3y"]["paired_cost_return_bootstrap"][
-        "confidence_interval_95"
-    ] = [-0.001, 0.02]
+    evidence["profiles"]["recent_3y"]["paired_cost_return_bootstrap"]["status"] = "failed"
     with pytest.raises(ValueError, match="block bootstrap"):
         validate_incremental_evidence(evidence)
 
@@ -201,6 +201,27 @@ def test_incremental_evidence_rejects_linear_proxy_and_point_estimates() -> None
     evidence["window_role_policy"]["nested_windows_count_as_independent"] = True
     with pytest.raises(ValueError, match="must not be counted as independent"):
         validate_incremental_evidence(evidence)
+
+
+def test_incremental_evidence_archives_insignificant_statistics_without_veto() -> None:
+    # Wide-in, strict-out: q-values above 0.10, an insignificant paired HAC
+    # test and a bootstrap interval crossing zero are sealed report-only and
+    # no longer veto the increment.
+    evidence = _incremental_evidence()
+    evidence["multiplicity"]["rank_ic_q_value"] = 0.50
+    evidence["multiplicity"]["cost_return_q_value"] = 0.60
+    evidence["multiplicity"]["statistical_evidence_role"] = "report_only"
+    evidence["profiles"]["recent_3y"]["paired_rank_ic_hac"] = {
+        "status": "ok",
+        "mean": 0.01,
+        "p_value": 0.40,
+    }
+    evidence["profiles"]["recent_3y"]["paired_cost_return_bootstrap"] = {
+        "status": "ok",
+        "confidence_interval_95": [-0.001, 0.02],
+        "one_sided_p_value": 0.30,
+    }
+    validate_incremental_evidence(evidence)
 
 
 def test_explicit_weighting_blocks_an_infeasible_family_mix() -> None:

@@ -479,7 +479,9 @@ def test_sparse_event_gate_reports_insufficient_below_event_floor() -> None:
 
 
 @pytest.mark.no_database
-def test_sparse_event_gate_fails_on_weak_signal_without_relaxing() -> None:
+def test_sparse_event_gate_admits_weak_signal_with_report_only_effect() -> None:
+    # Wide-in, strict-out: a well-formed but statistically weak sparse event
+    # factor is admitted; effect/significance failures are archived report-only.
     factor, label = _sparse_event_inputs(event_days=40, effect=0.0)
     outcome = ext.evaluate_sparse_event_factor(
         factor,
@@ -492,8 +494,30 @@ def test_sparse_event_gate_fails_on_weak_signal_without_relaxing() -> None:
     assert outcome["status"] == "ok"
     entry = _event_entry("candidate-1", outcome["metrics"])
     gate_status, reasons = ExternalEventGatePolicy().evaluate(entry["metrics"])
+    assert gate_status == "passed", reasons
+    layers = ExternalEventGatePolicy().evaluate_layers(entry["metrics"])
+    assert layers["hard_status"] == "passed"
+    assert layers["effect_status"] == "failed"
+    assert layers["effect_reasons"]
+
+
+@pytest.mark.no_database
+def test_sparse_event_gate_keeps_redundancy_a_hard_veto() -> None:
+    factor, label = _sparse_event_inputs(event_days=40)
+    outcome = ext.evaluate_sparse_event_factor(
+        factor,
+        label,
+        valid_start=PERIODS["valid_start"],
+        valid_end=PERIODS["valid_end"],
+        test_start=PERIODS["test_start"],
+        test_end=PERIODS["test_end"],
+    )
+    assert outcome["status"] == "ok"
+    metrics = dict(outcome["metrics"])
+    metrics["max_correlation"] = 0.95
+    gate_status, reasons = ExternalEventGatePolicy().evaluate(metrics)
     assert gate_status == "failed"
-    assert reasons
+    assert any("max_correlation" in reason for reason in reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +581,29 @@ def test_market_timeseries_gate_reports_insufficient_below_signal_floor() -> Non
     gate_status, reasons = MarketTimeseriesGatePolicy().evaluate(entry["metrics"])
     assert gate_status == "insufficient_evidence"
     assert any("signal days=47" in reason for reason in reasons)
+
+
+@pytest.mark.no_database
+def test_market_timeseries_gate_admits_weak_signal_with_report_only_effect() -> None:
+    # Wide-in, strict-out: a statistically weak MARKET timeseries signal with
+    # enough independent signal days is admitted; effect failures archive.
+    factor, label = _market_inputs(effect=0.0)
+    outcome = ext.evaluate_market_timeseries_factor(
+        factor,
+        label,
+        valid_start=PERIODS["valid_start"],
+        valid_end=PERIODS["valid_end"],
+        test_start=PERIODS["test_start"],
+        test_end=PERIODS["test_end"],
+    )
+    assert outcome["status"] == "ok"
+    entry = _event_entry("candidate-1", outcome["metrics"])
+    gate_status, reasons = MarketTimeseriesGatePolicy().evaluate(entry["metrics"])
+    assert gate_status == "passed", reasons
+    layers = MarketTimeseriesGatePolicy().evaluate_layers(entry["metrics"])
+    assert layers["hard_status"] == "passed"
+    assert layers["effect_status"] == "failed"
+    assert layers["effect_reasons"]
 
 
 @pytest.mark.no_database
@@ -1011,10 +1058,11 @@ def test_import_external_evaluation_persists_non_finite_metrics_as_audited_null(
 
     assert len(imported) == 1
     evaluation = imported[0]
-    # The raw NaN participates in the gate and therefore fails; persistence
-    # does not reinterpret it as a passing zero or an originally absent value.
+    # The raw NaN is incomplete evidence and fails the structural hard gate;
+    # persistence does not reinterpret it as a passing zero or an originally
+    # absent value.
     assert evaluation["gate_status"] == "failed"
-    assert any("turnover=nan failed" in reason for reason in evaluation["gate_reasons"])
+    assert any("turnover is not finite" in reason for reason in evaluation["gate_reasons"])
     assert evaluation["turnover"] is None
     assert evaluation["metrics"]["turnover"] is None
     normalization = evaluation["metrics"]["_quantlab_json_normalization"]

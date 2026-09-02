@@ -724,6 +724,9 @@ def main() -> None:
                 "hypothesis_count": hypothesis_count,
                 "rank_ic_q_value": float(rank_q),
                 "cost_return_q_value": float(return_q),
+                # Wide-in, strict-out: adjusted significance is sealed for the
+                # archive; it never vetoes the increment.
+                "statistical_evidence_role": "report_only",
             },
             "profiles": attempt["profiles"],
         }

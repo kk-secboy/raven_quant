@@ -263,7 +263,10 @@ def _profile_family_multiple_testing(
     and pretending they are independent observations would overstate sample
     size.  We instead compute each candidate's p-value and PBO inside each
     window, then apply Holm once across the complete candidate x window family.
-    A candidate is eligible only when all three governed windows survive.
+
+    Wide-in, strict-out: the resulting eligibility verdict is archived as a
+    report-only statistical health check.  It never blocks the tournament;
+    champions are ranked by the frozen score order regardless.
     """
 
     family_names = [str(item["name"]) for item in family_definitions]
@@ -374,6 +377,9 @@ def _profile_family_multiple_testing(
         "eligible_trial_names": eligible_trial_names,
         "failed_trials_count_as_p_one": True,
         "gate_passed": bool(eligible_trial_names),
+        # Wide-in, strict-out: the Holm/PBO verdict above is sealed as a
+        # report-only health check and never blocks champion selection.
+        "statistical_evidence_role": "report_only",
         "final_oos_opened": False,
     }
     evidence["evidence_sha256"] = canonical_sha256(evidence)
@@ -2580,8 +2586,9 @@ class AutopilotController:
             ),
             contract_version="model-full-multiple-testing-v2",
         )
-        if set(multiple["eligible_trial_names"]) != {str(item["name"]) for item in model_rows}:
-            raise ValueError("frozen champion did not pass every current-identity model gate")
+        # Wide-in, strict-out: the revalidation Holm/PBO verdict is sealed
+        # report-only inside the frozen evidence below; it never vetoes the
+        # fixed-recipe champion.
         model_evidence = {
             "contract_version": "model-family-champions-v2",
             "dataset_identity_sha256": str(tournament["dataset_identity_sha256"]),
@@ -2592,6 +2599,7 @@ class AutopilotController:
             "seed_cells_are_robustness_repeats": True,
             "window_cells_are_not_independent_votes": True,
             "failed_and_rejected_trials_retained": True,
+            "statistical_evidence_role": "report_only",
             "research_screening_only": True,
             "not_capital_confirmation": True,
             "final_oos_opened": False,
@@ -2638,8 +2646,8 @@ class AutopilotController:
             ),
             contract_version="prediction-finalist-multiple-testing-v2",
         )
-        if final_definition["name"] not in set(final_multiple["eligible_trial_names"]):
-            raise ValueError("current-identity prediction champion failed final gate")
+        # The finalist Holm/PBO family is archived report-only; it never
+        # blocks the revalidated champion from being frozen.
         selection = {
             "contract_version": "prediction-champion-selection-v1",
             "dataset_identity_sha256": str(tournament["dataset_identity_sha256"]),
@@ -2652,6 +2660,7 @@ class AutopilotController:
             "global_multiple_testing_evidence_sha256": final_multiple["evidence_sha256"],
             "models_and_ensembles_share_one_finalist_family": True,
             "fixed_prior_champion_current_identity_revalidation": True,
+            "statistical_evidence_role": "report_only",
             "research_screening_only": True,
             "not_capital_confirmation": True,
         }
@@ -3290,12 +3299,15 @@ class AutopilotController:
             ],
             "eligible_trial_names": eligible_trial_names,
             "gate_passed": bool(eligible_trial_names),
+            # Wide-in, strict-out: the Holm/PBO verdict is sealed report-only;
+            # it never filters the feature-screen ranking below.
+            "statistical_evidence_role": "report_only",
         }
         multiple["evidence_sha256"] = canonical_sha256(
             {key: value for key, value in multiple.items() if key != "evidence_sha256"}
         )
-        eligible = set(eligible_trial_names)
-        candidates = [item for item in candidates if item["trial_name"] in eligible]
+        # Statistical eligibility is archived, not applied: completed trials
+        # keep their fixed score order even when no trial survives Holm/PBO.
         best_by_feature: dict[str, dict[str, Any]] = {}
         for item in candidates:
             current = best_by_feature.get(item["feature_set_id"])
@@ -3313,8 +3325,8 @@ class AutopilotController:
             self.tournaments.block(
                 str(tournament["id"]),
                 reason=(
-                    "fewer than two feature sets passed the fixed-LightGBM "
-                    "independent screen"
+                    "fewer than two feature sets produced valid fixed-LightGBM "
+                    "screen evidence"
                 ),
             )
             return []
@@ -3346,6 +3358,7 @@ class AutopilotController:
             "failed_trials_retained": True,
             "other_profile_and_seed_cells_are_not_extra_votes": True,
             "all_preregistered_screen_trials_counted_in_holm_family": True,
+            "statistical_evidence_role": "report_only",
         }
         screen_evidence["evidence_sha256"] = canonical_sha256(screen_evidence)
         # Conditional full trials for losing feature sets remain explicit
@@ -3635,8 +3648,9 @@ class AutopilotController:
                 reason=f"full-model shared statistics failed closed: {exc}",
             )
             return []
-        eligible = set(multiple["eligible_trial_names"])
-        candidates = [item for item in candidates if item["trial_name"] in eligible]
+        # Wide-in, strict-out: the Holm/PBO eligibility list inside `multiple`
+        # is archived report-only; champions are ranked by the frozen score
+        # order among every candidate that produced immutable evidence.
         best_by_family: dict[str, dict[str, Any]] = {}
         for item in candidates:
             current = best_by_family.get(item["model_family"])
@@ -3653,7 +3667,7 @@ class AutopilotController:
         if not champions:
             self.tournaments.block(
                 str(tournament["id"]),
-                reason="no full-round model passed the independent three-window gate",
+                reason="no full-round model produced rankable admitted evidence",
             )
             return []
         for item in champions:
@@ -3671,6 +3685,7 @@ class AutopilotController:
             "seed_cells_are_robustness_repeats": True,
             "window_cells_are_not_independent_votes": True,
             "failed_and_rejected_trials_retained": True,
+            "statistical_evidence_role": "report_only",
         }
         evidence["evidence_sha256"] = canonical_sha256(evidence)
         self.store.patch_cycle_state(
@@ -4098,21 +4113,11 @@ class AutopilotController:
                 stage="ensemble_blocked",
             )
             return 0, 1
-        eligible = set(final_multiple["eligible_trial_names"])
-        pool = [item for item in pool if item["final_trial_name"] in eligible]
-        if not pool:
-            reason = "no model or ensemble passed the shared finalist Holm/PBO gate"
-            self.tournaments.block(str(tournament["id"]), reason=reason)
-            self.store.patch_cycle_state(
-                str(cycle["id"]),
-                state_patch={
-                    "model_ensemble_status": "blocked",
-                    "model_ensemble_blocker": reason,
-                    "prediction_finalist_multiple_testing": final_multiple,
-                },
-                stage="ensemble_blocked",
-            )
-            return 0, 1
+        # Wide-in, strict-out: the shared finalist Holm/PBO verdict is sealed
+        # inside the selection evidence as a report-only health check.  It
+        # never empties the pool or blocks the tournament; the prediction
+        # champion keeps the frozen score order even when no finalist is
+        # statistically eligible.
         winner = max(
             pool,
             key=lambda item: (
@@ -4158,6 +4163,7 @@ class AutopilotController:
             "models_and_ensembles_share_one_finalist_family": True,
             "selection_is_not_an_uncorrected_additional_hypothesis_test": True,
             "failed_and_rejected_trials_retained": True,
+            "statistical_evidence_role": "report_only",
             "selected_trial_ids": selected_trial_ids,
         }
         selection_evidence["evidence_sha256"] = canonical_sha256(selection_evidence)

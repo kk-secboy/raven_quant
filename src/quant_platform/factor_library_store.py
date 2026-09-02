@@ -129,6 +129,17 @@ def governed_economic_family(
 
 
 def validate_incremental_evidence(value: dict[str, Any]) -> None:
+    """Validate the sealed paired-ablation increment for one SOTA member.
+
+    Wide-in, strict-out: structural integrity (seals, window contract,
+    evaluation binding, no final-OOS exposure, per-profile hard gates, the
+    frozen-model improvement/non-degradation direction and the robust
+    crash-stress sentinel) remains fail-closed.  Statistical significance —
+    the adjusted BH q-values, the paired HAC p-value and the paired bootstrap
+    interval/p-value — must be present and well-formed so it archives
+    report-only, but it no longer vetoes admission; the forward paper gate is
+    the single life-or-death gate.
+    """
     if value.get("version") != INCREMENTAL_EVIDENCE_VERSION:
         raise ValueError("SOTA incremental evidence version is invalid")
     model = value.get("frozen_model")
@@ -179,8 +190,10 @@ def validate_incremental_evidence(value: dict[str, Any]) -> None:
         raise ValueError("SOTA incremental evidence lacks multiplicity governance")
     for name in ("rank_ic_q_value", "cost_return_q_value"):
         q_value = multiplicity.get(name)
-        if not isinstance(q_value, (int, float)) or not 0 <= float(q_value) <= 0.10:
-            raise ValueError(f"SOTA incremental {name} must pass the adjusted significance gate")
+        # Wide-in, strict-out: the adjusted significance q-values are sealed
+        # report-only; only their shape is validated here, never a threshold.
+        if not isinstance(q_value, (int, float)) or not 0 <= float(q_value) <= 1:
+            raise ValueError(f"SOTA incremental {name} must be an archived q-value in [0, 1]")
     profiles = value.get("profiles")
     if not isinstance(profiles, dict) or set(profiles) != {
         "recent_3y",
@@ -228,27 +241,35 @@ def validate_incremental_evidence(value: dict[str, Any]) -> None:
     ) <= 0:
         raise ValueError("recent SOTA RankIC and cost-adjusted return must both improve")
     rank_test = recent.get("paired_rank_ic_hac")
-    return_test = recent.get("paired_cost_return_bootstrap")
+    # The paired HAC significance verdict is archived report-only: structure
+    # and value ranges are validated, the 0.05 threshold is not enforced.
     if not (
         isinstance(rank_test, dict)
         and rank_test.get("status") == "ok"
-        and float(rank_test.get("mean") or 0.0) > 0
+        and isinstance(rank_test.get("mean"), (int, float))
+        and math.isfinite(float(rank_test["mean"]))
         and isinstance(rank_test.get("p_value"), (int, float))
-        and float(rank_test["p_value"]) <= 0.05
+        and 0 <= float(rank_test["p_value"]) <= 1
     ):
-        raise ValueError("recent RankIC increment is not significant under the paired HAC test")
+        raise ValueError("recent RankIC increment lacks an archived paired HAC test")
+    return_test = recent.get("paired_cost_return_bootstrap")
     interval = return_test.get("confidence_interval_95") if isinstance(return_test, dict) else None
+    # Same for the paired block bootstrap: the interval and one-sided p-value
+    # are sealed report-only, never a veto.
     if not (
         isinstance(return_test, dict)
         and return_test.get("status") == "ok"
         and isinstance(interval, list)
         and len(interval) == 2
-        and float(interval[0]) > 0
+        and all(
+            isinstance(bound, (int, float)) and math.isfinite(float(bound))
+            for bound in interval
+        )
         and isinstance(return_test.get("one_sided_p_value"), (int, float))
-        and float(return_test["one_sided_p_value"]) <= 0.05
+        and 0 <= float(return_test["one_sided_p_value"]) <= 1
     ):
         raise ValueError(
-            "recent cost-return increment is not significant under the paired block bootstrap"
+            "recent cost-return increment lacks an archived paired block bootstrap"
         )
     if float(balanced["delta_rank_ic"]) < 0 or float(
         balanced["delta_cost_adjusted_return"]
