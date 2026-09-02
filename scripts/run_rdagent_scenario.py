@@ -508,24 +508,13 @@ def run(args: argparse.Namespace) -> None:
             "status": (
                 "embedding_retrieval_configured"
                 if embeddings_configured
-                else "degraded_empty_retrieval"
+                else "unconfigured_fail_closed"
             ),
             "embedding_retrieval_configured": embeddings_configured,
             "retrieval_mode": (
-                "embedding_rag" if embeddings_configured else "typed_empty_knowledge"
+                "embedding_rag" if embeddings_configured else "unconfigured_fail_closed"
             ),
             "costeer_used": True,
-            "empty_knowledge_forced": (
-                not embeddings_configured
-                and args.scenario
-                in {
-                    "fin_factor",
-                    "fin_model",
-                    "fin_quant",
-                    "fin_factor_report",
-                    "fin_strategy",
-                }
-            ),
             "strategy_codegen_used": True if args.scenario == "fin_strategy" else None,
             "strategy_codegen_target": (
                 "allowlisted_rule_ir_and_contract_tests"

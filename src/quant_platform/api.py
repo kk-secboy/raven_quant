@@ -2058,6 +2058,9 @@ class LlmSettingsRequest(BaseModel):
     api_key: str = Field(min_length=8, max_length=1000)
     api_base: str = Field(default="", max_length=500)
     chat_model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=200)
+    embedding_api_key: str | None = Field(default=None, max_length=1000)
+    embedding_api_base: str = Field(default="", max_length=500)
+    embedding_model: str = Field(default="", max_length=200)
 
     @model_validator(mode="after")
     def validate_values(self) -> LlmSettingsRequest:
@@ -2067,6 +2070,14 @@ class LlmSettingsRequest(BaseModel):
             parsed = urlsplit(self.api_base)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("api_base must be an absolute HTTP(S) URL")
+        if self.embedding_api_key and any(
+            character.isspace() for character in self.embedding_api_key
+        ):
+            raise ValueError("embedding_api_key must not contain whitespace")
+        if self.embedding_api_base:
+            parsed = urlsplit(self.embedding_api_base)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("embedding_api_base must be an absolute HTTP(S) URL")
         return self
 
 
@@ -3346,6 +3357,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     (llm_record or {}).get("metadata_json", {}).get("chat_model")
                     or os.getenv("CHAT_MODEL", "gpt-4.1-mini")
                 ),
+                "embedding_configured": bool(
+                    (llm_record or {}).get("metadata_json", {}).get(
+                        "embedding_configured"
+                    )
+                ),
                 "updated_at": (llm_record or {}).get("updated_at"),
             },
             "alerts": {
@@ -3650,23 +3666,47 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/settings/llm")
     def update_llm_settings(payload: LlmSettingsRequest, request: Request) -> dict:
+        # Merge over the existing record so saving chat credentials never wipes
+        # the embedding configuration (and vice versa on later edits).
+        existing = runtime_secrets.get("llm") or {}
+        record = {
+            "api_key": payload.api_key,
+            "api_base": payload.api_base.strip().rstrip("/"),
+            "chat_model": payload.chat_model.strip(),
+        }
+        embedding_api_key = (payload.embedding_api_key or "").strip()
+        if embedding_api_key:
+            record["embedding_api_key"] = embedding_api_key
+        elif existing.get("embedding_api_key"):
+            record["embedding_api_key"] = str(existing["embedding_api_key"])
+        embedding_api_base = payload.embedding_api_base.strip().rstrip("/")
+        if embedding_api_base:
+            record["embedding_api_base"] = embedding_api_base
+        elif existing.get("embedding_api_base"):
+            record["embedding_api_base"] = str(existing["embedding_api_base"])
+        embedding_model = payload.embedding_model.strip()
+        if embedding_model:
+            record["embedding_model"] = embedding_model
+        elif existing.get("embedding_model"):
+            record["embedding_model"] = str(existing["embedding_model"])
         try:
             runtime_secrets.put(
                 "llm",
-                {
-                    "api_key": payload.api_key,
-                    "api_base": payload.api_base.strip().rstrip("/"),
-                    "chat_model": payload.chat_model.strip(),
-                },
+                record,
                 metadata={
-                    "api_base": payload.api_base.strip().rstrip("/"),
-                    "chat_model": payload.chat_model.strip(),
+                    "api_base": record["api_base"],
+                    "chat_model": record["chat_model"],
+                    "embedding_configured": bool(record.get("embedding_api_key")),
                 },
                 updated_by=request.state.user.get("id"),
             )
         except ValueError as exc:
             raise HTTPException(503, str(exc)) from exc
-        return {"status": "saved", "configured": True}
+        return {
+            "status": "saved",
+            "configured": True,
+            "embedding_configured": bool(record.get("embedding_api_key")),
+        }
 
     @app.post("/api/settings/alerts")
     def update_alert_webhook_settings(

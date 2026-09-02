@@ -23,11 +23,10 @@ def _costeer_knowledge_status(env: dict[str, str], *, module: str) -> dict[str, 
     strategy_compiler = module == "quant_platform.rdagent_strategy"
     return {
         "contract_version": "costeer-knowledge-status-v2",
-        "status": "embedding_retrieval_configured" if configured else "degraded_empty_retrieval",
+        "status": "embedding_retrieval_configured" if configured else "unconfigured_fail_closed",
         "embedding_retrieval_configured": configured,
-        "retrieval_mode": "embedding_rag" if configured else "typed_empty_knowledge",
+        "retrieval_mode": "embedding_rag" if configured else "unconfigured_fail_closed",
         "costeer_used": True,
-        "empty_knowledge_forced": not configured,
         "strategy_codegen_used": True if strategy_compiler else None,
         "strategy_codegen_target": (
             "allowlisted_rule_ir_and_contract_tests" if strategy_compiler else None
@@ -36,44 +35,27 @@ def _costeer_knowledge_status(env: dict[str, str], *, module: str) -> dict[str, 
     }
 
 
-def _disable_optional_costeer_embeddings() -> None:
-    """Keep CoSTEER coding active while replacing unavailable RAG retrieval."""
+def _route_embedding_calls() -> None:
+    """Send CoSTEER embedding calls to the configured embedding provider.
 
-    from rdagent.components.coder.CoSTEER import CoSTEER
-    from rdagent.components.coder.CoSTEER.knowledge_management import (
-        CoSTEERQueriedKnowledgeV2,
-        CoSTEERRAGStrategyV2,
-    )
+    Chat stays on the governed relay (OPENAI_API_BASE).  LiteLLM resolves
+    openai/* embedding models from that same global base, so the embedding
+    credentials arrive via EMBEDDING_OPENAI_* and are applied per call.
+    """
+    from rdagent.oai.backend import litellm as rdagent_litellm
 
-    original_init = CoSTEER.__init__
+    api_key = str(os.environ.get("EMBEDDING_OPENAI_API_KEY") or "").strip()
+    api_base = str(os.environ.get("EMBEDDING_OPENAI_API_BASE") or "").strip().rstrip("/")
+    original = rdagent_litellm.embedding
 
-    def governed_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        # RD-Agent's default multiprocessing coding strategy requires a
-        # CoSTEERQueriedKnowledge object even when no reusable knowledge exists.
-        # Supplying an empty, typed result preserves normal LLM code generation
-        # without calling a chat-only provider's nonexistent embedding endpoint.
-        kwargs["with_knowledge"] = True
-        kwargs["knowledge_self_gen"] = False
-        original_init(self, *args, **kwargs)
+    def routed(*args: Any, **kwargs: Any) -> Any:
+        if api_key:
+            kwargs.setdefault("api_key", api_key)
+        if api_base:
+            kwargs.setdefault("api_base", api_base)
+        return original(*args, **kwargs)
 
-    def empty_query(
-        _strategy: Any, evo: Any, _evolving_trace: Any
-    ) -> CoSTEERQueriedKnowledgeV2:
-        task_information = [task.get_task_information() for task in evo.sub_tasks]
-        return CoSTEERQueriedKnowledgeV2(
-            success_task_to_knowledge_dict={},
-            failed_task_info_set=set(),
-            task_to_former_failed_traces={key: ([], None) for key in task_information},
-            task_to_similar_task_successful_knowledge={
-                key: [] for key in task_information
-            },
-            task_to_similar_error_successful_knowledge={
-                key: [] for key in task_information
-            },
-        )
-
-    CoSTEER.__init__ = governed_init  # type: ignore[method-assign]
-    CoSTEERRAGStrategyV2.query = empty_query  # type: ignore[method-assign]
+    rdagent_litellm.embedding = routed  # type: ignore[assignment]
 
 
 def _enable_qlib_file_tracking_compatibility() -> None:
@@ -194,7 +176,11 @@ def main(argv: list[str]) -> int:
     if module != "quant_platform.rdagent_strategy":
         _enable_qlib_file_tracking_compatibility()
     if not _embedding_is_configured(dict(os.environ)):
-        _disable_optional_costeer_embeddings()
+        raise SystemExit(
+            "embedding retrieval is not configured; set the llm secret record's "
+            "embedding_api_key / embedding_api_base / embedding_model fields first"
+        )
+    _route_embedding_calls()
     target = importlib.import_module(module)
     if module == "rdagent.app.qlib_rd_loop.quant":
         _enable_fin_quant_arm_coverage()

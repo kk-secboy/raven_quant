@@ -16,7 +16,11 @@ type SettingsState = {
   storage_status: "ok" | "bootstrap_required" | "unavailable";
   storage_record_count: number;
   tushare: SecretState & { api_url: string; verified_at?: string | null };
-  llm: SecretState & { api_base: string; chat_model: string };
+  llm: SecretState & {
+    api_base: string;
+    chat_model: string;
+    embedding_configured?: boolean;
+  };
   alerts: SecretState & { endpoint_host: string };
 };
 
@@ -32,6 +36,9 @@ export function SettingsPanel({ api }: { api: string }) {
   const [apiBase, setApiBase] = useState("");
   const [chatModel, setChatModel] = useState("gpt-4.1-mini");
   const [apiKey, setApiKey] = useState("");
+  const [embeddingApiBase, setEmbeddingApiBase] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("embedding-3");
+  const [embeddingApiKey, setEmbeddingApiKey] = useState("");
   const [alertWebhook, setAlertWebhook] = useState("");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState<"tushare" | "llm" | "alerts" | null>(null);
@@ -79,7 +86,14 @@ export function SettingsPanel({ api }: { api: string }) {
       const response = await apiFetch(`${api}/api/settings/llm`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: apiKey, api_base: apiBase, chat_model: chatModel }),
+        body: JSON.stringify({
+          api_key: apiKey,
+          api_base: apiBase,
+          chat_model: chatModel,
+          embedding_api_key: embeddingApiKey || null,
+          embedding_api_base: embeddingApiBase,
+          embedding_model: embeddingModel,
+        }),
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail ?? "模型配置失败");
@@ -135,6 +149,10 @@ export function SettingsPanel({ api }: { api: string }) {
         <label>API Base<input type="url" value={apiBase} onChange={(event) => setApiBase(event.target.value)} placeholder="留空使用供应商默认地址" /></label>
         <label>模型名称<input value={chatModel} onChange={(event) => setChatModel(event.target.value)} required /></label>
         <label>API Key<input type="password" autoComplete="new-password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={state?.llm.configured ? "输入新 Key 可覆盖现有配置" : "输入模型 API Key"} required /></label>
+        <div className="card-heading"><div><span>EMBEDDING CREDENTIAL(用于研究知识检索 RAG)</span><strong>Embedding 模型</strong></div><span className={state?.llm.embedding_configured ? "status-chip verified" : "status-chip"}>{state?.llm.embedding_configured ? "已就绪" : "未配置"}</span></div>
+        <label>Embedding API Base<input type="url" value={embeddingApiBase} onChange={(event) => setEmbeddingApiBase(event.target.value)} placeholder="https://open.bigmodel.cn/api/paas/v4" /></label>
+        <label>Embedding 模型<input value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="embedding-3" /></label>
+        <label>Embedding API Key<input type="password" autoComplete="new-password" value={embeddingApiKey} onChange={(event) => setEmbeddingApiKey(event.target.value)} placeholder={state?.llm.embedding_configured ? "输入新 Key 可覆盖现有配置" : "输入 Embedding API Key"} /></label>
         <button className="primary" disabled={saving !== null || apiKey.length < 8}>{saving === "llm" ? "保存中……" : "加密保存"}</button>
       </form>
 

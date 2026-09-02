@@ -175,14 +175,12 @@ def _costeer_knowledge_status() -> dict[str, Any]:
         raise RuntimeError("CoSTEER knowledge status contract drifted")
     if status.get("status") not in {
         "embedding_retrieval_configured",
-        "degraded_empty_retrieval",
+        "unconfigured_fail_closed",
     }:
         raise RuntimeError("CoSTEER knowledge status value is unsupported")
     if not isinstance(status.get("embedding_retrieval_configured"), bool):
         raise RuntimeError("CoSTEER knowledge status readiness is invalid")
-    if not isinstance(status.get("costeer_used"), bool) or not isinstance(
-        status.get("empty_knowledge_forced"), bool
-    ):
+    if not isinstance(status.get("costeer_used"), bool):
         raise RuntimeError("CoSTEER knowledge use status is invalid")
     return status
 

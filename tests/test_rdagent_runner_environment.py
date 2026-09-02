@@ -145,15 +145,13 @@ def test_embedding_provider_detection_requires_a_real_embedding_endpoint() -> No
     degraded = run_rdagent_module._costeer_knowledge_status(
         {}, module="rdagent.app.qlib_rd_loop.factor"
     )
-    assert degraded["status"] == "degraded_empty_retrieval"
-    assert degraded["empty_knowledge_forced"] is True
+    assert degraded["status"] == "unconfigured_fail_closed"
     configured = run_rdagent_module._costeer_knowledge_status(
         {"EMBEDDING_OPENAI_API_KEY": "embedding-key"},
         module="quant_platform.rdagent_strategy",
     )
     assert configured["status"] == "embedding_retrieval_configured"
     assert configured["costeer_used"] is True
-    assert configured["empty_knowledge_forced"] is False
     assert configured["strategy_codegen_used"] is True
     assert configured["strategy_codegen_target"] == (
         "allowlisted_rule_ir_and_contract_tests"
@@ -164,7 +162,7 @@ def test_embedding_provider_detection_requires_a_real_embedding_endpoint() -> No
         {}, module="quant_platform.rdagent_strategy"
     )
     assert strategy_degraded["costeer_used"] is True
-    assert strategy_degraded["empty_knowledge_forced"] is True
+    assert strategy_degraded["status"] == "unconfigured_fail_closed"
     assert strategy_degraded["strategy_codegen_used"] is True
 
 
@@ -197,50 +195,56 @@ def test_disposable_qlib_container_allows_local_mlflow_tracking(
     }
 
 
-def test_missing_strategy_embeddings_use_typed_empty_costeer_knowledge(
+def test_configured_embeddings_are_routed_to_the_embedding_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from scripts import run_rdagent_module
 
-    class FakeCoSTEER:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
+    backend = ModuleType("rdagent.oai.backend.litellm")
+    calls: list[dict] = []
 
-    class FakeQueriedKnowledge:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
+    def fake_embedding(*args, **kwargs):
+        calls.append(kwargs)
+        return kwargs
 
-    class FakeRAGStrategy:
-        pass
-
-    module_names = [
-        "rdagent",
-        "rdagent.components",
-        "rdagent.components.coder",
-    ]
-    for name in module_names:
-        monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    costeer_module = ModuleType("rdagent.components.coder.CoSTEER")
-    costeer_module.CoSTEER = FakeCoSTEER
-    knowledge_module = ModuleType(
-        "rdagent.components.coder.CoSTEER.knowledge_management"
+    backend.embedding = fake_embedding
+    monkeypatch.setitem(sys.modules, "rdagent", ModuleType("rdagent"))
+    monkeypatch.setitem(sys.modules, "rdagent.oai", ModuleType("rdagent.oai"))
+    monkeypatch.setitem(
+        sys.modules, "rdagent.oai.backend", ModuleType("rdagent.oai.backend")
     )
-    knowledge_module.CoSTEERQueriedKnowledgeV2 = FakeQueriedKnowledge
-    knowledge_module.CoSTEERRAGStrategyV2 = FakeRAGStrategy
-    monkeypatch.setitem(sys.modules, costeer_module.__name__, costeer_module)
-    monkeypatch.setitem(sys.modules, knowledge_module.__name__, knowledge_module)
+    monkeypatch.setitem(sys.modules, "rdagent.oai.backend.litellm", backend)
 
-    run_rdagent_module._disable_optional_costeer_embeddings()
+    monkeypatch.setenv("EMBEDDING_OPENAI_API_KEY", "emb-key")
+    monkeypatch.setenv("EMBEDDING_OPENAI_API_BASE", "https://emb.invalid/v4")
+    run_rdagent_module._route_embedding_calls()
 
-    coder = FakeCoSTEER(with_knowledge=False, knowledge_self_gen=True)
-    assert coder.kwargs["with_knowledge"] is True
-    assert coder.kwargs["knowledge_self_gen"] is False
-    task = SimpleNamespace(get_task_information=lambda: "governed-strategy-task")
-    knowledge = FakeRAGStrategy().query(SimpleNamespace(sub_tasks=[task]), [])
-    assert knowledge.success_task_to_knowledge_dict == {}
-    assert knowledge.failed_task_info_set == set()
-    assert knowledge.task_to_former_failed_traces == {
-        "governed-strategy-task": ([], None)
+    backend.embedding(model="openai/embedding-3", input=["x"])
+    assert calls == [
+        {
+            "model": "openai/embedding-3",
+            "input": ["x"],
+            "api_key": "emb-key",
+            "api_base": "https://emb.invalid/v4",
+        }
+    ]
+
+
+def test_embedding_environment_injects_configured_provider() -> None:
+    from quant_platform.job_commands.research import _embedding_environment
+
+    assert _embedding_environment({}) == {}
+    env = _embedding_environment(
+        {
+            "embedding_api_key": "emb-key",
+            "embedding_api_base": "https://emb.invalid/v4/",
+            "embedding_model": "embedding-3",
+        }
+    )
+    assert env == {
+        "EMBEDDING_MODEL": "openai/embedding-3",
+        "EMBEDDING_OPENAI_API_KEY": "emb-key",
+        "EMBEDDING_OPENAI_API_BASE": "https://emb.invalid/v4",
     }
 
 

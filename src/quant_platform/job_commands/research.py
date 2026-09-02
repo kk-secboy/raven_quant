@@ -14,6 +14,26 @@ from ..rdagent_scenarios import get_rdagent_scenario
 from ._shared import _require_supported_rdagent_execution
 
 
+def _embedding_environment(llm: dict) -> dict[str, str]:
+    """Route CoSTEER embedding retrieval to the configured embedding provider.
+
+    Chat stays on the governed relay (OPENAI_API_BASE); embedding credentials
+    arrive via EMBEDDING_OPENAI_* and run_rdagent_module applies them per call.
+    """
+    key = str(llm.get("embedding_api_key") or "").strip()
+    if not key:
+        return {}
+    model = str(llm.get("embedding_model") or "embedding-3").strip()
+    if "/" not in model:
+        model = f"openai/{model}"
+    return {
+        "EMBEDDING_MODEL": model,
+        "EMBEDDING_OPENAI_API_KEY": key,
+        "EMBEDDING_OPENAI_API_BASE": str(llm.get("embedding_api_base") or "")
+        .strip()
+        .rstrip("/"),
+    }
+
 def rdagent_job_command(
     worker, job: dict
 ) -> tuple[list[str], Path | None, dict[str, str]]:
@@ -34,6 +54,7 @@ def rdagent_job_command(
             worker.settings.rdagent_llm_key_env: llm["api_key"],
             "OPENAI_API_BASE": llm.get("api_base", ""),
             "CHAT_MODEL": llm.get("chat_model", "gpt-4.1-mini"),
+            **_embedding_environment(llm),
         }
     local_runtime = probe_rdagent(
         worker.settings,
@@ -146,6 +167,7 @@ def rdagent_job_command(
         env[worker.settings.rdagent_llm_key_env] = llm["api_key"]
         env["OPENAI_API_BASE"] = llm.get("api_base", "")
         env["CHAT_MODEL"] = llm.get("chat_model", "gpt-4.1-mini")
+        env.update(_embedding_environment(llm))
     return command, result_path, env
 
 
