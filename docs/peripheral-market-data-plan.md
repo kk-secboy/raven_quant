@@ -21,7 +21,7 @@
 
 ## 阶段
 
-- **A. 数据源验证(只读)**:index_global 指数清单核对(SOX/GICS);美债接口字段语义;龙头白名单(默认 NVDA 等十只以内)
+- **A. 数据源验证(只读)**:~~index_global 指数清单核对~~ 已完成(2026-09-02):index_global 共 22 支,宽基齐全(SPX/IXIC/DJI/RUT/HSI/HKTECH/N225 等),**无费城半导体等细分行业指数**——行业传导层改用"半导体龙头篮子"(NVDA/TSM/AVGO 等,us_daily 已有数据,等权合成)近似,不引入新数据源;美债接口字段语义待实施时核;龙头白名单(默认十只以内)
 - **B. PIT 与快照接入(核心)**:availability.py 注册外围可用时间政策(外盘收盘 → A 股盘前可用,fail-closed);外围数据进独立快照(不动 A 股主快照与 Qlib 数据集身份);verify 质量门扩展
 - **C. 外围因子化**:隔夜涨跌幅、行业指数动量、美债收益率变化等纯结构化因子(无 LLM),经 register_external_factor 走既有评估通道;龙头对 A 股产业链映射用确定性规则(参照 major_news_mentions)
 - **D. 缺口补漏**:cn_macro 回补 2016-2023;npr 排查(权限或解析),不可用则从目录边界移除并记录
