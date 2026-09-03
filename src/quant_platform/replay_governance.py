@@ -1,14 +1,9 @@
-"""Narrow admission for a consumed-history transparent-baseline replay.
+"""Replay-governance evidence rules for sealed and consumed-history backtests.
 
-This module does not introduce another promotion or simulation lifecycle.  It
-only proves that one exact historical replay is descriptive evidence and
-freezes the stricter criteria for the existing forward paper stage.
-
-Current status (2026-09, weight-reduction phase 3b): the standalone
-transparent-baseline line has been deleted and the admission entry point
-(``StrategyStore.admit_forward_only_rehabilitation``) is gone, so no new
-replay admissions can occur.  The module is still a *live* dependency and
-cannot be deleted yet:
+These symbols were lifted verbatim out of the retired
+``forward_only_rehabilitation`` module during weight-reduction phase C3; the
+standalone transparent-baseline admission line is gone, so this module only
+carries the *live* governance surface:
 
 - ``worker`` and ``scripts/run_multifactor_backtest.py`` use
   ``EVIDENCE_MODE_REPLAY``/``EVIDENCE_MODE_SEALED``, ``REPLAY_MARKERS``,
@@ -22,9 +17,8 @@ cannot be deleted yet:
 - ``deployment_readiness`` uses the ``TERMINAL_CASH_ONLY_*`` constants and
   ``require_terminal_cash_only_receipt`` for readiness checks.
 
-A future refactor should move the evidence-mode constants and the
-incomplete-family/replay validators into a small neutral module before this
-file can be removed.
+No new replay admissions can occur; the admission entry point and its
+qualification builders stayed behind with the deleted module.
 """
 
 from __future__ import annotations
@@ -41,7 +35,6 @@ import pandas as pd
 from sqlalchemy import insert, select, update
 
 from quant_data.database import (
-    audit_events,
     backtest_runs,
     formal_backtest_interruption_recoveries,
     jobs,
@@ -81,7 +74,6 @@ EVIDENCE_MODE_LEGACY = "legacy_ambiguous"
 EVIDENCE_MODE_SEALED = "sealed_final_oos"
 EVIDENCE_MODE_REPLAY = "consumed_historical_replay"
 REPLAY_AUTHORITY = "historical_description_only"
-REHABILITATION_AUDIT_ACTION = "strategy.forward_only_rehabilitation_admitted"
 INCOMPLETE_FAMILY_ELIGIBILITY_VERSION = "incomplete-factor-family-eligibility-v1"
 INCOMPLETE_FAMILY_AUTHORITY = "conservative_bonferroni_only"
 _REQUIRED_MISSING_FAMILY_ARTIFACTS = frozenset(
@@ -157,11 +149,6 @@ TERMINAL_CASH_ONLY_HORIZON = "short_1_5d"
 TERMINAL_CASH_ONLY_ARTIFACT_RELATIVE_PATH = (
     f"artifacts/backtests/{TERMINAL_CASH_ONLY_BACKTEST_ID}"
 )
-# Short aliases are intentionally confined to this exact one-shot receipt and
-# are used by the bounded readiness projection.
-TARGET_VERSION_ID = TERMINAL_CASH_ONLY_VERSION_ID
-TARGET_BACKTEST_ID = TERMINAL_CASH_ONLY_BACKTEST_ID
-TARGET_JOB_ID = TERMINAL_CASH_ONLY_JOB_ID
 
 REPLAY_MARKERS: dict[str, Any] = {
     "evidence_mode": EVIDENCE_MODE_REPLAY,
@@ -1237,19 +1224,6 @@ def require_replay_markers(value: Mapping[str, Any], *, label: str) -> None:
         )
 
 
-def rehabilitation_forward_thresholds(base: Mapping[str, Any]) -> dict[str, Any]:
-    """Strengthen, never replace, the existing horizon-specific paper gate."""
-
-    thresholds = dict(base)
-    thresholds["min_forward_calendar_days"] = max(
-        365, int(thresholds.get("min_forward_calendar_days") or 0)
-    )
-    thresholds["min_forward_trading_days"] = max(
-        252, int(thresholds.get("min_forward_trading_days") or 0)
-    )
-    return thresholds
-
-
 def require_forward_criteria(value: Mapping[str, Any]) -> None:
     thresholds = value.get("thresholds")
     if (
@@ -1464,261 +1438,6 @@ def _artifact_hashes(
     ):
         raise ValueError("historical replay execution manifest provenance is inconsistent")
     return {key: sha256_file(path) for key, path in paths.items()}
-
-
-def build_qualification(
-    connection: Any,
-    *,
-    version: Mapping[str, Any],
-    backtest: Mapping[str, Any],
-    forward_criteria: Mapping[str, Any],
-    created_by: str,
-) -> dict[str, Any]:
-    """Rebuild the exact forward-only receipt from governed rows and artifacts."""
-
-    actor = created_by.strip()
-    if len(actor) < 2:
-        raise ValueError("forward-only rehabilitation requires a responsible actor")
-    config = version.get("config")
-    if not isinstance(config, Mapping):
-        raise ValueError("strategy replay config is missing")
-    binding = require_replay_config(config)
-    if (
-        version.get("evidence_mode") != EVIDENCE_MODE_REPLAY
-        or version.get("status") != "draft"
-        or version.get("promotion_stage") is not None
-        or bool(version.get("is_legacy"))
-        or backtest.get("evidence_mode") != EVIDENCE_MODE_REPLAY
-        or backtest.get("status") != "succeeded"
-        or bool(backtest.get("is_legacy"))
-        or str(backtest.get("strategy_version_id")) != str(version.get("id"))
-        or str(backtest.get("dataset")) != SOURCE_DATASET
-        or dict(backtest.get("periods") or {}) != SOURCE_PERIODS
-    ):
-        raise ValueError("target StrategyVersion/backtest is not an inert succeeded replay")
-    metrics = backtest.get("metrics")
-    if not isinstance(metrics, Mapping):
-        raise ValueError("historical replay metrics are missing")
-    require_replay_markers(metrics, label="backtest metrics")
-    formal = metrics.get("formal_validation")
-    multiple = formal.get("multiple_testing") if isinstance(formal, Mapping) else None
-    deflated = metrics.get("deflated_sharpe")
-    try:
-        trial_count = int(metrics.get("strategy_trial_count"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("historical replay has no real strategy trial count") from exc
-    audit_sha256 = str((multiple or {}).get("trial_count_audit_sha256") or "")
-    eligibility_sha256 = str(
-        (multiple or {}).get("eligibility_receipt_sha256") or ""
-    )
-    eligibility_row = connection.execute(
-        select(strategy_incomplete_family_eligibilities).where(
-            strategy_incomplete_family_eligibilities.c.strategy_version_id
-            == str(version["id"])
-        )
-    ).first()
-    if (
-        trial_count <= 1
-        or int((multiple or {}).get("trial_count") or 0) != trial_count
-        or int((deflated or {}).get("trials") or 0) != trial_count
-        or not is_sha256(audit_sha256)
-        or not is_sha256(eligibility_sha256)
-        or eligibility_row is None
-        or str(eligibility_row.receipt_sha256) != eligibility_sha256
-    ):
-        raise ValueError(
-            "historical replay must use the complete real trial count and conservative gate"
-        )
-    require_forward_criteria(forward_criteria)
-    vintage = require_consumed_vintage(
-        connection,
-        version_config=config,
-        dataset_identity_sha256=str(binding["dataset_identity_sha256"]),
-        dataset_lineage_id=str(binding["dataset_lineage_id"]),
-    )
-    source_cancellation = require_source_cancellation(connection)
-    source_cash_only = require_source_cash_only_lockbox(connection)
-    bootstrap = config.get("transparent_baseline_bootstrap")
-    if not isinstance(bootstrap, Mapping):
-        raise ValueError("historical replay runtime binding is missing")
-    runner_sha256 = str(bootstrap.get("target_runner_sha256") or "")
-    runtime_bundle_sha256 = str(
-        bootstrap.get("target_runtime_bundle_sha256") or ""
-    )
-    image_digest = str(bootstrap.get("target_worker_runtime_image_digest") or "")
-    if (
-        not is_sha256(runner_sha256)
-        or not is_sha256(runtime_bundle_sha256)
-        or not image_digest.startswith("sha256:")
-        or not is_sha256(image_digest.removeprefix("sha256:"))
-    ):
-        raise ValueError("historical replay runtime identity is incomplete")
-    artifact_hashes = _artifact_hashes(backtest, metrics=metrics)
-    criteria = dict(forward_criteria)
-    criteria_sha256 = canonical_sha256(criteria)
-    core = {
-        "contract_version": CONTRACT_VERSION,
-        **REPLAY_MARKERS,
-        "final_oos_opened": True,
-        "capital_eligible": False,
-        "source_strategy_version_id": SOURCE_VERSION_ID,
-        "source_backtest_id": SOURCE_BACKTEST_ID,
-        "source_job_id": SOURCE_JOB_ID,
-        "source_interruption_recovery_receipt_sha256": source_cancellation[
-            "source_interruption_recovery_receipt_sha256"
-        ],
-        "source_interruption_receipt_authority": source_cancellation[
-            "source_interruption_receipt_authority"
-        ],
-        **source_cash_only,
-        "strategy_version_id": str(version["id"]),
-        "backtest_id": str(backtest["id"]),
-        "consumed_oos_vintage_id": str(vintage.id),
-        "recipe_id": "short_relative_strength",
-        "horizon_profile": "short_1_5d",
-        "dataset": SOURCE_DATASET,
-        "dataset_identity_sha256": SOURCE_DATASET_IDENTITY_SHA256,
-        "dataset_lineage_id": SOURCE_DATASET_LINEAGE_ID,
-        "strategy_rules_sha256": SOURCE_RULES_SHA256,
-        "execution_contract_hash": SOURCE_EXECUTION_CONTRACT_HASH,
-        "runner_sha256": runner_sha256,
-        "runtime_bundle_sha256": runtime_bundle_sha256,
-        "worker_runtime_image_digest": image_digest,
-        "replay_periods": SOURCE_PERIODS,
-        **artifact_hashes,
-        "strategy_trial_count": trial_count,
-        "trial_count_audit_sha256": audit_sha256,
-        "incomplete_family_eligibility_sha256": eligibility_sha256,
-        "forward_criteria": criteria,
-        "forward_criteria_sha256": criteria_sha256,
-    }
-    receipt_sha256 = canonical_sha256(core)
-    return {**core, "receipt_sha256": receipt_sha256, "created_by": actor}
-
-
-def insert_qualification(
-    connection: Any,
-    qualification: Mapping[str, Any],
-    *,
-    created_at: datetime | None = None,
-) -> dict[str, Any]:
-    """Append the audit event and qualification receipt in the caller transaction."""
-
-    value = dict(qualification)
-    receipt_sha256 = str(value.get("receipt_sha256") or "")
-    if not is_sha256(receipt_sha256):
-        raise ValueError("forward-only rehabilitation receipt SHA-256 is invalid")
-    core = {key: item for key, item in value.items() if key not in {"receipt_sha256", "created_by"}}
-    if canonical_sha256(core) != receipt_sha256:
-        raise ValueError("forward-only rehabilitation receipt is not canonical")
-    existing = connection.execute(
-        select(strategy_forward_only_rehabilitations).where(
-            strategy_forward_only_rehabilitations.c.strategy_version_id
-            == value["strategy_version_id"]
-        )
-    ).first()
-    if existing is not None:
-        if str(existing.receipt_sha256) != receipt_sha256:
-            raise ValueError("StrategyVersion is bound to another rehabilitation receipt")
-        return row_dict(existing)
-    now = created_at or datetime.now(UTC)
-    audit_id = connection.scalar(
-        insert(audit_events)
-        .values(
-            user_id=None,
-            username=str(value["created_by"]),
-            action=REHABILITATION_AUDIT_ACTION,
-            method="INTERNAL",
-            path="/internal/strategies/forward-only-rehabilitation",
-            status_code=201,
-            ip_hash=None,
-            user_agent="quantlab-forward-only-rehabilitation",
-            details_json={
-                "receipt_sha256": receipt_sha256,
-                "strategy_version_id": value["strategy_version_id"],
-                "backtest_id": value["backtest_id"],
-                "consumed_oos_vintage_id": value["consumed_oos_vintage_id"],
-                "authority": REPLAY_AUTHORITY,
-            },
-            created_at=now,
-        )
-        .returning(audit_events.c.id)
-    )
-    connection.execute(
-        insert(strategy_forward_only_rehabilitations).values(
-            receipt_sha256=receipt_sha256,
-            source_audit_event_id=audit_id,
-            source_strategy_version_id=value["source_strategy_version_id"],
-            source_backtest_id=value["source_backtest_id"],
-            source_job_id=value["source_job_id"],
-            source_interruption_recovery_receipt_sha256=value[
-                "source_interruption_recovery_receipt_sha256"
-            ],
-            source_interruption_receipt_authority=value[
-                "source_interruption_receipt_authority"
-            ],
-            source_lockbox_contract_version=value[
-                "source_lockbox_contract_version"
-            ],
-            source_lockbox_batch_sha256=value["source_lockbox_batch_sha256"],
-            source_lockbox_member_sha256=value["source_lockbox_member_sha256"],
-            source_history_selection_sha256=value[
-                "source_history_selection_sha256"
-            ],
-            source_unavailable_horizons_sha256=value[
-                "source_unavailable_horizons_sha256"
-            ],
-            source_unavailable_evidence_sha256s_json=value[
-                "source_unavailable_evidence_sha256s"
-            ],
-            source_cash_only_scope=value["source_cash_only_scope"],
-            strategy_version_id=value["strategy_version_id"],
-            backtest_id=value["backtest_id"],
-            consumed_oos_vintage_id=value["consumed_oos_vintage_id"],
-            contract_version=CONTRACT_VERSION,
-            evidence_mode=EVIDENCE_MODE_REPLAY,
-            authority=REPLAY_AUTHORITY,
-            recipe_id=value["recipe_id"],
-            horizon_profile=value["horizon_profile"],
-            dataset=value["dataset"],
-            dataset_identity_sha256=value["dataset_identity_sha256"],
-            dataset_lineage_id=value["dataset_lineage_id"],
-            strategy_rules_sha256=value["strategy_rules_sha256"],
-            execution_contract_hash=value["execution_contract_hash"],
-            runner_sha256=value["runner_sha256"],
-            runtime_bundle_sha256=value["runtime_bundle_sha256"],
-            worker_runtime_image_digest=value["worker_runtime_image_digest"],
-            replay_periods_json=value["replay_periods"],
-            replay_manifest_sha256=value["replay_manifest_sha256"],
-            replay_result_sha256=value["replay_result_sha256"],
-            replay_artifact_manifest_sha256=value[
-                "replay_artifact_manifest_sha256"
-            ],
-            replay_daily_returns_sha256=value["replay_daily_returns_sha256"],
-            strategy_trial_count=value["strategy_trial_count"],
-            trial_count_audit_sha256=value["trial_count_audit_sha256"],
-            incomplete_family_eligibility_sha256=value[
-                "incomplete_family_eligibility_sha256"
-            ],
-            forward_criteria_json=value["forward_criteria"],
-            forward_criteria_sha256=value["forward_criteria_sha256"],
-            qualification_json={
-                key: item for key, item in value.items() if key != "created_by"
-            },
-            created_by=value["created_by"],
-            created_at=now,
-        )
-    )
-    return value
-
-
-def qualification_for_version(connection: Any, version_id: str) -> dict[str, Any] | None:
-    row = connection.execute(
-        select(strategy_forward_only_rehabilitations).where(
-            strategy_forward_only_rehabilitations.c.strategy_version_id == version_id
-        )
-    ).first()
-    return row_dict(row) if row is not None else None
 
 
 def require_qualification(

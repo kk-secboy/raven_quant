@@ -48,10 +48,6 @@ from .factor_evaluation_recovery import (
 )
 from .factor_library_store import FactorLibraryStore
 from .feature_set_registry import register_feature_set
-from .forward_only_rehabilitation import (
-    EVIDENCE_MODE_REPLAY,
-    require_replay_markers,
-)
 from .job_commands import build_command
 from .job_commands._shared import (
     _bind_daily_simulation_settlement_calendar as _bind_daily_simulation_settlement_calendar,
@@ -98,6 +94,10 @@ from .rdagent_scenarios import (
 )
 from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
+from .replay_governance import (
+    EVIDENCE_MODE_REPLAY,
+    require_replay_markers,
+)
 from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
 from .report_rc_factors import default_factors_dir as report_rc_factors_dir
 from .research_execution_cadence import (

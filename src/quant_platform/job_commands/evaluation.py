@@ -11,14 +11,14 @@ from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from ..cost_model import CostModelConfig
 from ..feature_set_registry import get_feature_set, register_feature_set
-from ..forward_only_rehabilitation import (
+from ..parameter_experiments import merge_admitted_trial_ledgers
+from ..replay_governance import (
     EVIDENCE_MODE_REPLAY,
     EVIDENCE_MODE_SEALED,
     REPLAY_MARKERS,
     incomplete_family_eligibility_for_version,
     require_replay_config,
 )
-from ..parameter_experiments import merge_admitted_trial_ledgers
 from ..research_execution_cadence import build_research_execution_cadence_contract
 from ..research_label_binding import (
     resolve_research_label_binding,

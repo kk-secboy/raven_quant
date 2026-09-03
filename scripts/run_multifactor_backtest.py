@@ -52,14 +52,6 @@ from quant_platform.formal_validation import (
     run_outer_walk_forward,
     run_signal_decay_suite,
 )
-from quant_platform.forward_only_rehabilitation import (
-    EVIDENCE_MODE_REPLAY,
-    EVIDENCE_MODE_SEALED,
-    REPLAY_MARKERS,
-    require_incomplete_family_eligibility,
-    require_replay_config,
-    require_replay_markers,
-)
 from quant_platform.model_recompute import (
     execute_model_candidate,
     governed_checkpoint_filename,
@@ -93,6 +85,14 @@ from quant_platform.qlib_factor_baseline import (
 )
 from quant_platform.qlib_policy_strategy import create_qlib_policy_strategy
 from quant_platform.qlib_workflow import qlib_workflow_run
+from quant_platform.replay_governance import (
+    EVIDENCE_MODE_REPLAY,
+    EVIDENCE_MODE_SEALED,
+    REPLAY_MARKERS,
+    require_incomplete_family_eligibility,
+    require_replay_config,
+    require_replay_markers,
+)
 from quant_platform.risk_math import estimate_covariance
 from quant_platform.statistical_validation import (
     deflated_sharpe_probability,

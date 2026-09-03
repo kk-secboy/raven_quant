@@ -83,19 +83,6 @@ from quant_platform.formal_validation import (
     validate_factor_score_incomplete_family_multiple_testing,
     validate_paired_bootstrap_evidence,
 )
-from quant_platform.forward_only_rehabilitation import (
-    EVIDENCE_MODE_LEGACY,
-    EVIDENCE_MODE_REPLAY,
-    EVIDENCE_MODE_SEALED,
-    audit_incomplete_family_artifacts,
-    build_incomplete_family_eligibility,
-    insert_incomplete_family_eligibility,
-    register_terminal_cash_only_receipt,
-    require_consumed_vintage,
-    require_incomplete_family_eligibility,
-    require_replay_config,
-    require_replay_markers,
-)
 from quant_platform.horizon_factor_bundle import validate_horizon_factor_bundle
 from quant_platform.model_ensemble import prediction_grid_from_admission
 from quant_platform.model_research_governance import (
@@ -131,6 +118,19 @@ from quant_platform.qlib_factor_baseline import (
     bind_factor_source_config,
 )
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.replay_governance import (
+    EVIDENCE_MODE_LEGACY,
+    EVIDENCE_MODE_REPLAY,
+    EVIDENCE_MODE_SEALED,
+    audit_incomplete_family_artifacts,
+    build_incomplete_family_eligibility,
+    insert_incomplete_family_eligibility,
+    register_terminal_cash_only_receipt,
+    require_consumed_vintage,
+    require_incomplete_family_eligibility,
+    require_replay_config,
+    require_replay_markers,
+)
 from quant_platform.research_horizon import (
     LEGACY_AMBIGUOUS,
     horizon_columns_from_config,

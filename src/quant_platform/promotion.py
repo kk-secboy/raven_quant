@@ -65,17 +65,17 @@ from quant_platform.cost_model import (
     COST_SCHEDULE_VERSION,
     CostModelConfig,
 )
-from quant_platform.forward_only_rehabilitation import (
-    EVIDENCE_MODE_REPLAY,
-    require_qualification,
-)
-from quant_platform.forward_only_rehabilitation import (
-    canonical_sha256 as rehabilitation_canonical_sha256,
-)
 from quant_platform.investor_profile import (
     InvestorSimulationProfileStore,
     bind_investor_profile,
     validate_investor_profile_binding,
+)
+from quant_platform.replay_governance import (
+    EVIDENCE_MODE_REPLAY,
+    require_qualification,
+)
+from quant_platform.replay_governance import (
+    canonical_sha256 as rehabilitation_canonical_sha256,
 )
 from quant_platform.research_horizon import (
     LEGACY_AMBIGUOUS,

@@ -77,7 +77,6 @@ from .cost_model import (
     infer_cn_asset_type,
 )
 from .execution_algorithms import execution_time_slots, normalize_execution_policy
-from .forward_only_rehabilitation import EVIDENCE_MODE_REPLAY, require_qualification
 from .investor_profile import (
     require_investor_profile_target_permissions,
     require_matching_active_profile_binding,
@@ -92,6 +91,7 @@ from .paper_policy_state import (
     validate_paper_policy_state,
 )
 from .qlib_workflow import require_qlib_workflow_identity
+from .replay_governance import EVIDENCE_MODE_REPLAY, require_qualification
 from .safe_mode import SafeModeStore
 from .simulation_engine import (
     SIMULATION_ENGINE_VERSION,
