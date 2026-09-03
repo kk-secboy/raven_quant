@@ -3192,13 +3192,11 @@ class LocalJobWorker:
         )
         source_artifacts = result.get("strategy_proposals") or []
         archived = strategy_archive.get("strategy_proposal_artifacts") or []
-        governed_periods = payload.get("periods")
         if (
             not dataset_name
             or not dataset_path.is_dir()
             or not re.fullmatch(r"[0-9a-f]{64}", dataset_identity)
             or not allowed_factor_ids
-            or not isinstance(governed_periods, dict)
             or len(source_artifacts) != len(archived)
         ):
             raise ValueError("fin_strategy competition inputs are incomplete")
@@ -3234,13 +3232,10 @@ class LocalJobWorker:
             evaluation_contract = artifact["strategy_proposal"][
                 "evaluation_contract"
             ]
-            # The proposal records the isolated, pre-final research-loop view
-            # (enforced at archive time).  The pre-final competition itself must
-            # span the full governed validation window: the horizon minimum-OOS
-            # floors are calibrated against it, and the sealed final test stays
-            # untouched either way.
             periods = derive_strategy_research_competition_periods(
-                governed_periods,
+                artifact["strategy_proposal"]["data_contract"][
+                    "research_periods"
+                ],
                 dataset_path=dataset_path,
                 purge_sessions=int(candidate_config["outer_purge_days"]),
                 minimum_oos_observations=int(

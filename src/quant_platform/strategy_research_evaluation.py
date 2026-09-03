@@ -393,16 +393,6 @@ def derive_strategy_research_competition_periods(
 ) -> dict[str, Any]:
     """Derive two pre-final comparison segments from the frozen Qlib calendar."""
 
-    required = {
-        "train_start",
-        "train_end",
-        "valid_start",
-        "valid_end",
-        "test_start",
-        "test_end",
-    }
-    if set(research_periods) != required:
-        raise ValueError("strategy research periods are incomplete")
     calendar_path = Path(dataset_path) / "calendars" / "day.txt"
     if not calendar_path.is_file():
         raise ValueError("strategy comparison requires the frozen Qlib daily calendar")
@@ -416,6 +406,34 @@ def derive_strategy_research_competition_periods(
             errors="coerce",
         )
     ).dropna().sort_values().unique()
+    return derive_strategy_research_competition_periods_from_calendar(
+        research_periods,
+        calendar,
+        purge_sessions=purge_sessions,
+        minimum_oos_observations=minimum_oos_observations,
+    )
+
+
+def derive_strategy_research_competition_periods_from_calendar(
+    research_periods: Mapping[str, Any],
+    calendar: pd.DatetimeIndex,
+    *,
+    purge_sessions: int,
+    minimum_oos_observations: int,
+) -> dict[str, Any]:
+    """Derive the comparison segments against an already loaded calendar."""
+
+    required = {
+        "train_start",
+        "train_end",
+        "valid_start",
+        "valid_end",
+        "test_start",
+        "test_end",
+    }
+    if set(research_periods) != required:
+        raise ValueError("strategy research periods are incomplete")
+    calendar = pd.DatetimeIndex(calendar).dropna().sort_values().unique()
     train = calendar[
         (calendar >= pd.Timestamp(str(research_periods["train_start"])))
         & (calendar <= pd.Timestamp(str(research_periods["train_end"])))

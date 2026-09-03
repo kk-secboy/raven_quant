@@ -176,47 +176,28 @@ def test_pre_2022_unopened_history_runs_short_and_swing_without_fake_10y() -> No
     short_periods, short = resolve_research_periods(
         calendar, horizon_profile=SHORT_1_5D
     )
-    swing_periods, swing = resolve_research_periods(
-        calendar, horizon_profile=SWING_1_6M
-    )
 
     assert len(calendar) == 3527
     assert sum(day >= "2015-08-03" for day in calendar) == 1683
     assert short_periods["test_end"] < "2022-07-06"
-    assert swing_periods["test_end"] < "2022-07-06"
     assert [item["id"] for item in short["evaluation_profiles"]] == [
         "recent_3y",
         "robust_10y",
         "balanced_5y",
     ]
-    assert [item["id"] for item in swing["evaluation_profiles"]] == [
-        "recent_3y",
-        "robust_10y",
-        "balanced_5y",
-    ]
-    swing_resolution = swing["evaluation_profile_resolution"]
-    assert swing_resolution["capital_evaluation_eligible"] is True
-    assert swing_resolution["effective_profiles"] == [
-        "recent_3y",
-        "robust_10y",
-        "balanced_5y",
-    ]
-    assert swing_resolution["unavailable_profiles"] == []
-    robust = next(
-        item for item in swing["evaluation_profiles"] if item["id"] == "robust_10y"
-    )
-    assert robust["requested_validation_trading_days"] == 2520
-    assert robust["effective_validation_trading_days"] == 926
-    assert robust["validation_window_truncated"] is True
-    confirmation = next(
-        item
-        for item in swing["evaluation_profiles"]
-        if item["id"] == "balanced_5y"
-    )
-    assert confirmation["requested_validation_trading_days"] == 1260
-    assert confirmation["effective_validation_trading_days"] == 841
-    assert confirmation["binding_constraints"][-1] == (
-        "confirmation_shortened_to_distinct_cost_covered_midpoint"
+
+    # The swing selection segment must cover its 504-session OOS floor after
+    # the 60/40 research isolation, which needs a deeper validation window
+    # than this calendar's cost-covered tail can host.  Resolution must say
+    # so up front instead of letting the run fail after research compute.
+    with pytest.raises(ResearchWindowUnavailableError) as captured:
+        resolve_research_periods(calendar, horizon_profile=SWING_1_6M)
+
+    evidence = captured.value.evidence
+    assert evidence["horizon_profile"] == SWING_1_6M
+    assert evidence["capital_evaluation_eligible"] is False
+    assert evidence["capital_evaluation_unavailable_reason"] == (
+        "horizon_window_cannot_host_fair_competition"
     )
 
 

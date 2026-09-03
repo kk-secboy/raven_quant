@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from datetime import date
 from typing import Any
 
@@ -12,6 +13,8 @@ from .factor_evaluator import normalize_series
 from .factor_library import ECONOMIC_FAMILIES, compile_qlib_expression
 from .feature_set_registry import get_feature_set
 from .model_research_governance import MODEL_LABEL_HORIZON_TRADING_DAYS
+from .parameter_experiments import split_research_period
+from .rdagent_dataset_view import isolate_rdagent_periods
 from .rdagent_runtime import validate_duration, validate_duration_limit
 from .rdagent_scenarios import (
     get_rdagent_scenario,
@@ -30,6 +33,9 @@ from .research_horizon import (
 from .research_window import (
     build_research_window_contract,
     resolve_required_field_coverage,
+)
+from .strategy_research_evaluation import (
+    derive_strategy_research_competition_periods_from_calendar,
 )
 
 RESEARCH_PERIOD_KEYS = (
@@ -391,6 +397,35 @@ def derive_rolling_research_periods(
     }
 
 
+def _primary_depth_for_selection_floor(
+    ordered: list[str],
+    *,
+    valid_end_index: int,
+    floor_sessions: int,
+    minimum_depth: int,
+) -> int:
+    """Smallest primary depth whose research split keeps ``floor_sessions``.
+
+    RD-Agent research isolates the governed validation window into a 60/40
+    pre-final split (see ``isolate_rdagent_periods``).  The selection segment
+    must still cover the horizon's minimum OOS floor, so the primary depth is
+    grown until the calendar-level split actually does so.
+    """
+
+    depth = max(minimum_depth, floor_sessions)
+    while valid_end_index - depth + 1 >= 0:
+        start = date.fromisoformat(ordered[valid_end_index - depth + 1])
+        end = date.fromisoformat(ordered[valid_end_index])
+        in_sample = split_research_period(start, end)["in_sample"]
+        sessions = bisect_right(ordered, in_sample["end"]) - bisect_left(
+            ordered, in_sample["start"]
+        )
+        if sessions >= floor_sessions:
+            return depth
+        depth += 1
+    return depth
+
+
 def _derive_multi_profile_research_periods(
     calendar_days: list[str],
     *,
@@ -398,6 +433,7 @@ def _derive_multi_profile_research_periods(
     embargo_days: int,
     purge_days: int = MODEL_LABEL_HORIZON_TRADING_DAYS,
     label_maturity_days: int = 0,
+    selection_floor_sessions: int = 0,
 ) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any]]:
     """Build a primary window plus honest, cost-covered stress profiles.
 
@@ -453,6 +489,13 @@ def _derive_multi_profile_research_periods(
     effective_windows: dict[tuple[int, int], str] = {}
     for spec in RESEARCH_EVALUATION_PROFILES:
         requested_validation_days = int(spec["validation_trading_days"])
+        if spec["role"] == "primary" and selection_floor_sessions > 0:
+            requested_validation_days = _primary_depth_for_selection_floor(
+                ordered,
+                valid_end_index=valid_end_index,
+                floor_sessions=selection_floor_sessions,
+                minimum_depth=requested_validation_days,
+            )
         requested_valid_start_index = valid_end_index - requested_validation_days + 1
         valid_start_index = max(
             requested_valid_start_index,
@@ -721,12 +764,18 @@ def resolve_research_periods(
             period_policy,
             horizon_profile=profile,
         )
+        selection_floor_sessions = (
+            0
+            if profile == LEGACY_AMBIGUOUS
+            else int(horizon.sealed_oos_sessions or 0)
+        )
         resolved, profiles, profile_resolution = _derive_multi_profile_research_periods(
             ordered,
             test_days=policy["test_trading_days"],
             embargo_days=policy["embargo_trading_days"],
             purge_days=purge_days,
             label_maturity_days=maturity_days,
+            selection_floor_sessions=selection_floor_sessions,
         )
         mode = (
             ROLLING_PERIOD_RESOLUTION_VERSION
@@ -735,6 +784,35 @@ def resolve_research_periods(
         )
         effective_embargo_days = policy["embargo_trading_days"]
         effective_maturity_days = maturity_days
+    if profile != LEGACY_AMBIGUOUS:
+        # Fail fast at resolution time when the frozen horizon window cannot
+        # host an executable fin_strategy competition: the isolated pre-final
+        # split must cover the sealed-OOS floor while the cost-covered
+        # training tail keeps room for fair-comparison history.  Discovering
+        # this after research compute would waste the whole run budget.
+        try:
+            derive_strategy_research_competition_periods_from_calendar(
+                isolate_rdagent_periods(resolved),
+                pd.DatetimeIndex(pd.to_datetime(ordered)),
+                purge_sessions=purge_days,
+                minimum_oos_observations=int(horizon.sealed_oos_sessions or 0),
+            )
+        except ValueError as exc:
+            raise ResearchWindowUnavailableError(
+                f"{profile} research window cannot be formed honestly: {exc}",
+                evidence={
+                    "contract_version": HORIZON_PERIOD_RESOLUTION_VERSION,
+                    "horizon_profile": profile,
+                    "periods": dict(resolved),
+                    "sealed_oos_sessions": int(horizon.sealed_oos_sessions or 0),
+                    "purge_trading_days": purge_days,
+                    "calendar_trading_days": len(ordered),
+                    "capital_evaluation_eligible": False,
+                    "capital_evaluation_unavailable_reason": (
+                        "horizon_window_cannot_host_fair_competition"
+                    ),
+                },
+            ) from exc
     if periods is not None:
         profile_resolution = {
             "contract_version": "explicit-profile-resolution-v1",

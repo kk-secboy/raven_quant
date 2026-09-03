@@ -423,16 +423,17 @@ def test_policy_queue_revalidates_with_the_frozen_feature_allowlist(
     assert observed["allowed_factor_ids"] == set(feature_set["features"])
 
 
-def test_policy_queue_derives_competition_from_governed_periods(
+def test_policy_queue_derives_competition_from_isolated_proposal_periods(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The competition spans the full governed validation window.
+    """The competition stays inside the isolated pre-final research view.
 
-    Proposals record the isolated pre-final research-loop view (enforced at
-    archive time).  Deriving the competition from that halved view makes the
-    swing/long minimum-OOS floors unreachable, so the queue must derive from
-    the governed payload periods instead.
+    The admission layer requires the competition out-of-sample to end at or
+    before the isolated valid_end (the formal pre-final OOS and the sealed
+    final test both sit later).  The horizon minimum-OOS floors are instead
+    satisfied by sizing the governed validation window at period-resolution
+    time, never by widening the competition past the isolated view.
     """
 
     periods = {
@@ -484,7 +485,6 @@ def test_policy_queue_derives_competition_from_governed_periods(
             "dataset_path": str(tmp_path),
             "dataset_identity_sha256": "b" * 64,
             "feature_set": feature_set,
-            "periods": periods,
         }
     }
 
@@ -506,7 +506,7 @@ def test_policy_queue_derives_competition_from_governed_periods(
 
     isolated = artifact["strategy_proposal"]["data_contract"]["research_periods"]
     assert isolated != periods
-    assert observed["periods"] == periods
+    assert observed["periods"] == isolated
 
 
 def _job_payload(feature_set: dict, periods: dict[str, str]) -> dict:

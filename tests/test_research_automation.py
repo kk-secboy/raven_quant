@@ -326,6 +326,69 @@ def test_multi_profile_windows_share_one_final_oos() -> None:
 
 
 @pytest.mark.no_database
+def test_horizon_windows_keep_isolated_selection_above_oos_floor(tmp_path) -> None:
+    from pathlib import Path
+
+    from quant_platform.rdagent_dataset_view import isolate_rdagent_periods
+    from quant_platform.research_horizon import research_horizon_contract
+    from quant_platform.strategy_research_evaluation import (
+        derive_strategy_research_competition_periods,
+    )
+
+    calendar: list[str] = []
+    day = date(2008, 1, 2)
+    while day <= date(2026, 9, 2):
+        if day.weekday() < 5:
+            calendar.append(day.isoformat())
+        day += timedelta(days=1)
+    dataset = Path(tmp_path)
+    (dataset / "calendars").mkdir()
+    (dataset / "calendars" / "day.txt").write_text(
+        "\n".join(calendar) + "\n", encoding="utf-8"
+    )
+
+    floors = {"short_1_5d": 252, "swing_1_6m": 504}
+    for profile, floor in floors.items():
+        periods, _audit = resolve_research_periods(
+            calendar, horizon_profile=profile
+        )
+        isolated = isolate_rdagent_periods(periods)
+        derived = derive_strategy_research_competition_periods(
+            isolated,
+            dataset_path=dataset,
+            purge_sessions=int(
+                research_horizon_contract(profile).purge_sessions or 0
+            ),
+            minimum_oos_observations=floor,
+        )
+        out_of_sample = derived["out_of_sample"]
+        sessions = sum(
+            1
+            for session in calendar
+            if out_of_sample["start"] <= session <= out_of_sample["end"]
+        )
+        assert sessions >= floor
+        assert out_of_sample["end"] < periods["test_start"]
+
+
+@pytest.mark.no_database
+def test_long_horizon_is_declared_unavailable_instead_of_failing_late() -> None:
+    from quant_platform.research_automation import ResearchWindowUnavailableError
+
+    calendar: list[str] = []
+    day = date(2008, 1, 2)
+    while day <= date(2026, 9, 2):
+        if day.weekday() < 5:
+            calendar.append(day.isoformat())
+        day += timedelta(days=1)
+
+    with pytest.raises(ResearchWindowUnavailableError) as excinfo:
+        resolve_research_periods(calendar, horizon_profile="long_1_3y")
+    assert excinfo.value.evidence["horizon_profile"] == "long_1_3y"
+    assert excinfo.value.evidence["capital_evaluation_eligible"] is False
+
+
+@pytest.mark.no_database
 def test_explicit_pre_cost_validation_is_rejected_instead_of_truncated() -> None:
     calendar = [
         (date(2010, 1, 1) + timedelta(days=offset)).isoformat()
