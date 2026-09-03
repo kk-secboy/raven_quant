@@ -189,6 +189,7 @@ from quant_platform.transparent_baseline_runner import (
     STRATEGY_RESEARCH_V23_TARGET_RECIPE_VERSION,
     STRATEGY_RESEARCH_V24_TARGET_RECIPE_VERSION,
     STRATEGY_RESEARCH_V25_TARGET_RECIPE_VERSION,
+    STRATEGY_RESEARCH_V26_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
@@ -342,6 +343,7 @@ def _transparent_worker_runtime_failures(
             STRATEGY_RESEARCH_V23_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V24_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V25_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_V26_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
         or target_runner_for_recipe(
@@ -405,7 +407,7 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
             "forward-only rehabilitation entry point"
         )
     if is_current_public_recipe and config.get("evidence_mode") != EVIDENCE_MODE_SEALED:
-        raise ValueError("the v26 strategy-research runtime requires sealed final OOS")
+        raise ValueError("the v27 strategy-research runtime requires sealed final OOS")
     if target_runner_for_recipe(recipe_id, recipe_version) is None:
         raise ValueError("the current transparent runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
