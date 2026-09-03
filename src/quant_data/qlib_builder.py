@@ -2215,6 +2215,7 @@ class QlibBuilder:
             daily_basic_columns = {
                 "ts_code",
                 "trade_date",
+                "close",
                 "total_mv",
                 "circ_mv",
                 "pb",
@@ -2231,7 +2232,9 @@ class QlibBuilder:
                 )
                 if daily_basic is None or daily_basic.empty:
                     continue
-                daily_basic = self._filter_governed_style_rows(daily_basic)
+                daily_basic = self._filter_governed_style_rows(
+                    self._with_derived_total_market_value(daily_basic)
+                )
                 if daily_basic.empty:
                     continue
                 adjusted_close = self._load_adjusted_close(batch)
