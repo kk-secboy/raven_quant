@@ -293,6 +293,7 @@ def run(args: argparse.Namespace) -> None:
     ]
     for asset_id in args.asset_id:
         export.extend(["--asset-id", asset_id])
+    export.extend(["--loop-n", str(args.loop_n)])
     if args.feature_set_id:
         export.extend(["--feature-set-id", args.feature_set_id])
     if args.feature_set_sha256:

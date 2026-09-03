@@ -1318,11 +1318,12 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
     costeer_knowledge = _costeer_knowledge_status()
     if args.scenario == "fin_strategy" and not strategy_proposals:
         raise RuntimeError("fin_strategy produced no governed strategy proposal")
-    if args.scenario == "fin_strategy" and len(strategy_proposals) > int(args.loop_n):
+    loop_budget = int(getattr(args, "loop_n", 1) or 1)
+    if args.scenario == "fin_strategy" and len(strategy_proposals) > loop_budget:
         # One evolving loop may compile several challenger drafts before it
         # settles.  The governed competition preregisters one candidate per
         # loop, so keep only the final compiled artifact(s) in trace order.
-        strategy_proposals = strategy_proposals[-int(args.loop_n) :]
+        strategy_proposals = strategy_proposals[-loop_budget:]
     if args.scenario == "fin_strategy" and (
         costeer_knowledge["costeer_used"] is not True
         or costeer_knowledge.get("strategy_codegen_used") is not True
@@ -1382,6 +1383,7 @@ def main() -> None:
     export_parser.add_argument("--asset-id", action="append", default=[])
     export_parser.add_argument("--feature-set-id")
     export_parser.add_argument("--feature-set-sha256")
+    export_parser.add_argument("--loop-n", type=int, default=1)
     export_parser.add_argument("--base-features")
     args = parser.parse_args()
     result = probe(args) if args.command == "probe" else export_trace(args)
