@@ -4388,7 +4388,11 @@ def _fundamental_revision_rows_sql(
     is_initial = (
         "coalesce(try_cast(update_flag AS DOUBLE) = 0, false)"
         if "update_flag" in source_columns
-        else "false"
+        # Providers without a revision-flag column (for example fina_audit)
+        # publish one payload per announcement; a single retained payload in a
+        # business-key group is the initial version, while conflicting payloads
+        # still fall through to the conservative ingested_at bound.
+        else "true"
     )
     hashed = ", ".join(
         f"coalesce(CAST({_sql_identifier(column)} AS VARCHAR), '<NULL>')"

@@ -2580,6 +2580,51 @@ def test_ingestion_boundary_is_stable_across_duckdb_session_timezones() -> None:
     ]
 
 
+def test_flagless_provider_singleton_payload_uses_announcement_date() -> None:
+    revision_rows = _fundamental_revision_rows_sql(
+        "SELECT * FROM revision_source",
+        payload_columns=["ts_code", "ann_date", "end_date", "audit_result"],
+        source_columns={"ts_code", "ann_date", "end_date", "audit_result", "ingested_at"},
+    )
+    connection = duckdb.connect()
+    try:
+        connection.execute("SET TimeZone='Asia/Shanghai'")
+        connection.execute(
+            """
+            CREATE TABLE revision_source AS
+            SELECT * FROM (VALUES
+                ('000001.SZ', '2016-04-22', '2015-12-31', '标准无保留意见',
+                 TIMESTAMPTZ '2026-08-22 10:00:00+00'),
+                ('000002.SZ', '2016-04-22', '2015-12-31', '标准无保留意见',
+                 TIMESTAMPTZ '2026-08-22 10:00:00+00'),
+                ('000002.SZ', '2016-04-22', '2015-12-31', '保留意见',
+                 TIMESTAMPTZ '2026-08-22 11:00:00+00')
+            ) AS t(ts_code, ann_date, end_date, audit_result, ingested_at)
+            """
+        )
+        observed = connection.execute(
+            "SELECT ts_code, audit_result, available_at, available_at_source FROM ("
+            + revision_rows
+            + ") ORDER BY ts_code, audit_result"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    # Providers without a revision-flag column (fina_audit) publish one payload
+    # per announcement: the singleton is visible on its announcement date,
+    # while a conflicting group stays on the conservative ingestion bound.
+    assert observed == [
+        ("000001.SZ", "标准无保留意见", date(2016, 4, 22), "announcement_date_initial"),
+        ("000002.SZ", "保留意见", date(2026, 8, 22), "ingested_at_upper_bound"),
+        (
+            "000002.SZ",
+            "标准无保留意见",
+            date(2026, 8, 22),
+            "ingested_at_upper_bound",
+        ),
+    ]
+
+
 def test_singleton_initial_payload_uses_announcement_before_ingestion(
     tmp_path: Path,
 ) -> None:
