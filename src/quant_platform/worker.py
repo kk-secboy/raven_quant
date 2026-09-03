@@ -645,6 +645,22 @@ class LocalJobWorker:
                 )
                 if not requeued:
                     self._mark_unhandled_job_failure(job, error_message)
+            except Exception as exc:  # noqa: BLE001 - the durable consumer must not die
+                # A deterministic payload/contract failure (KeyError, ValueError,
+                # RuntimeError, ...) must not kill the only consumer thread and
+                # leave the job stuck in "running" forever.  Mark it failed via
+                # the standard retry policy and keep consuming.
+                job_id = str(job["id"])
+                error_message = f"{type(exc).__name__}: {exc}"
+                try:
+                    self.store.finish_or_retry(
+                        job_id,
+                        exit_code=1,
+                        error=error_message,
+                        retryable=True,
+                    )
+                except SQLAlchemyError:
+                    self._mark_unhandled_job_failure(job, error_message)
 
     def _retry_transient_database(self, operation):
         """Retry one transactional database operation with bounded backoff."""
