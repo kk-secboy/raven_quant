@@ -170,7 +170,7 @@ from quant_platform.strategy_rule_compiler import (
     validate_strategy_rule_binding,
 )
 from quant_platform.strategy_trial_lineage import build_strategy_trial_lineage
-from quant_platform.transparent_baseline_lockbox import (
+from quant_platform.transparent_baseline_governance import (
     baseline_oos_sealed_member_set,
     validate_lockbox_link,
     validate_repair_registry_binding,

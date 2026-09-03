@@ -24,7 +24,7 @@ def _default_audit_validator(
     audit: Any, *, expected_receipt_sha256: str
 ) -> Mapping[str, Any]:
     # Lazy import avoids widening the strategy-store/lockbox import cycle.
-    from quant_platform.transparent_baseline_lockbox import (
+    from quant_platform.transparent_baseline_governance import (
         validate_pre_result_repair_audit_event,
     )
 

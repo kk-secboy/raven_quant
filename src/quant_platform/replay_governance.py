@@ -50,14 +50,14 @@ from quant_platform.strategy_artifact_manifest import (
     STRATEGY_BACKTEST_ARTIFACT_MANIFEST_VERSION,
     validate_backtest_artifact_manifest,
 )
-from quant_platform.transparent_baseline_lockbox import (
+from quant_platform.transparent_baseline_governance import (
     BOOTSTRAP_CONFIG_KEY,
     LOCKBOX_CONFIG_KEY,
     lockbox_member_link,
     validate_joint_lockbox,
     validate_unopened_history_selection,
 )
-from quant_platform.transparent_baseline_lockbox import (
+from quant_platform.transparent_baseline_governance import (
     canonical_sha256 as lockbox_canonical_sha256,
 )
 from quant_platform.transparent_baseline_runner import (

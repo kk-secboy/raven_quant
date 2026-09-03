@@ -158,7 +158,7 @@ def test_current_v14_closure_covers_execution_research_and_construction() -> Non
         "src/quant_platform/horizon_review.py",
         "src/quant_platform/strategy_recipes.py",
         "src/quant_platform/strategy_rule_compiler.py",
-        "src/quant_platform/transparent_baseline_lockbox.py",
+        "src/quant_platform/transparent_baseline_governance.py",
         "src/quant_platform/transparent_baseline_runner.py",
         "src/quant_data/qlib_builder.py",
         "src/quant_platform/runtime_source_closure.py",

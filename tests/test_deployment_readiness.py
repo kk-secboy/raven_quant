@@ -38,7 +38,7 @@ from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES
 from quant_platform.services import refresh_qlib_display_catalog
 from quant_platform.strategy_recipes import get_strategy_recipe
-from quant_platform.transparent_baseline_lockbox import (
+from quant_platform.transparent_baseline_governance import (
     LOCKBOX_CONFIG_KEY,
     build_all_unavailable_cash_only_receipt,
     build_joint_lockbox,

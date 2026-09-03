@@ -67,7 +67,7 @@ from .schedule_store import ACTIVE_SCHEDULE_KINDS
 from .scheduler import AUTOMATED_DATA_BUNDLES
 from .services import list_qlib_datasets_for_display
 from .strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS, get_strategy_recipe
-from .transparent_baseline_lockbox import (
+from .transparent_baseline_governance import (
     ALL_UNAVAILABLE_CASH_ONLY_ACTION,
     ALL_UNAVAILABLE_CASH_ONLY_AUTHORITY,
     ALL_UNAVAILABLE_CASH_ONLY_CONTRACT_VERSION,
