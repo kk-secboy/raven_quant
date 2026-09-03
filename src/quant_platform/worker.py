@@ -3008,7 +3008,16 @@ class LocalJobWorker:
             "sanitized_result_sha256": sanitized_result_sha256,
             "artifacts": archived,
         }
-        audit_path = write_immutable_json(root / "fin-strategy-audit.json", audit)
+        audit_encoded = (
+            json.dumps(audit, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        audit_sha256 = hashlib.sha256(audit_encoded).hexdigest()
+        # Content-address the audit manifest: retries of one run may compile
+        # different proposals, and a fixed filename would collide with the
+        # immutable-archive guard on the next attempt.
+        audit_path = write_immutable_json(
+            root / f"fin-strategy-audit-{audit_sha256[:24]}.json", audit
+        )
         audit_row = self.rdagent_candidates.register_run_artifact(
             research_run_id=run_id,
             artifact_type="fin_strategy_audit_manifest",
