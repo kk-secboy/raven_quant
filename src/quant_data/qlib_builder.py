@@ -1977,6 +1977,81 @@ class QlibBuilder:
             how="inner",
         ).drop(columns=["__governed_trade_date"])
 
+    def _with_derived_total_market_value(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
+        """Fill missing total market value from close x point-in-time shares.
+
+        The governed gateway serves ``daily_basic.total_mv`` only from 2016;
+        BaoStock-covered 2008-2015 rows carry prices but no share counts.  The
+        balancesheet PIT surface already records ``total_share`` per
+        announcement, so derive the missing market value instead of dropping
+        eight years of size/style history.  Rows that still have no announced
+        share count keep their NaN market value.
+        """
+
+        if (
+            daily_basic.empty
+            or "total_mv" not in daily_basic.columns
+            or "close" not in daily_basic.columns
+            or not daily_basic["total_mv"].isna().any()
+        ):
+            return daily_basic
+        symbols = sorted(daily_basic["ts_code"].dropna().astype(str).unique())
+        shares = self._read_dataset_for_symbols(
+            "balancesheet",
+            {
+                "ts_code",
+                "ann_date",
+                "end_date",
+                "f_ann_date",
+                "update_flag",
+                "ingested_at",
+                "total_share",
+            },
+            symbols,
+            required={"ts_code", "ann_date", "total_share"},
+        )
+        if shares is None or shares.empty:
+            return daily_basic
+        events = _select_fundamental_revision_events(
+            shares,
+            value_columns=["total_share"],
+        )
+        if events.empty:
+            return daily_basic
+        events = events.rename(columns={"available_at": "share_available_at"})
+        result = daily_basic.copy()
+        result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce")
+        filled_parts: list[pd.DataFrame] = []
+        share_groups = {
+            instrument: group[["share_available_at", "total_share"]]
+            for instrument, group in events.groupby("ts_code", sort=False)
+        }
+        for instrument, index in result.groupby("ts_code", sort=False).groups.items():
+            group = share_groups.get(instrument)
+            if group is None:
+                filled_parts.append(result.loc[index])
+                continue
+            target = result.loc[index].sort_values("trade_date")
+            joined = pd.merge_asof(
+                target,
+                group.sort_values("share_available_at"),
+                left_on="trade_date",
+                right_on="share_available_at",
+                direction="backward",
+                allow_exact_matches=False,
+            )
+            joined.index = target.index
+            filled_parts.append(joined)
+        merged = pd.concat(filled_parts).sort_index()
+        derived = (
+            pd.to_numeric(merged["close"], errors="coerce")
+            * pd.to_numeric(merged["total_share"], errors="coerce")
+            / 10000.0
+        )
+        missing = merged["total_mv"].isna() & derived.notna() & (derived > 0)
+        merged.loc[missing, "total_mv"] = derived.loc[missing]
+        return merged.drop(columns=["share_available_at", "total_share"])
+
     def _build_style_exposures(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
         """Extended Barra-style exposure panel with a backward-compatible schema.
 
@@ -1988,7 +2063,9 @@ class QlibBuilder:
         announcement-date ASOF channel inside style_exposure_panel.
         """
 
-        governed_daily_basic = self._filter_governed_style_rows(daily_basic)
+        governed_daily_basic = self._filter_governed_style_rows(
+            self._with_derived_total_market_value(daily_basic)
+        )
         panel = build_raw_style_panel(
             governed_daily_basic,
             adjusted_close=self._load_adjusted_close(),

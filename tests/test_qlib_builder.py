@@ -2625,6 +2625,40 @@ def test_flagless_provider_singleton_payload_uses_announcement_date() -> None:
     ]
 
 
+def test_derived_total_market_value_fills_baostock_years_point_in_time() -> None:
+    from types import SimpleNamespace
+
+    daily_basic = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"] * 3,
+            "trade_date": ["2012-03-01", "2012-05-02", "2016-01-05"],
+            "close": [10.0, 10.0, 20.0],
+            "total_mv": [float("nan"), float("nan"), 400_000.0],
+        }
+    )
+    balancesheet = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"],
+            "ann_date": ["2012-04-20"],
+            "end_date": ["2011-12-31"],
+            "total_share": [100_000_000.0],
+            "ingested_at": [pd.Timestamp("2012-04-20T08:00:00Z")],
+        }
+    )
+    builder = SimpleNamespace(
+        _read_dataset_for_symbols=lambda *_args, **_kwargs: balancesheet,
+    )
+
+    result = QlibBuilder._with_derived_total_market_value(builder, daily_basic)
+
+    # Before the 2012-04-20 announcement no share count is knowable.
+    assert pd.isna(result["total_mv"].iloc[0])
+    # close 10.0 x 100,000,000 shares / 10,000 = 100,000 (万元).
+    assert result["total_mv"].iloc[1] == pytest.approx(100_000.0)
+    # Existing provider market value is never overwritten.
+    assert result["total_mv"].iloc[2] == pytest.approx(400_000.0)
+
+
 def test_singleton_initial_payload_uses_announcement_before_ingestion(
     tmp_path: Path,
 ) -> None:
