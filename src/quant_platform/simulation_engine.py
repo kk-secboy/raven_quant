@@ -655,6 +655,7 @@ def execute_simulation_day(
                     trade_date=trade_date,
                     costs=cost_model,
                     rules=lot_rules[instrument],
+                    instrument=instrument,
                 )
             if side == "sell":
                 sell_position = state.get(instrument) or {}
@@ -676,6 +677,8 @@ def execute_simulation_day(
                 participation=participation,
                 asset_type=infer_cn_asset_type(instrument),
                 trade_date=trade_date,
+                instrument=instrument,
+                quantity=fill_quantity,
             )
             gross = fill_quantity * price
             fee = float(breakdown["total"])
@@ -1109,6 +1112,8 @@ def execute_atomic_pair_day(
                 asset_type=infer_cn_asset_type(spec["instrument"]),
                 trade_date=trade_date,
                 borrow_days=borrow_days,
+                instrument=spec["instrument"],
+                quantity=quantity,
             )
             gross = quantity * price
             fee = float(breakdown["total"])
@@ -1457,6 +1462,7 @@ def _affordable_buy_quantity(
     trade_date: date,
     costs: CostModelConfig,
     rules: OrderUnitRules,
+    instrument: str,
 ) -> int:
     result = lot_floor(min(quantity, int(cash / price)), rules) if price > 0 else 0
     while result > 0:
@@ -1467,6 +1473,8 @@ def _affordable_buy_quantity(
             participation=participation,
             asset_type=asset_type,
             trade_date=trade_date,
+            instrument=instrument,
+            quantity=result,
         )
         if gross + fee <= cash + 1e-9:
             return result

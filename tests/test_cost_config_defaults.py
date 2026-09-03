@@ -74,17 +74,33 @@ def test_strategy_request_accepts_dated_version_labels() -> None:
         )
 
 
-def test_governed_schedule_fails_closed_before_exact_transfer_fee_support() -> None:
+def test_governed_schedule_resolves_pre_2015_versions_exactly() -> None:
     from quant_platform.cost_model import CN_COST_SCHEDULE_BOOK
 
-    # Before 2015-08-01 Shanghai and Shenzhen used different transfer-fee
-    # bases that this traded-value-only model cannot reproduce exactly.
+    # Pre-2015 fee structures (bilateral stamp duty, Shanghai par-value and
+    # Shenzhen traded-value transfer fees) are recorded per effective range.
+    assert (
+        CN_COST_SCHEDULE_BOOK.as_of(date(2015, 7, 31)).version
+        == "cn-effective-cost-2012-09-01"
+    )
+    opening = CN_COST_SCHEDULE_BOOK.as_of(date(2008, 1, 2))
+    assert opening.version == "cn-effective-cost-2008-01-02"
+    assert opening.stock_buy_stamp_duty_rate == 0.003
+    assert opening.stock_sell_stamp_duty_rate == 0.003
+    assert opening.sh_transfer_fee_par_rate == 0.0005
+    assert opening.sz_transfer_fee_rate == 0.0000255
     with pytest.raises(ValueError, match="no effective cost schedule"):
-        CN_COST_SCHEDULE_BOOK.as_of(date(2015, 7, 31))
+        CN_COST_SCHEDULE_BOOK.as_of(date(2008, 1, 1))
     assert CN_COST_SCHEDULE_BOOK.as_of(date(2015, 8, 1)).transfer_fee_rate == 0.00002
     # No overlap and only the latest version is open-ended.
     versions = CN_COST_SCHEDULE_BOOK.versions
     assert [v.effective_to for v in versions[:-1]] == [
+        "2008-04-23",
+        "2008-09-18",
+        "2012-05-31",
+        "2012-08-31",
+        "2015-07-31",
         "2022-04-28",
         "2023-08-27",
     ]
+    assert versions[-1].effective_to is None

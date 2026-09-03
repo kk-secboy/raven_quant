@@ -5411,6 +5411,8 @@ class SimulationStore:
                             participation=cost_model.max_volume_participation,
                             asset_type=infer_cn_asset_type(instrument),
                             trade_date=trade_date,
+                            instrument=instrument,
+                            quantity=int(new["quantity"]) / maximum_slices,
                         )
                     )
                     self._freeze_order_cash(

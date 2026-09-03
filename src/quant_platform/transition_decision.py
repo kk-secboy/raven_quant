@@ -160,6 +160,8 @@ def estimate_transition_cost(
             participation=participation,
             asset_type=infer_cn_asset_type(instrument),
             trade_date=trade_date,
+            instrument=instrument,
+            quantity=gross_value / price,
         )
         total_cny += float(breakdown["total"])
         legs.append(

@@ -3042,17 +3042,17 @@ class PromotionStore:
         if config is None:
             raise ValueError(f"unknown cost schedule version: {cost_schedule_version}")
         participation = config.max_volume_participation
-        buy = config.estimate(
+        buy = config.reference_one_side_rate(
             side="buy",
             gross_value=_REFERENCE_ORDER_VALUE,
             participation=participation,
         )
-        sell = config.estimate(
+        sell = config.reference_one_side_rate(
             side="sell",
             gross_value=_REFERENCE_ORDER_VALUE,
             participation=participation,
         )
-        return (buy + sell) / (2.0 * _REFERENCE_ORDER_VALUE)
+        return (buy + sell) / 2.0
 
     def _event(self, version_id: str, *, event_type: str, actor: str, payload: dict) -> None:
         with self.engine.begin() as connection:

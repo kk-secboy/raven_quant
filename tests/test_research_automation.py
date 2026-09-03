@@ -296,14 +296,13 @@ def test_multi_profile_windows_share_one_final_oos() -> None:
     assert robust["validation_trading_days"] == 2520
     assert robust["requested_validation_trading_days"] == 2520
     assert robust["effective_validation_trading_days"] == effective_days["robust_10y"]
-    assert robust["effective_validation_trading_days"] < 2520
-    assert robust["periods"]["valid_start"] == "2015-08-03"
-    assert robust["authoritative_cost_schedule_effective_from"] == "2015-08-01"
-    assert robust["authoritative_cost_schedule_first_trading_day"] == "2015-08-03"
-    assert robust["validation_window_truncated"] is True
-    assert robust["validation_window_truncation_reason"] == (
-        "authoritative_cn_cost_schedule_start"
-    )
+    # The cost book covers 2008-01-02 onward, so a 2010-start calendar fits
+    # the full ten-year stress window without truncation.
+    assert robust["effective_validation_trading_days"] == 2520
+    assert robust["periods"]["valid_start"] == "2014-08-20"
+    assert robust["authoritative_cost_schedule_effective_from"] == "2008-01-02"
+    assert robust["authoritative_cost_schedule_first_trading_day"] == "2010-01-01"
+    assert robust["validation_window_truncated"] is False
     robust_train_days = (
         calendar.index(robust["periods"]["train_end"])
         - calendar.index(robust["periods"]["train_start"])
@@ -347,7 +346,7 @@ def test_horizon_windows_keep_isolated_selection_above_oos_floor(tmp_path) -> No
         "\n".join(calendar) + "\n", encoding="utf-8"
     )
 
-    floors = {"short_1_5d": 252, "swing_1_6m": 504}
+    floors = {"short_1_5d": 252, "swing_1_6m": 504, "long_1_3y": 756}
     for profile, floor in floors.items():
         periods, _audit = resolve_research_periods(
             calendar, horizon_profile=profile
@@ -375,9 +374,11 @@ def test_horizon_windows_keep_isolated_selection_above_oos_floor(tmp_path) -> No
 def test_long_horizon_is_declared_unavailable_instead_of_failing_late() -> None:
     from quant_platform.research_automation import ResearchWindowUnavailableError
 
+    # 2008-2020 leaves too little cost-covered history for the long-horizon
+    # competition chain (deepened validation plus a 756-session sealed test).
     calendar: list[str] = []
     day = date(2008, 1, 2)
-    while day <= date(2026, 9, 2):
+    while day <= date(2020, 12, 31):
         if day.weekday() < 5:
             calendar.append(day.isoformat())
         day += timedelta(days=1)
@@ -391,29 +392,29 @@ def test_long_horizon_is_declared_unavailable_instead_of_failing_late() -> None:
 @pytest.mark.no_database
 def test_explicit_pre_cost_validation_is_rejected_instead_of_truncated() -> None:
     calendar = [
-        (date(2010, 1, 1) + timedelta(days=offset)).isoformat()
+        (date(2005, 1, 3) + timedelta(days=offset)).isoformat()
         for offset in range(4000)
     ]
     explicit = {
-        "train_start": "2010-01-01",
-        "train_end": "2015-07-28",
-        "valid_start": "2015-07-31",
-        "valid_end": "2018-12-31",
-        "test_start": "2019-01-07",
-        "test_end": "2019-12-31",
+        "train_start": "2005-01-03",
+        "train_end": "2007-12-28",
+        "valid_start": "2007-12-31",
+        "valid_end": "2008-12-31",
+        "test_start": "2009-01-05",
+        "test_end": "2009-12-31",
     }
 
     with pytest.raises(ValueError, match="explicit research validation starts before"):
         resolve_research_periods(calendar, periods=explicit)
 
-    assert explicit["valid_start"] == "2015-07-31"
+    assert explicit["valid_start"] == "2007-12-31"
 
 
 @pytest.mark.no_database
 def test_rolling_profiles_are_truncated_to_cost_coverage_without_fake_depth() -> None:
     calendar: list[str] = []
     day = date(2005, 1, 3)
-    while len(calendar) < 4000:
+    while len(calendar) < 2200:
         if day.weekday() < 5:
             calendar.append(day.isoformat())
         day += timedelta(days=1)
@@ -425,7 +426,13 @@ def test_rolling_profiles_are_truncated_to_cost_coverage_without_fake_depth() ->
     )
 
     by_id = {str(item["id"]): item for item in profiles}
-    assert by_id["balanced_5y"]["periods"]["valid_start"] >= "2015-08-03"
+    # The 2008-01-02 cost boundary truncates both deep profiles; the
+    # confirmation profile is then shortened to a distinct midpoint instead
+    # of double-counting the stress window.
+    assert by_id["robust_10y"]["periods"]["valid_start"] == "2008-01-02"
+    assert by_id["robust_10y"]["validation_window_truncated"] is True
+    assert by_id["robust_10y"]["effective_validation_trading_days"] == 1161
+    assert by_id["balanced_5y"]["periods"]["valid_start"] == "2008-10-10"
     assert by_id["balanced_5y"]["validation_window_truncated"] is True
     assert by_id["balanced_5y"]["effective_validation_trading_days"] < (
         by_id["balanced_5y"]["requested_validation_trading_days"]

@@ -9,11 +9,18 @@ COST_SCHEDULE_VERSION = "cn-effective-cost-v1"
 
 # Effective-dated schedule versions recorded from the named announcements.
 #
-# The governed schedule intentionally starts on 2015-08-01.  Before that date
-# Shanghai charged transfer fees on face value while Shenzhen charged on
-# traded value, and the exact rules changed again in 2012.  This model does not
-# receive par value, so pretending one flat traded-value rate is exact would
-# corrupt per-fill cash and NAV.  Pre-2015 runs therefore fail closed.
+# Pre-2015 secondary-market fees differ structurally from the current law:
+# stamp duty was charged bilaterally until 2008-09-19, Shanghai levied its
+# transfer fee on par value (not traded value) until 2015-08-01, and Shenzhen
+# levied its own lower traded-value rate.  The model therefore carries a
+# buy-side stamp rate plus per-market transfer-fee fields; Shanghai par-value
+# fees are computed from the filled quantity and the sealed par-value table
+# below.  Every pre-2015 effective range is recorded with its announcement.
+COST_SCHEDULE_VERSION_2008 = "cn-effective-cost-2008-01-02"
+COST_SCHEDULE_VERSION_2008_STAMP_CUT = "cn-effective-cost-2008-04-24"
+COST_SCHEDULE_VERSION_2008_UNILATERAL = "cn-effective-cost-2008-09-19"
+COST_SCHEDULE_VERSION_2012 = "cn-effective-cost-2012-06-01"
+COST_SCHEDULE_VERSION_2012_SECOND = "cn-effective-cost-2012-09-01"
 COST_SCHEDULE_VERSION_2015 = "cn-effective-cost-2015-08-01"
 COST_SCHEDULE_VERSION_2022 = "cn-effective-cost-2022-04-29"
 COST_SCHEDULE_VERSION_2023 = "cn-effective-cost-2023-08-28"
@@ -21,6 +28,11 @@ COST_SCHEDULE_VERSION_2023 = "cn-effective-cost-2023-08-28"
 KNOWN_COST_SCHEDULE_VERSIONS = frozenset(
     {
         COST_SCHEDULE_VERSION,
+        COST_SCHEDULE_VERSION_2008,
+        COST_SCHEDULE_VERSION_2008_STAMP_CUT,
+        COST_SCHEDULE_VERSION_2008_UNILATERAL,
+        COST_SCHEDULE_VERSION_2012,
+        COST_SCHEDULE_VERSION_2012_SECOND,
         COST_SCHEDULE_VERSION_2015,
         COST_SCHEDULE_VERSION_2022,
         COST_SCHEDULE_VERSION_2023,
@@ -45,6 +57,42 @@ def infer_cn_asset_type(instrument: str) -> str:
     return "stock"
 
 
+def infer_cn_exchange(instrument: str) -> str:
+    """Return the listing exchange ("sh" or "sz") for one CN instrument."""
+
+    value = str(instrument).upper()
+    if value.startswith(("SH", "60", "68", "50", "51", "52", "56", "58")):
+        return "sh"
+    if value.startswith(("SZ", "00", "30", "15", "16", "18")):
+        return "sz"
+    digits = "".join(character for character in value if character.isdigit())[-6:]
+    if len(digits) != 6:
+        raise ValueError(f"cannot classify Chinese exchange: {instrument}")
+    if digits.startswith(("60", "68", "50", "51", "52", "56", "58")):
+        return "sh"
+    if digits.startswith(("00", "30", "15", "16", "18")):
+        return "sz"
+    raise ValueError(f"cannot classify Chinese exchange: {instrument}")
+
+
+# Sealed par-value exceptions.  A-share par value is CNY 1.00 for essentially
+# every listing; the handful of historical exceptions inside the governed
+# 2008+ coverage are recorded here.  No-par red-chip STAR listings only exist
+# from 2019 and are outside the pre-2015 ranges that need par value.
+CN_A_SHARE_PAR_VALUE_EXCEPTIONS: dict[str, float] = {
+    "601899": 0.1,  # 紫金矿业
+    "603993": 0.2,  # 洛阳钼业
+}
+CN_A_SHARE_DEFAULT_PAR_VALUE = 1.0
+
+
+def infer_cn_par_value(instrument: str) -> float:
+    digits = "".join(character for character in str(instrument) if character.isdigit())[-6:]
+    if len(digits) != 6:
+        raise ValueError(f"cannot resolve Chinese par value: {instrument}")
+    return CN_A_SHARE_PAR_VALUE_EXCEPTIONS.get(digits, CN_A_SHARE_DEFAULT_PAR_VALUE)
+
+
 @dataclass(frozen=True)
 class CostModelConfig:
     """One effective-dated cost version shared by research, Qlib and execution.
@@ -61,8 +109,11 @@ class CostModelConfig:
     buy_commission_rate: float = 0.0005
     sell_commission_rate: float = 0.0005
     stock_sell_stamp_duty_rate: float = CURRENT_STOCK_SELL_STAMP_DUTY_RATE
+    stock_buy_stamp_duty_rate: float = 0.0
     etf_sell_stamp_duty_rate: float = 0.0
     transfer_fee_rate: float = CURRENT_TRANSFER_FEE_RATE
+    sh_transfer_fee_par_rate: float = 0.0
+    sz_transfer_fee_rate: float | None = None
     annual_borrow_rate: float = 0.0
     min_commission: float = 5.0
     fixed_slippage_rate: float = 0.0005
@@ -76,14 +127,18 @@ class CostModelConfig:
             self.buy_commission_rate,
             self.sell_commission_rate,
             self.stock_sell_stamp_duty_rate,
+            self.stock_buy_stamp_duty_rate,
             self.etf_sell_stamp_duty_rate,
             self.transfer_fee_rate,
+            self.sh_transfer_fee_par_rate,
             self.annual_borrow_rate,
             self.fixed_slippage_rate,
             self.max_volume_participation,
             self.impact_at_max_participation,
         )
         if min(rates) < 0 or self.max_volume_participation <= 0:
+            raise ValueError("cost rates and participation limit must be non-negative")
+        if self.sz_transfer_fee_rate is not None and self.sz_transfer_fee_rate < 0:
             raise ValueError("cost rates and participation limit must be non-negative")
         if self.min_commission < 0 or self.lot_size < 1:
             raise ValueError("minimum commission and lot size are invalid")
@@ -125,8 +180,15 @@ class CostModelConfig:
             buy_commission_rate=self.buy_commission_rate * 2,
             sell_commission_rate=self.sell_commission_rate * 2,
             stock_sell_stamp_duty_rate=self.stock_sell_stamp_duty_rate * 2,
+            stock_buy_stamp_duty_rate=self.stock_buy_stamp_duty_rate * 2,
             etf_sell_stamp_duty_rate=self.etf_sell_stamp_duty_rate * 2,
             transfer_fee_rate=self.transfer_fee_rate * 2,
+            sh_transfer_fee_par_rate=self.sh_transfer_fee_par_rate * 2,
+            sz_transfer_fee_rate=(
+                None
+                if self.sz_transfer_fee_rate is None
+                else self.sz_transfer_fee_rate * 2
+            ),
             annual_borrow_rate=self.annual_borrow_rate * 2,
             fixed_slippage_rate=self.fixed_slippage_rate * 2,
             impact_at_max_participation=self.impact_at_max_participation * 2,
@@ -163,6 +225,25 @@ class CostModelConfig:
         ratio = participation / self.max_volume_participation
         return self.impact_at_max_participation * sqrt(ratio)
 
+    @property
+    def uses_per_market_transfer_fee(self) -> bool:
+        return self.sh_transfer_fee_par_rate > 0 or self.sz_transfer_fee_rate is not None
+
+    def conservative_transfer_value_rate(self) -> float:
+        """Worst-case transfer fee expressed as one traded-value rate.
+
+        Shanghai's pre-2015 par-value fee is bounded by its par rate itself:
+        par value never exceeds CNY 1 within the sealed exceptions and A-share
+        prices do not sustain below CNY 1, so fee/value <= par_rate.  Valueless
+        screening paths use this bound instead of silently dropping the fee.
+        """
+
+        return max(
+            self.transfer_fee_rate,
+            self.sz_transfer_fee_rate or 0.0,
+            self.sh_transfer_fee_par_rate,
+        )
+
     def estimate_breakdown(
         self,
         *,
@@ -172,6 +253,8 @@ class CostModelConfig:
         asset_type: str = "stock",
         trade_date: date | None = None,
         borrow_days: int = 0,
+        instrument: str | None = None,
+        quantity: float | None = None,
     ) -> dict[str, float | str]:
         if gross_value < 0:
             raise ValueError("gross value must be non-negative")
@@ -183,6 +266,8 @@ class CostModelConfig:
             raise ValueError("cost schedule does not support this asset type")
         if borrow_days < 0:
             raise ValueError("borrow days must be non-negative")
+        if quantity is not None and quantity < 0:
+            raise ValueError("quantity must be non-negative")
         if trade_date is not None and not self.covers(trade_date):
             raise ValueError("no effective cost schedule exists for the trade date")
         commission_rate = (
@@ -193,22 +278,49 @@ class CostModelConfig:
             if gross_value > 0
             else 0.0
         )
-        stamp_rate = 0.0
-        if normalized_side == "sell":
+        if normalized_asset == "stock":
             stamp_rate = (
-                self.stock_sell_stamp_duty_rate
-                if normalized_asset == "stock"
-                else self.etf_sell_stamp_duty_rate
+                self.stock_buy_stamp_duty_rate
+                if normalized_side == "buy"
+                else self.stock_sell_stamp_duty_rate
+            )
+        else:
+            stamp_rate = (
+                self.etf_sell_stamp_duty_rate if normalized_side == "sell" else 0.0
             )
         stamp_duty = gross_value * stamp_rate
         # ChinaClear's secondary-market transaction transfer fee is an A-share
         # charge. ETF creation/redemption can have separate basket transfer
         # fees, but those are not incurred by this secondary-market simulator.
-        transfer_fee = (
-            gross_value * self.transfer_fee_rate
-            if normalized_asset == "stock"
-            else 0.0
-        )
+        transfer_fee = 0.0
+        transfer_fee_basis = "none"
+        if normalized_asset == "stock" and gross_value > 0:
+            if self.uses_per_market_transfer_fee:
+                if instrument is None:
+                    raise ValueError(
+                        "per-market transfer fee requires the traded instrument"
+                    )
+                exchange = infer_cn_exchange(instrument)
+                if exchange == "sh" and self.sh_transfer_fee_par_rate > 0:
+                    if quantity is None:
+                        raise ValueError(
+                            "Shanghai par-value transfer fee requires the filled quantity"
+                        )
+                    transfer_fee = (
+                        quantity
+                        * infer_cn_par_value(instrument)
+                        * self.sh_transfer_fee_par_rate
+                    )
+                    transfer_fee_basis = "par_value"
+                elif exchange == "sz" and self.sz_transfer_fee_rate is not None:
+                    transfer_fee = gross_value * self.sz_transfer_fee_rate
+                    transfer_fee_basis = "traded_value"
+                else:
+                    transfer_fee = gross_value * self.transfer_fee_rate
+                    transfer_fee_basis = "traded_value"
+            else:
+                transfer_fee = gross_value * self.transfer_fee_rate
+                transfer_fee_basis = "traded_value"
         slippage = gross_value * self.fixed_slippage_rate
         impact = gross_value * self.market_impact_rate(participation)
         borrow = gross_value * self.annual_borrow_rate * borrow_days / 252.0
@@ -219,6 +331,7 @@ class CostModelConfig:
             "commission": commission,
             "stamp_duty": stamp_duty,
             "transfer_fee": transfer_fee,
+            "transfer_fee_basis": transfer_fee_basis,
             "slippage": slippage,
             "market_impact": impact,
             "borrow_cost": borrow,
@@ -234,6 +347,8 @@ class CostModelConfig:
         asset_type: str = "stock",
         trade_date: date | None = None,
         borrow_days: int = 0,
+        instrument: str | None = None,
+        quantity: float | None = None,
     ) -> float:
         return float(
             self.estimate_breakdown(
@@ -243,8 +358,46 @@ class CostModelConfig:
                 asset_type=asset_type,
                 trade_date=trade_date,
                 borrow_days=borrow_days,
+                instrument=instrument,
+                quantity=quantity,
             )["total"]
         )
+
+    def reference_one_side_rate(
+        self,
+        *,
+        side: str,
+        gross_value: float,
+        participation: float,
+    ) -> float:
+        """One-side value rate without per-instrument data.
+
+        Uses the conservative transfer-fee bound so version-level reference
+        rates stay honest for per-market (pre-2015) schedule versions.
+        """
+
+        if gross_value <= 0:
+            raise ValueError("reference gross value must be positive")
+        if side not in {"buy", "sell"}:
+            raise ValueError("cost side must be buy or sell")
+        commission_rate = (
+            self.buy_commission_rate if side == "buy" else self.sell_commission_rate
+        )
+        stamp_rate = (
+            self.stock_buy_stamp_duty_rate
+            if side == "buy"
+            else self.stock_sell_stamp_duty_rate
+        )
+        return (
+            max(self.min_commission, gross_value * commission_rate)
+            + gross_value
+            * (
+                stamp_rate
+                + self.conservative_transfer_value_rate()
+                + self.fixed_slippage_rate
+                + self.market_impact_rate(participation)
+            )
+        ) / gross_value
 
     def factor_screening_rate(
         self,
@@ -259,17 +412,17 @@ class CostModelConfig:
         assumed_participation = (
             self.max_volume_participation if participation is None else participation
         )
-        buy = self.estimate(
+        buy = self.reference_one_side_rate(
             side="buy",
             gross_value=reference_order_value,
             participation=assumed_participation,
         )
-        sell = self.estimate(
+        sell = self.reference_one_side_rate(
             side="sell",
             gross_value=reference_order_value,
             participation=assumed_participation,
         )
-        return (buy + sell) / reference_order_value
+        return buy + sell
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -287,7 +440,89 @@ _BROKER_ASSUMPTIONS: dict[str, Any] = {
     "impact_at_max_participation": 0.0010,
 }
 
+# Pre-2015 commissions were broker-negotiated under the 2002 floating regime
+# capped at 0.003 per side.  Seal a deliberately cost-pessimistic 0.002 per
+# side so pre-2015 evidence is never flattered by today's cheaper assumption.
+_PRE_2015_BROKER_ASSUMPTIONS: dict[str, Any] = {
+    **_BROKER_ASSUMPTIONS,
+    "buy_commission_rate": 0.002,
+    "sell_commission_rate": 0.002,
+}
+
 CN_COST_SCHEDULE_VERSIONS: tuple[CostModelConfig, ...] = (
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2008,
+        effective_from="2008-01-02",
+        effective_to="2008-04-23",
+        stock_sell_stamp_duty_rate=0.003,
+        stock_buy_stamp_duty_rate=0.003,
+        transfer_fee_rate=0.0,
+        sh_transfer_fee_par_rate=0.0005,
+        sz_transfer_fee_rate=0.0000255,
+        source=(
+            "财政部 国家税务总局 2007-05-29 通知：2007-05-30 起证券交易印花税 "
+            "按成交金额 3‰ 双边征收；中国结算：沪市过户费按成交面额 0.5‰ 双边，"
+            "深市按成交金额 0.0255‰ 双边"
+        ),
+        **_PRE_2015_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2008_STAMP_CUT,
+        effective_from="2008-04-24",
+        effective_to="2008-09-18",
+        stock_sell_stamp_duty_rate=0.001,
+        stock_buy_stamp_duty_rate=0.001,
+        transfer_fee_rate=0.0,
+        sh_transfer_fee_par_rate=0.0005,
+        sz_transfer_fee_rate=0.0000255,
+        source=(
+            "财政部 国家税务总局：2008-04-24 起证券交易印花税由 3‰ 下调为 "
+            "1‰（双边征收）"
+        ),
+        **_PRE_2015_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2008_UNILATERAL,
+        effective_from="2008-09-19",
+        effective_to="2012-05-31",
+        stock_sell_stamp_duty_rate=0.001,
+        transfer_fee_rate=0.0,
+        sh_transfer_fee_par_rate=0.0005,
+        sz_transfer_fee_rate=0.0000255,
+        source=(
+            "财税明电〔2008〕2号：2008-09-19 起证券交易印花税改为对出让方 "
+            "单边按 1‰ 征收"
+        ),
+        **_PRE_2015_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2012,
+        effective_from="2012-06-01",
+        effective_to="2012-08-31",
+        stock_sell_stamp_duty_rate=0.001,
+        transfer_fee_rate=0.0,
+        sh_transfer_fee_par_rate=0.000375,
+        sz_transfer_fee_rate=0.0000255,
+        source=(
+            "中国结算 2012-04-30《关于调整A股交易过户费收费标准的通知》："
+            "2012-06-01 起沪市过户费按成交面额 0.375‰ 双边收取"
+        ),
+        **_PRE_2015_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2012_SECOND,
+        effective_from="2012-09-01",
+        effective_to="2015-07-31",
+        stock_sell_stamp_duty_rate=0.001,
+        transfer_fee_rate=0.0,
+        sh_transfer_fee_par_rate=0.0003,
+        sz_transfer_fee_rate=0.0000255,
+        source=(
+            "中国结算 2012-08-02《关于进一步调整A股交易过户费收费标准有关事项"
+            "的通知》：2012-09-01 起沪市过户费按成交面额 0.3‰ 双边收取"
+        ),
+        **_PRE_2015_BROKER_ASSUMPTIONS,
+    ),
     CostModelConfig(
         version=COST_SCHEDULE_VERSION_2015,
         effective_from="2015-08-01",
@@ -480,9 +715,18 @@ class CostScheduleBook:
         """Flat Qlib-style cost view resolved at one explicit date."""
 
         config = self.as_of(as_of)
+        transfer_bound = config.conservative_transfer_value_rate()
         return {
-            "open_cost": config.buy_commission_rate,
-            "close_cost": config.sell_commission_rate,
+            "open_cost": (
+                config.buy_commission_rate
+                + config.stock_buy_stamp_duty_rate
+                + transfer_bound
+            ),
+            "close_cost": (
+                config.sell_commission_rate
+                + config.stock_sell_stamp_duty_rate
+                + transfer_bound
+            ),
             "min_cost": config.min_commission,
             "trade_unit": config.lot_size,
             "slippage": config.fixed_slippage_rate,

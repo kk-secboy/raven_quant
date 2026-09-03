@@ -176,29 +176,27 @@ def test_pre_2022_unopened_history_runs_short_and_swing_without_fake_10y() -> No
     short_periods, short = resolve_research_periods(
         calendar, horizon_profile=SHORT_1_5D
     )
+    swing_periods, swing = resolve_research_periods(
+        calendar, horizon_profile=SWING_1_6M
+    )
 
     assert len(calendar) == 3527
-    assert sum(day >= "2015-08-03" for day in calendar) == 1683
+    # The cost book covers 2008-01-02 onward, so every session of this
+    # 2008-start audit calendar is cost-covered.
+    assert sum(day >= "2008-01-02" for day in calendar) == len(calendar)
     assert short_periods["test_end"] < "2022-07-06"
+    assert swing_periods["test_end"] < "2022-07-06"
     assert [item["id"] for item in short["evaluation_profiles"]] == [
         "recent_3y",
         "robust_10y",
         "balanced_5y",
     ]
-
-    # The swing selection segment must cover its 504-session OOS floor after
-    # the 60/40 research isolation, which needs a deeper validation window
-    # than this calendar's cost-covered tail can host.  Resolution must say
-    # so up front instead of letting the run fail after research compute.
-    with pytest.raises(ResearchWindowUnavailableError) as captured:
-        resolve_research_periods(calendar, horizon_profile=SWING_1_6M)
-
-    evidence = captured.value.evidence
-    assert evidence["horizon_profile"] == SWING_1_6M
-    assert evidence["capital_evaluation_eligible"] is False
-    assert evidence["capital_evaluation_unavailable_reason"] == (
-        "horizon_window_cannot_host_fair_competition"
-    )
+    assert [item["id"] for item in swing["evaluation_profiles"]] == [
+        "recent_3y",
+        "robust_10y",
+        "balanced_5y",
+    ]
+    assert swing["evaluation_profile_resolution"]["capital_evaluation_eligible"] is True
 
 
 @pytest.mark.no_database
@@ -209,28 +207,16 @@ def test_pre_2022_long_is_explicitly_unavailable_without_weakening_oos() -> None
         resolve_research_periods(calendar, horizon_profile=LONG_1_3Y)
 
     evidence = captured.value.evidence
+    assert evidence["horizon_profile"] == LONG_1_3Y
     assert evidence["calendar_trading_days"] == 3527
     assert evidence["capital_evaluation_eligible"] is False
+    # Resolution succeeds, but the frozen long-horizon window cannot host an
+    # executable fair competition on this calendar: the deepened validation
+    # window plus the 756-session sealed test leave no cost-covered room for
+    # the in-sample selection segment.
     assert evidence["capital_evaluation_unavailable_reason"] == (
-        "primary_and_distinct_stress_profiles_required"
+        "horizon_window_cannot_host_fair_competition"
     )
-    assert evidence["effective_profiles"] == ["recent_3y"]
-    assert {item["id"] for item in evidence["unavailable_profiles"]} == {
-        "robust_10y",
-        "balanced_5y",
-    }
-    primary = next(
-        item
-        for item in evidence["requested_profiles"]
-        if item["id"] == "recent_3y"
-    )
-    assert primary["periods"]["test_end"] == calendar[-253]
-    assert sum(
-        primary["periods"]["test_start"]
-        <= day
-        <= primary["periods"]["test_end"]
-        for day in calendar
-    ) == 756
 
 
 @pytest.mark.no_database

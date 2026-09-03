@@ -44,11 +44,15 @@ class SquareRootImpactExchange(Exchange):
         )
         conservative_buy = (
             start_config.buy_commission_rate
+            + start_config.stock_buy_stamp_duty_rate
+            + start_config.conservative_transfer_value_rate()
             + start_config.fixed_slippage_rate
             + start_config.impact_at_max_participation
         )
         conservative_sell = (
             start_config.sell_commission_rate
+            + start_config.stock_sell_stamp_duty_rate
+            + start_config.conservative_transfer_value_rate()
             + start_config.fixed_slippage_rate
             + start_config.impact_at_max_participation
         )
@@ -155,6 +159,8 @@ class SquareRootImpactExchange(Exchange):
             participation=participation,
             asset_type=infer_cn_asset_type(str(order.stock_id)),
             trade_date=trade_date,
+            instrument=str(order.stock_id),
+            quantity=trade_value / trade_price if trade_price > 0 else 0.0,
         )
         self._record_fill(
             order,

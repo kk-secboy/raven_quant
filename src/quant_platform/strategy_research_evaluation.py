@@ -460,6 +460,13 @@ def derive_strategy_research_competition_periods_from_calendar(
     if len(valid) < minimum_oos:
         raise ValueError("strategy validation window is shorter than its preregistered OOS")
     split = max(minimum_history - 1, len(train) // 2 - 1)
+    # Prefer the deepest fair-comparison history that still leaves the
+    # in-sample selection segment its preregistered floor after the purge
+    # gap.  The 50/50 default is a heuristic; when it is the only binding
+    # constraint, back the split off to the latest feasible index instead of
+    # failing an otherwise satisfiable window.
+    latest_feasible_split = len(train) - 2 * purge - minimum_in_sample - 2
+    split = min(split, max(minimum_history - 1, latest_feasible_split))
     first_cost_train_index = int(train.searchsorted(first_cost_date, side="left"))
     in_start_index = max(split + purge + 1, first_cost_train_index)
     in_end_index = len(train) - purge - 1

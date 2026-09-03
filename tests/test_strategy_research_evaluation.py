@@ -156,9 +156,10 @@ def test_competition_periods_keep_history_but_clamp_trades_to_cost_coverage(
     assert periods["governance"]["historical_validation_periods"]["end"] == (
         "2015-03-12"
     )
-    # 2015-08-01 was a Saturday; the first cost-covered trading session in
-    # this frozen calendar is the following Monday.
-    assert periods["in_sample"]["start"] == "2015-08-03"
+    # The cost book now covers 2008-01-02 onward, so the in-sample segment
+    # starts right after the history split and purge gap instead of being
+    # clamped to the old 2015-08-01 cost boundary.
+    assert periods["in_sample"]["start"] == "2015-03-23"
     assert periods["out_of_sample"]["start"] == "2022-06-01"
 
 
@@ -167,18 +168,20 @@ def test_competition_periods_fail_when_cost_covered_selection_is_too_short(
     tmp_path,
 ) -> None:
     dataset_path = _write_business_day_calendar(
-        tmp_path, "2013-01-02", "2017-12-29"
+        tmp_path, "2005-01-03", "2017-12-29"
     )
 
+    # Training ends eleven months after the 2008-01-02 cost boundary, leaving
+    # fewer cost-covered sessions than the in-sample floor plus purge gap.
     with pytest.raises(ValueError, match="cost-covered strategy training window"):
         derive_strategy_research_competition_periods(
             {
-                "train_start": "2013-01-02",
-                "train_end": "2016-04-29",
-                "valid_start": "2016-05-16",
-                "valid_end": "2016-12-30",
-                "test_start": "2017-01-03",
-                "test_end": "2017-12-29",
+                "train_start": "2005-01-03",
+                "train_end": "2008-11-28",
+                "valid_start": "2008-12-15",
+                "valid_end": "2009-12-31",
+                "test_start": "2010-01-04",
+                "test_end": "2010-12-31",
             },
             dataset_path=dataset_path,
             purge_sessions=6,

@@ -220,11 +220,98 @@ def test_book_scaled_applies_to_every_recorded_version() -> None:
 
 def test_flat_view_resolves_qlib_triple_at_explicit_date() -> None:
     flat = CN_COST_SCHEDULE_BOOK.flat_view(as_of=date(2024, 1, 2))
-    assert flat["open_cost"] == pytest.approx(0.0005)
-    assert flat["close_cost"] == pytest.approx(0.0005)
+    assert flat["open_cost"] == pytest.approx(0.0005 + 0.00001)
+    assert flat["close_cost"] == pytest.approx(0.0005 + 0.0005 + 0.00001)
     assert flat["min_cost"] == pytest.approx(5.0)
     assert flat["cost_schedule_version"] == "cn-effective-cost-2023-08-28"
     assert flat["as_of"] == "2024-01-02"
+
+
+def test_pre_2015_shanghai_transfer_fee_uses_par_value_per_fill() -> None:
+    config = CN_COST_SCHEDULE_BOOK.as_of(date(2010, 6, 1))
+    assert config.version == "cn-effective-cost-2008-09-19"
+    breakdown = config.estimate_breakdown(
+        side="buy",
+        gross_value=100_000,
+        participation=0.01,
+        instrument="600000",
+        quantity=10_000,
+    )
+    # 10,000 shares x CNY 1.00 par x 0.5 per mille, charged on par not value.
+    assert breakdown["transfer_fee"] == pytest.approx(10_000 * 1.0 * 0.0005)
+    assert breakdown["transfer_fee_basis"] == "par_value"
+    assert breakdown["stamp_duty"] == pytest.approx(0.0)
+
+    exception = config.estimate_breakdown(
+        side="sell",
+        gross_value=50_000,
+        participation=0.01,
+        instrument="603993",
+        quantity=5_000,
+    )
+    # 洛阳钼业 par CNY 0.20; sell-side stamp duty remains traded-value based.
+    assert exception["transfer_fee"] == pytest.approx(5_000 * 0.2 * 0.0005)
+    assert exception["stamp_duty"] == pytest.approx(50_000 * 0.001)
+
+
+def test_pre_2015_shenzhen_transfer_fee_uses_traded_value() -> None:
+    config = CN_COST_SCHEDULE_BOOK.as_of(date(2010, 6, 1))
+    breakdown = config.estimate_breakdown(
+        side="buy",
+        gross_value=100_000,
+        participation=0.01,
+        instrument="000001",
+        quantity=10_000,
+    )
+    assert breakdown["transfer_fee"] == pytest.approx(100_000 * 0.0000255)
+    assert breakdown["transfer_fee_basis"] == "traded_value"
+
+
+def test_pre_2015_bilateral_stamp_duty_charges_both_sides() -> None:
+    config = CN_COST_SCHEDULE_BOOK.as_of(date(2008, 3, 3))
+    assert config.version == "cn-effective-cost-2008-01-02"
+    buy = config.estimate_breakdown(
+        side="buy",
+        gross_value=100_000,
+        participation=0.01,
+        instrument="600000",
+        quantity=10_000,
+    )
+    sell = config.estimate_breakdown(
+        side="sell",
+        gross_value=100_000,
+        participation=0.01,
+        instrument="600000",
+        quantity=10_000,
+    )
+    assert buy["stamp_duty"] == pytest.approx(100_000 * 0.003)
+    assert sell["stamp_duty"] == pytest.approx(100_000 * 0.003)
+
+    cut = CN_COST_SCHEDULE_BOOK.as_of(date(2008, 5, 6))
+    assert cut.version == "cn-effective-cost-2008-04-24"
+    assert cut.stock_buy_stamp_duty_rate == 0.001
+    assert cut.stock_sell_stamp_duty_rate == 0.001
+
+
+def test_per_market_transfer_fee_fails_closed_without_fill_details() -> None:
+    config = CN_COST_SCHEDULE_BOOK.as_of(date(2010, 6, 1))
+    with pytest.raises(ValueError, match="requires the traded instrument"):
+        config.estimate(
+            side="buy",
+            gross_value=100_000,
+            participation=0.01,
+        )
+    with pytest.raises(ValueError, match="requires the filled quantity"):
+        config.estimate(
+            side="buy",
+            gross_value=100_000,
+            participation=0.01,
+            instrument="600000",
+        )
+    # Value-free screening still prices the fee through the conservative bound.
+    assert config.conservative_transfer_value_rate() == pytest.approx(0.0005)
+    rate = config.factor_screening_rate(reference_order_value=100_000)
+    assert rate > 0.003
 
 
 def test_single_version_range_check_semantics_are_preserved() -> None:
