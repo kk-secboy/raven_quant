@@ -2018,12 +2018,17 @@ class QlibBuilder:
         )
         if events.empty:
             return daily_basic
-        events = events.rename(columns={"available_at": "share_available_at"})
+        events = events.rename(
+            columns={
+                "available_at": "share_available_at",
+                "total_share": "announced_total_share",
+            }
+        )
         result = daily_basic.copy()
         result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce")
         filled_parts: list[pd.DataFrame] = []
         share_groups = {
-            instrument: group[["share_available_at", "total_share"]]
+            instrument: group[["share_available_at", "announced_total_share"]]
             for instrument, group in events.groupby("ts_code", sort=False)
         }
         for instrument, index in result.groupby("ts_code", sort=False).groups.items():
@@ -2045,12 +2050,12 @@ class QlibBuilder:
         merged = pd.concat(filled_parts).sort_index()
         derived = (
             pd.to_numeric(merged["close"], errors="coerce")
-            * pd.to_numeric(merged["total_share"], errors="coerce")
+            * pd.to_numeric(merged["announced_total_share"], errors="coerce")
             / 10000.0
         )
         missing = merged["total_mv"].isna() & derived.notna() & (derived > 0)
         merged.loc[missing, "total_mv"] = derived.loc[missing]
-        return merged.drop(columns=["share_available_at", "total_share"])
+        return merged.drop(columns=["share_available_at", "announced_total_share"])
 
     def _build_style_exposures(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
         """Extended Barra-style exposure panel with a backward-compatible schema.

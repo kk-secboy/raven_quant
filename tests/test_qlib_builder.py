@@ -2633,6 +2633,9 @@ def test_derived_total_market_value_fills_baostock_years_point_in_time() -> None
             "ts_code": ["000001.SZ"] * 3,
             "trade_date": ["2012-03-01", "2012-05-02", "2016-01-05"],
             "close": [10.0, 10.0, 20.0],
+            # The snapshot schema already carries an all-NaN share column; the
+            # derivation must not collide with it during the ASOF merge.
+            "total_share": [float("nan")] * 3,
             "total_mv": [float("nan"), float("nan"), 400_000.0],
         }
     )
