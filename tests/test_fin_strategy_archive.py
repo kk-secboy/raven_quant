@@ -400,6 +400,14 @@ def test_policy_queue_revalidates_with_the_frozen_feature_allowlist(
             "dataset_path": str(tmp_path),
             "dataset_identity_sha256": "b" * 64,
             "feature_set": feature_set,
+            "periods": {
+                "train_start": "2008-01-02",
+                "train_end": "2019-11-28",
+                "valid_start": "2020-06-10",
+                "valid_end": "2023-07-20",
+                "test_start": "2024-01-25",
+                "test_end": "2026-03-03",
+            },
         }
     }
 
@@ -413,6 +421,92 @@ def test_policy_queue_revalidates_with_the_frozen_feature_allowlist(
         )
 
     assert observed["allowed_factor_ids"] == set(feature_set["features"])
+
+
+def test_policy_queue_derives_competition_from_governed_periods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The competition spans the full governed validation window.
+
+    Proposals record the isolated pre-final research-loop view (enforced at
+    archive time).  Deriving the competition from that halved view makes the
+    swing/long minimum-OOS floors unreachable, so the queue must derive from
+    the governed payload periods instead.
+    """
+
+    periods = {
+        "train_start": "2008-01-02",
+        "train_end": "2019-11-28",
+        "valid_start": "2020-06-10",
+        "valid_end": "2023-07-20",
+        "test_start": "2024-01-25",
+        "test_end": "2026-03-03",
+    }
+    feature_set = get_feature_set("governed-baseline")
+    artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="b" * 64,
+        incumbent_id=None,
+    )
+    observed: dict[str, dict] = {}
+
+    def derive(research_periods, **_kwargs):
+        observed["periods"] = dict(research_periods)
+        raise RuntimeError("derive-observed")
+
+    monkeypatch.setattr(
+        "quant_platform.worker.derive_strategy_research_competition_periods",
+        derive,
+    )
+    monkeypatch.setattr(
+        "quant_platform.worker.build_public_strategy_control_config",
+        lambda _config: {},
+    )
+    monkeypatch.setattr(
+        "quant_platform.worker.build_transparent_full_stack_control_config",
+        lambda _config: {},
+    )
+    strategies = SimpleNamespace(
+        get_version=lambda version_id: {
+            "id": version_id,
+            "config": {"outer_purge_days": 6},
+            "benchmark": "SH000300",
+            "universe": "cn_all",
+        }
+    )
+    worker = SimpleNamespace(strategies=strategies)
+    job = {
+        "payload": {
+            "dataset": "snapshot",
+            "dataset_path": str(tmp_path),
+            "dataset_identity_sha256": "b" * 64,
+            "feature_set": feature_set,
+            "periods": periods,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="derive-observed"):
+        Worker._queue_fin_strategy_policy_evaluations(
+            worker,
+            "run-1",
+            job,
+            {"strategy_proposals": [artifact]},
+            {
+                "strategy_proposal_artifacts": [
+                    {
+                        "strategy_version_id": "a" * 32,
+                        "compiled_artifact_id": "compiled-artifact-1",
+                    }
+                ]
+            },
+        )
+
+    isolated = artifact["strategy_proposal"]["data_contract"]["research_periods"]
+    assert isolated != periods
+    assert observed["periods"] == periods
 
 
 def _job_payload(feature_set: dict, periods: dict[str, str]) -> dict:
