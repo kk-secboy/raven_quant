@@ -39,12 +39,9 @@ _PENDING_V17_INTERRUPTION_RECOVERY_JOB_ID = "858a75a6f1994c359fa9c3567ed09f57"
 RESEARCH_JOB_CPU_COST = {
     "data_qlib": 16,
     "minute_qlib": 16,
-    "rdagent_factor": 8,
     "rdagent_run": 8,
-    "rdagent_model": 8,
     "rdagent_factor_report": 4,
     "rdagent_quant": 12,
-    "rdagent_data_science": 8,
     "minute_research": 4,
     "qlib_baseline": 8,
     "external_factor_evaluate": 4,
@@ -65,12 +62,9 @@ RESEARCH_JOB_CPU_COST = {
 RESEARCH_JOB_MEMORY_GB = {
     "data_qlib": 24,
     "minute_qlib": 24,
-    "rdagent_factor": 12,
     "rdagent_run": 12,
-    "rdagent_model": 16,
     "rdagent_factor_report": 8,
     "rdagent_quant": 20,
-    "rdagent_data_science": 16,
     "minute_research": 8,
     # The full Alpha158/LightGBM baseline reached about 36.4 GiB RSS on the
     # production 32-core/64-GiB host.  Charge the full 40-GiB research budget
@@ -182,13 +176,9 @@ FORMAL_DATA_AUTO_RETRY_KINDS = frozenset(
 AUTO_RETRY_ATTEMPTS = {
     **{kind: 3 for kind in FORMAL_DATA_AUTO_RETRY_KINDS},
     "research_asset_acquire": 3,
-    "rdagent_factor": 3,
     "rdagent_run": 3,
-    "rdagent_model": 3,
     "rdagent_quant": 3,
     "rdagent_factor_report": 3,
-    "rdagent_data_science": 1,
-    "rdagent_llm_finetune": 1,
     "factor_sota_evaluate": 2,
     "factor_library_materialize": 2,
     "factor_library_cluster": 2,

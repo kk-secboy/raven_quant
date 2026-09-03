@@ -218,11 +218,11 @@ def test_embedding_environment_uses_hosted_vllm_env_without_patches() -> None:
 @pytest.mark.parametrize(
     ("scenario", "module"),
     [
-        ("fin_factor", "rdagent.app.qlib_rd_loop.factor"),
+        ("fin_quant", "rdagent.app.qlib_rd_loop.quant"),
         ("fin_strategy", "quant_platform.rdagent_strategy"),
     ],
 )
-def test_factor_and_strategy_commands_bind_verified_base_features(
+def test_quant_and_strategy_commands_bind_verified_base_features(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,

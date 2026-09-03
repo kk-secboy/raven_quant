@@ -21,10 +21,10 @@ def test_research_resource_costs_match_the_governed_queue_contract() -> None:
     assert research_job_memory_gb("minute_qlib") == 24
     assert research_job_cpu_cost("qlib_baseline") == 8
     assert research_job_memory_gb("qlib_baseline") == 40
-    assert research_job_cpu_cost("rdagent_factor") == 8
-    assert research_job_memory_gb("rdagent_factor") == 12
-    assert research_job_cpu_cost("rdagent_model") == 8
-    assert research_job_memory_gb("rdagent_model") == 16
+    assert research_job_cpu_cost("rdagent_run") == 8
+    assert research_job_memory_gb("rdagent_run") == 12
+    assert research_job_cpu_cost("rdagent_factor") == 0
+    assert research_job_memory_gb("rdagent_model") == 0
     assert research_job_cpu_cost("rdagent_factor_report") == 4
     assert research_job_memory_gb("rdagent_factor_report") == 8
     assert research_job_cpu_cost("rdagent_quant") == 12

@@ -67,14 +67,27 @@ def test_worker_gate_allows_retained_scenarios() -> None:
 
 def test_worker_command_enforces_the_freeze_before_building_a_command() -> None:
     worker = object.__new__(LocalJobWorker)
+    with pytest.raises(ValueError, match="is frozen"):
+        worker._command(
+            {
+                "id": "job-rdagent_run",
+                "kind": "rdagent_run",
+                "payload": {"scenario": "general_model"},
+            }
+        )
+
+
+def test_frozen_worker_command_kinds_are_physically_removed() -> None:
+    # Weight-reduction phase C3 deleted the frozen scenarios' worker command
+    # kinds, so a historical queued job now fails closed as unsupported.
+    worker = object.__new__(LocalJobWorker)
     for kind, scenario_id in (
         ("rdagent_factor", "fin_factor"),
         ("rdagent_model", "fin_model"),
         ("rdagent_data_science", "data_science"),
         ("rdagent_llm_finetune", "llm_finetune"),
-        ("rdagent_run", "general_model"),
     ):
-        with pytest.raises(ValueError, match="is frozen"):
+        with pytest.raises(ValueError, match=f"unsupported job kind: {kind}"):
             worker._command(
                 {
                     "id": f"job-{kind}",

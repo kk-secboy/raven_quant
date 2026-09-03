@@ -35,7 +35,9 @@ RDAGENT_JOB_KINDS = frozenset(
 # Weight-reduction phase 1: these scenarios stay registered so historical
 # runs, governed assets, and the public catalog remain readable, but no new
 # run may be scheduled, created through the API, or executed by a worker.
-# A later phase physically deletes them; do not remove the registry entries.
+# Weight-reduction phase C3 physically deleted their execution-side code
+# (runner branches, orchestration, worker command kinds); do not remove the
+# registry entries — historical runs and assets stay readable through them.
 FROZEN_RDAGENT_SCENARIOS = frozenset(
     {"fin_factor", "fin_model", "general_model", "data_science", "llm_finetune"}
 )

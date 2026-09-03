@@ -529,12 +529,11 @@ def test_worker_closes_model_quant_and_generic_audit_chains() -> None:
 
     source = inspect.getsource(Worker)
     for marker in (
-        "_queue_model_evaluation",
+        "_import_model_evaluations",
         "_queue_quant_bundle_evaluation",
         "_import_quant_bundle_evaluation_artifact",
         "_archive_rdagent_run_evidence",
         "_archive_fin_strategy_artifacts",
-        "_archive_rdagent_lab_artifacts",
     ):
         assert marker in source
 
@@ -643,19 +642,21 @@ def test_api_trace_view_reads_only_the_verified_sanitized_artifact(tmp_path: Pat
     assert view["loops"][0]["loop_id"] == 1
 
 
-def test_data_science_and_finetune_use_explicit_isolated_runtime_contracts() -> None:
+def test_frozen_lab_runtime_contracts_are_physically_deleted() -> None:
+    # Weight-reduction phase C3 removed the data_science/llm_finetune runner
+    # orchestration; the frozen scenarios keep no runtime env builders.
     runtime_path = Path(__file__).parents[1] / "src" / "quant_platform" / "rdagent_runtime.py"
     runtime = runtime_path.read_text(encoding="utf-8")
     for marker in (
-        '"DS_SCEN": "rdagent.scenarios.data_science.scen.DataScienceScen"',
-        '"DS_CODER_COSTEER_ENV_TYPE": "docker"',
-        '"DS_DOCKER_NETWORK": "none"',
-        '"DS_DOCKER_ENABLE_GPU": "false"',
-        '"DS_DOCKER_MEM_LIMIT": "16g"',
-        '"FT_CODER_COSTEER_ENV_TYPE": "docker"',
-        '"FT_DOCKER_ENABLE_CACHE": "false"',
+        '"DS_SCEN"',
+        '"DS_DOCKER_IMAGE"',
+        '"FT_DOCKER_IMAGE"',
+        '"FT_SCEN"',
+        "_stage_finetune_asset",
+        "rdagent_data_science_image",
+        "rdagent_finetune_image",
     ):
-        assert marker in runtime
+        assert marker not in runtime
 
 
 def test_quant_exporter_accumulates_alternating_accepted_factor_model_rounds(

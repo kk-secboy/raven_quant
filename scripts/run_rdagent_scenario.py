@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import queue
@@ -87,171 +86,6 @@ def _require_preloaded_sandbox(*, configured_name: str, runtime_name: str) -> No
         raise ValueError(f"required Docker image is not preloaded: {configured}") from exc
 
 
-def _require_gpu(asset_root: str) -> None:
-    executable = shutil.which("nvidia-smi")
-    if not executable:
-        raise ValueError("llm_finetune requires an NVIDIA GPU runtime")
-    try:
-        completed = subprocess.run(
-            [
-                executable,
-                "--query-gpu=name,memory.free,driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError("llm_finetune GPU probe failed") from exc
-    rows = [
-        [field.strip() for field in line.split(",")]
-        for line in completed.stdout.splitlines()
-        if line.strip()
-    ]
-    if not rows or any(len(row) != 3 for row in rows):
-        raise ValueError("llm_finetune requires an available NVIDIA GPU")
-    minimum_memory = max(
-        1024, int(os.getenv("RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB", "16384"))
-    )
-    if max(int(float(row[1])) for row in rows) < minimum_memory:
-        raise ValueError(
-            f"llm_finetune requires at least {minimum_memory} MiB free GPU memory"
-        )
-    version_probe = subprocess.run(
-        [executable], capture_output=True, text=True, timeout=10, check=True
-    )
-    if "CUDA Version:" not in version_probe.stdout or not rows[0][2]:
-        raise ValueError("llm_finetune requires NVIDIA driver and CUDA evidence")
-    docker = shutil.which("docker")
-    if not docker:
-        raise ValueError("llm_finetune requires a Docker GPU runtime")
-    runtime_probe = subprocess.run(
-        [docker, "info", "--format", "{{json .Runtimes}}"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=True,
-    )
-    cdi_probe = subprocess.run(
-        [docker, "info", "--format", "{{json .CDISpecDirs}}"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    runtimes = json.loads(runtime_probe.stdout or "{}")
-    cdi_dirs = json.loads(cdi_probe.stdout or "[]") if cdi_probe.returncode == 0 else []
-    if not isinstance(runtimes, dict) or (
-        "nvidia" not in runtimes and not (isinstance(cdi_dirs, list) and cdi_dirs)
-    ):
-        raise ValueError("llm_finetune Docker NVIDIA runtime/CDI evidence is unavailable")
-    finetune_image = _immutable_image("RDAGENT_FINETUNE_IMAGE")
-    benchmark_image = _immutable_image("RDAGENT_FINETUNE_BENCHMARK_IMAGE")
-    probe_image = _immutable_image("RDAGENT_FINETUNE_GPU_PROBE_IMAGE")
-    if os.getenv("FT_DOCKER_IMAGE") != finetune_image:
-        raise ValueError("fine-tune runtime image disagrees with the governed digest")
-    if os.getenv("BENCHMARK_DOCKER_IMAGE") != benchmark_image:
-        raise ValueError("benchmark runtime image disagrees with the governed digest")
-    for image in (finetune_image, benchmark_image, probe_image):
-        try:
-            _inspect_preloaded_image(docker, image)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ValueError(f"required Docker image is not preloaded: {image}") from exc
-    try:
-        smoke = subprocess.run(
-            [
-                docker,
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--gpus",
-                "all",
-                "--entrypoint",
-                "nvidia-smi",
-                probe_image,
-                "--query-gpu=name,memory.total,driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError("pinned Docker GPU smoke test failed") from exc
-    if not smoke.stdout.strip():
-        raise ValueError("pinned Docker GPU smoke test returned no GPU evidence")
-    minimum_disk = max(
-        1.0, float(os.getenv("RDAGENT_FINETUNE_MIN_DISK_GB", "50"))
-    )
-    free_gb = shutil.disk_usage(Path(asset_root)).free / (1024**3)
-    if free_gb < minimum_disk:
-        raise ValueError(
-            f"llm_finetune requires at least {minimum_disk:g} GiB free DATA_ROOT space"
-        )
-
-
-def _verify_finetune_staging() -> None:
-    """Prove that the offline model/data/benchmark inputs stayed immutable."""
-
-    root_value = str(os.getenv("FT_FILE_PATH") or "").strip()
-    expected_digest = str(
-        os.getenv("QUANTLAB_FINETUNE_STAGED_INVENTORY_SHA256") or ""
-    ).strip()
-    if not root_value or len(expected_digest) != 64:
-        raise ValueError("fine-tune staging identity is unavailable")
-    root = Path(root_value).resolve(strict=True)
-    evidence_path = root / "quantlab-staged-inventory.json"
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    if not isinstance(evidence, dict):
-        raise ValueError("fine-tune staging evidence is invalid")
-    actual_digest = str(evidence.pop("inventory_sha256", ""))
-    canonical_digest = hashlib.sha256(
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    if actual_digest != expected_digest or canonical_digest != expected_digest:
-        raise ValueError("fine-tune staging inventory identity disagrees")
-    entries = evidence.get("files")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("fine-tune staging inventory has no files")
-    expected_files = {"quantlab-staged-inventory.json"}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError("fine-tune staging file evidence is invalid")
-        relative = Path(str(entry.get("path") or ""))
-        if relative.is_absolute() or any(
-            part in {"", ".", ".."} for part in relative.parts
-        ):
-            raise ValueError("fine-tune staging file path is unsafe")
-        path = (root / relative).resolve(strict=True)
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("fine-tune staging file escapes its root") from exc
-        if not path.is_file() or path.is_symlink():
-            raise ValueError("fine-tune staging contains a non-regular input")
-        if path.stat().st_size != int(entry.get("bytes") or -1):
-            raise ValueError("fine-tune staging file size disagrees")
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != str(entry.get("sha256") or ""):
-            raise ValueError("fine-tune staging file digest disagrees")
-        expected_files.add(relative.as_posix())
-    actual_files: set[str] = set()
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise ValueError("fine-tune staging contains a symlink")
-        if path.is_file():
-            actual_files.add(path.relative_to(root).as_posix())
-    if actual_files != expected_files:
-        raise ValueError("fine-tune staging file set changed during execution")
-
-
 def _secret_values() -> list[str]:
     markers = ("KEY", "TOKEN", "PASSWORD", "SECRET", "CREDENTIAL")
     return sorted(
@@ -324,7 +158,7 @@ def _run_streaming_redacted(command: list[str], *, timeout: int, env: dict[str, 
 
 
 def _verify_feature_set(args: argparse.Namespace) -> str | None:
-    if args.scenario not in {"fin_factor", "fin_model", "fin_quant", "fin_strategy"}:
+    if args.scenario not in {"fin_quant", "fin_strategy"}:
         if args.feature_set_id or args.feature_set_sha256 or args.base_features:
             raise ValueError(f"{args.scenario} does not accept a governed feature set")
         return None
@@ -344,50 +178,25 @@ def _verify_feature_set(args: argparse.Namespace) -> str | None:
 def _scenario_command(args: argparse.Namespace) -> list[str]:
     scenario = get_rdagent_scenario(args.scenario)
     assets = list(args.asset)
-    options = _read_options(args.scenario_options)
+    # Validate the options file when one is supplied; no retained scenario
+    # consumes scenario options.
+    _read_options(args.scenario_options)
     base_features = _verify_feature_set(args)
     governed_module_runner = str(
         Path(__file__).resolve().with_name("run_rdagent_module.py")
     )
-    if scenario.id in {
-        "fin_factor",
-        "fin_model",
-        "fin_quant",
-        "fin_factor_report",
-        "general_model",
-    }:
+    if scenario.id in {"fin_quant", "fin_factor_report"}:
         _require_preloaded_sandbox(
             configured_name="RDAGENT_QLIB_SANDBOX_IMAGE",
             runtime_name="QLIB_DOCKER_IMAGE",
         )
-    if scenario.id == "data_science":
-        _require_preloaded_sandbox(
-            configured_name="RDAGENT_DATA_SCIENCE_IMAGE",
-            runtime_name="DS_DOCKER_IMAGE",
-        )
-    if scenario.id in {"fin_factor", "fin_model", "fin_quant", "fin_strategy"} and assets:
+    if scenario.id in {"fin_quant", "fin_strategy"} and assets:
         raise ValueError(f"{scenario.id} does not accept document/data assets")
-    if scenario.id == "fin_factor":
+    if scenario.id == "fin_quant":
         return [
             sys.executable,
             governed_module_runner,
-            "rdagent.app.qlib_rd_loop.factor",
-            "--loop_n",
-            str(args.loop_n),
-            "--all_duration",
-            args.duration,
-            "--base_features_path",
-            str(base_features),
-        ]
-    if scenario.id in {"fin_model", "fin_quant"}:
-        module = {
-            "fin_model": "rdagent.app.qlib_rd_loop.model",
-            "fin_quant": "rdagent.app.qlib_rd_loop.quant",
-        }[scenario.id]
-        return [
-            sys.executable,
-            governed_module_runner,
-            module,
+            "rdagent.app.qlib_rd_loop.quant",
             "--loop_n",
             str(args.loop_n),
             "--all_duration",
@@ -423,71 +232,6 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
             "--report_folder",
             str(report_root),
             "--all_duration",
-            args.duration,
-        ]
-    if scenario.id == "general_model":
-        if len(assets) != 1:
-            raise ValueError("general_model requires exactly one PDF")
-        report = _require_path(assets[0], directory=False)
-        if Path(report).suffix.lower() != ".pdf":
-            raise ValueError("general_model input must be a PDF")
-        return [args.command, scenario.command, report]
-    if scenario.id == "data_science":
-        if len(assets) != 1 or set(options) != {"competition"}:
-            raise ValueError("data_science requires one dataset and its competition identity")
-        _require_path(assets[0], directory=True)
-        return [
-            args.command,
-            scenario.command,
-            "--competition",
-            options["competition"],
-            "--loop-n",
-            str(args.loop_n),
-            "--timeout",
-            args.duration,
-        ]
-    if scenario.id == "llm_finetune":
-        required = {
-            "benchmark",
-            "benchmark_description",
-            "dataset",
-            "base_model",
-            "model_license_accepted",
-            "dataset_license_accepted",
-            "model_revision",
-            "dataset_revision",
-            "model_license",
-            "dataset_license",
-            "model_license_terms_sha256",
-            "dataset_license_terms_sha256",
-            "model_license_accepted_by",
-            "dataset_license_accepted_by",
-            "model_license_accepted_at",
-            "dataset_license_accepted_at",
-        }
-        if len(assets) != 1 or set(options) != required:
-            raise ValueError("llm_finetune requires one sealed configuration asset")
-        asset_root = _require_path(assets[0], directory=True)
-        if (
-            options["model_license_accepted"] != "true"
-            or options["dataset_license_accepted"] != "true"
-        ):
-            raise ValueError("llm_finetune asset licenses are not explicitly accepted")
-        _require_gpu(asset_root)
-        return [
-            args.command,
-            scenario.command,
-            "--benchmark",
-            options["benchmark"],
-            "--benchmark-description",
-            options["benchmark_description"],
-            "--dataset",
-            options["dataset"],
-            "--base-model",
-            options["base_model"],
-            "--loop-n",
-            str(args.loop_n),
-            "--timeout",
             args.duration,
         ]
     raise ValueError(f"unsupported RD-Agent scenario: {scenario.id}")
@@ -530,18 +274,12 @@ def run(args: argparse.Namespace) -> None:
         separators=(",", ":"),
     )
     command = _scenario_command(args)
-    if args.scenario == "llm_finetune":
-        _verify_finetune_staging()
     # Give RD-Agent a short cleanup/export margin beyond the governed budget.
-    try:
-        _run_streaming_redacted(
-            command,
-            env=env,
-            timeout=_duration_seconds(args.duration) + 300,
-        )
-    finally:
-        if args.scenario == "llm_finetune":
-            _verify_finetune_staging()
+    _run_streaming_redacted(
+        command,
+        env=env,
+        timeout=_duration_seconds(args.duration) + 300,
+    )
     export = [
         sys.executable,
         args.bridge,

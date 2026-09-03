@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -493,117 +492,6 @@ def _shared_runtime_root(settings: Settings, trace_path: Path) -> Path:
     return target
 
 
-def _stage_finetune_asset(
-    resolved_assets: dict[str, Any],
-    *,
-    runtime_root: Path,
-    audit_root: Path,
-) -> tuple[Path, str]:
-    """Copy the sealed FT bundle to a Docker-visible, run-specific directory."""
-
-    assets = resolved_assets.get("assets") or []
-    if len(assets) != 1:
-        raise ValueError("llm_finetune requires exactly one governed bundle")
-    asset = assets[0]
-    manifest_sha256 = str(asset.get("manifest_sha256") or "")
-    if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256):
-        raise ValueError("llm_finetune asset manifest identity is invalid")
-    entries = []
-    for item in asset.get("files") or []:
-        relative = Path(str(item.get("relative_path") or ""))
-        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-            raise ValueError("llm_finetune asset contains an unsafe relative path")
-        entries.append(
-            {
-                "path": relative.as_posix(),
-                "bytes": Path(str(item["path"])).stat().st_size,
-                "sha256": str(item["sha256"]),
-            }
-        )
-    entries.sort(key=lambda item: item["path"])
-    inventory = {
-        "contract_version": "quantlab-finetune-staging-v1",
-        "asset_id": str(asset["asset_id"]),
-        "asset_manifest_sha256": manifest_sha256,
-        "files": entries,
-    }
-    inventory_sha256 = hashlib.sha256(
-        json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    destination = runtime_root / f"finetune-files-{manifest_sha256[:16]}"
-    evidence_path = destination / "quantlab-staged-inventory.json"
-
-    def verify_staged() -> None:
-        if not evidence_path.is_file():
-            raise ValueError("existing fine-tune staging directory is incomplete")
-        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-        if evidence != {**inventory, "inventory_sha256": inventory_sha256}:
-            raise ValueError("existing fine-tune staging evidence disagrees")
-        actual_files = {
-            path.relative_to(destination).as_posix()
-            for path in destination.rglob("*")
-            if path.is_file()
-        }
-        expected_files = {item["path"] for item in entries} | {
-            "quantlab-staged-inventory.json"
-        }
-        if actual_files != expected_files:
-            raise ValueError("fine-tune staging contains unsealed files")
-        for entry in entries:
-            path = destination / entry["path"]
-            if path.stat().st_size != entry["bytes"]:
-                raise ValueError("fine-tune staged file size disagrees")
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            if digest.hexdigest() != entry["sha256"]:
-                raise ValueError("fine-tune staged file digest disagrees")
-
-    if destination.exists():
-        verify_staged()
-    else:
-        runtime_root.mkdir(parents=True, exist_ok=True)
-        stage = Path(tempfile.mkdtemp(prefix=".finetune-stage-", dir=runtime_root))
-        try:
-            for source_entry, inventory_entry in zip(
-                sorted(asset["files"], key=lambda item: str(item["relative_path"])),
-                entries,
-                strict=True,
-            ):
-                target = stage / inventory_entry["path"]
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(Path(str(source_entry["path"])), target)
-            (stage / "quantlab-staged-inventory.json").write_text(
-                json.dumps(
-                    {**inventory, "inventory_sha256": inventory_sha256},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            os.replace(stage, destination)
-        finally:
-            if stage.exists():
-                shutil.rmtree(stage)
-        verify_staged()
-
-    audit_root.mkdir(parents=True, exist_ok=True)
-    (audit_root / "finetune-staging-evidence.json").write_text(
-        json.dumps(
-            {**inventory, "inventory_sha256": inventory_sha256},
-            ensure_ascii=False,
-            sort_keys=True,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return destination, inventory_sha256
-
-
 def _prepare_scenario_inputs(
     settings: Settings,
     scenario: RDAgentScenario,
@@ -641,10 +529,6 @@ def _prepare_scenario_inputs(
                 if hashlib.sha256(destination.read_bytes()).hexdigest() != item["sha256"]:
                     raise ValueError("staged report digest disagrees with its governed asset")
         paths = [str(reports)]
-    elif scenario.id == "general_model":
-        paths = [str(resolved["assets"][0]["files"][0]["path"])]
-    elif scenario.id in {"data_science", "llm_finetune"}:
-        paths = [str(resolved["assets"][0]["path"])]
     if resolved["scenario_options"]:
         scenario_options_path = input_root / "scenario-options.json"
         scenario_options_path.write_text(
@@ -854,10 +738,6 @@ def rdagent_command(
             else ""
         ),
         "RDAGENT_QLIB_SANDBOX_IMAGE": settings.rdagent_qlib_sandbox_image,
-        "RDAGENT_DATA_SCIENCE_IMAGE": settings.rdagent_data_science_image,
-        "RDAGENT_FINETUNE_IMAGE": settings.rdagent_finetune_image,
-        "RDAGENT_FINETUNE_BENCHMARK_IMAGE": settings.rdagent_finetune_benchmark_image,
-        "RDAGENT_FINETUNE_GPU_PROBE_IMAGE": settings.rdagent_finetune_gpu_probe_image,
         # RD-Agent workspaces are mounted into Docker by absolute path. Keep
         # them on the platform-owned shared data volume, disable pickle resume,
         # and never depend on the worker image's private /app filesystem.
@@ -870,9 +750,6 @@ def rdagent_command(
         # Force every CoSTEER family that supports a selectable environment to
         # use the isolated Docker implementation. Values are platform-owned.
         "MODEL_CoSTEER_env_type": "docker",
-        "DS_Coder_CoSTEER_env_type": "docker",
-        "DS_Runner_CoSTEER_env_type": "docker",
-        "FT_Coder_CoSTEER_env_type": "docker",
         "QLIB_DOCKER_NETWORK": "none",
         "QLIB_DOCKER_BUILD_FROM_DOCKERFILE": "false",
         "QLIB_DOCKER_IMAGE": settings.rdagent_qlib_sandbox_image,
@@ -880,14 +757,6 @@ def rdagent_command(
         # upstream default probes NVIDIA on every Docker run and can leave
         # failed probe containers behind on a non-GPU host.
         "QLIB_DOCKER_ENABLE_GPU": "false",
-        "DS_DOCKER_NETWORK": "none",
-        "DS_DOCKER_BUILD_FROM_DOCKERFILE": "false",
-        "DS_DOCKER_IMAGE": settings.rdagent_data_science_image,
-        "DS_DOCKER_MEM_LIMIT": "8g",
-        "DS_DOCKER_CPU_COUNT": "4",
-        "DS_DOCKER_ENABLE_GPU": "false",
-        "FT_DOCKER_NETWORK": "none",
-        "BENCHMARK_DOCKER_NETWORK": "none",
         **feature_environment,
     }
     if scenario_spec.requires_dataset:
@@ -1020,53 +889,6 @@ def rdagent_command(
             }
         )
         (qlib_home_host / "qlib_data" / "cn_data").mkdir(parents=True, exist_ok=True)
-    elif scenario_spec.id == "data_science" and resolved_assets:
-        env.update(
-            {
-                "DS_LOCAL_DATA_PATH": _runtime_path(
-                    Path(resolved_assets["assets"][0]["path"]).parent,
-                    is_wsl=is_wsl,
-                ),
-                "DS_SCEN": "rdagent.scenarios.data_science.scen.DataScienceScen",
-                "DS_CODER_COSTEER_ENV_TYPE": "docker",
-                "DS_DOCKER_NETWORK": "none",
-                "DS_DOCKER_ENABLE_GPU": "false",
-                "DS_DOCKER_ENABLE_CACHE": "false",
-                "DS_DOCKER_BUILD_FROM_DOCKERFILE": "false",
-                "DS_DOCKER_IMAGE": settings.rdagent_data_science_image,
-                "DS_DOCKER_MEM_LIMIT": "16g",
-                "DS_DOCKER_CPU_COUNT": "4",
-            }
-        )
-    elif scenario_spec.id == "llm_finetune":
-        if not resolved_assets:
-            raise ValueError("llm_finetune requires a governed asset bundle")
-        finetune_root, staged_inventory_sha256 = _stage_finetune_asset(
-            resolved_assets,
-            runtime_root=runtime_root,
-            audit_root=trace_path.parent,
-        )
-        env.update(
-            {
-                "FT_FILE_PATH": _runtime_path(finetune_root, is_wsl=is_wsl),
-                "FT_SCEN": (
-                    "quant_platform.rdagent_scenario."
-                    "QuantLabOfflineFinetuneScenario"
-                ),
-                "FT_CODER_COSTEER_ENV_TYPE": "docker",
-                "FT_DOCKER_ENABLE_CACHE": "false",
-                "FT_DOCKER_BUILD_FROM_DOCKERFILE": "false",
-                "FT_DOCKER_IMAGE": settings.rdagent_finetune_image,
-                "FT_DOCKER_NETWORK": "none",
-                "FT_DOCKER_MEM_LIMIT": "48g",
-                "FT_DOCKER_CPU_COUNT": "8",
-                "BENCHMARK_DOCKER_BUILD_FROM_DOCKERFILE": "false",
-                "BENCHMARK_DOCKER_IMAGE": settings.rdagent_finetune_benchmark_image,
-                "BENCHMARK_DOCKER_NETWORK": "none",
-                "QUANTLAB_BLOCK_GENERATED_SECRETS": "true",
-                "QUANTLAB_FINETUNE_STAGED_INVENTORY_SHA256": staged_inventory_sha256,
-            }
-        )
     if is_wsl:
         source_root = _to_wsl_path(project_root / "src")
         env["PYTHONPATH"] = ":".join(

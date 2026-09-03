@@ -174,10 +174,6 @@ def rdagent_job_command(
 
 COMMANDS = {
     "rdagent_run": rdagent_job_command,
-    "rdagent_factor": rdagent_job_command,
-    "rdagent_model": rdagent_job_command,
     "rdagent_quant": rdagent_job_command,
     "rdagent_factor_report": rdagent_job_command,
-    "rdagent_data_science": rdagent_job_command,
-    "rdagent_llm_finetune": rdagent_job_command,
 }

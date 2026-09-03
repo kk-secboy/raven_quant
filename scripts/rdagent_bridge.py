@@ -1067,7 +1067,6 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
 
     rounds: dict[int, dict[str, Any]] = {}
     tag_counts: dict[str, int] = {}
-    general_model_outputs: list[dict[str, Any]] = []
     strategy_proposals: list[dict[str, Any]] = []
     strategy_proposal_hashes: set[str] = set()
     strategy_feature_ids = _strategy_feature_ids(args)
@@ -1128,38 +1127,6 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
             if artifact_sha256 not in strategy_proposal_hashes:
                 strategy_proposal_hashes.add(artifact_sha256)
                 strategy_proposals.append(artifact)
-        if args.scenario == "general_model" and message.tag.endswith(
-            "developed_experiment"
-        ):
-            tasks = getattr(content, "sub_tasks", []) or []
-            workspaces = getattr(content, "sub_workspace_list", []) or []
-            for index, workspace in enumerate(workspaces):
-                task = (
-                    tasks[index]
-                    if index < len(tasks)
-                    else getattr(workspace, "target_task", None)
-                )
-                files = getattr(workspace, "file_dict", {}) or {}
-                code = files.get("model.py")
-                if not isinstance(code, str) or not code.strip():
-                    continue
-                name = str(getattr(task, "name", f"paper-model-{index + 1}"))
-                safe_name = "".join(
-                    character if character.isalnum() or character in "-_" else "_"
-                    for character in name
-                )[:80]
-                destination = code_root / f"general-model-{index + 1:03d}-{safe_name}.py"
-                destination.write_text(code, encoding="utf-8")
-                general_model_outputs.append(
-                    {
-                        "name": name,
-                        "description": str(getattr(task, "description", "")),
-                        "model_type": str(getattr(task, "model_type", "")),
-                        "code_path": str(destination),
-                        "code_sha256": _sha256(code),
-                        "implementation_ready": True,
-                    }
-                )
         loop_id = _loop_id(message.tag)
         if loop_id is None:
             continue
@@ -1394,7 +1361,8 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
         "single_arm": bool(fin_quant_coverage and fin_quant_coverage["single_arm"]),
         "costeer_knowledge": costeer_knowledge,
         "strategy_proposals": strategy_proposals,
-        "lab_outputs": general_model_outputs,
+        # Frozen lab scenarios are export-dead; keep the result key stable.
+        "lab_outputs": [],
     }
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
