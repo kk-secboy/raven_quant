@@ -488,6 +488,14 @@ def materialize_strategy_candidate_config(
                 research_signal_binding
             )
         )
+    # Walk-forward stability is proved on contiguous folds spanning the whole
+    # preregistered OOS segment.  Scale the fold length to the horizon's
+    # minimum OOS: a fixed 252-day window cannot produce the preregistered
+    # fold count for the short horizon (252-day OOS) and wastes the long one.
+    evaluation_contract = proposal["evaluation_contract"]
+    rolling_folds = int(evaluation_contract["rolling_folds"])
+    minimum_oos = int(evaluation_contract["minimum_oos_observations"])
+    rolling_fold_days = max(20, minimum_oos // rolling_folds)
     config.update(
         {
             "recipe_id": proposal["baseline_recipe_id"],
@@ -495,15 +503,11 @@ def materialize_strategy_candidate_config(
             "horizon_profile": candidate["horizon"],
             "outer_purge_days": int(horizon.purge_sessions or 0),
             "outer_embargo_days": int(horizon.embargo_sessions or 0),
-            "min_backtest_days": int(
-                proposal["evaluation_contract"]["minimum_oos_observations"]
-            ),
+            "min_backtest_days": minimum_oos,
             "min_pre_final_history_days": 2520,
-            "rolling_window_days": 252,
-            "rolling_step_days": 63,
-            "min_rolling_windows": int(
-                proposal["evaluation_contract"]["rolling_folds"]
-            ),
+            "rolling_window_days": rolling_fold_days,
+            "rolling_step_days": rolling_fold_days,
+            "min_rolling_windows": rolling_folds,
             "min_rolling_pass_rate": 0.60,
             "minimum_outer_test_pass_rate": 0.60,
             "min_robustness_pass_rate": 1.0,

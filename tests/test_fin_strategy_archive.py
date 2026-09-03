@@ -423,6 +423,43 @@ def test_policy_queue_revalidates_with_the_frozen_feature_allowlist(
     assert observed["allowed_factor_ids"] == set(feature_set["features"])
 
 
+def test_materialization_scales_walk_forward_folds_to_horizon_oos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform.strategy_rule_compiler import (
+        materialize_strategy_candidate_config,
+    )
+
+    periods = {
+        "train_start": "2008-01-02",
+        "train_end": "2018-12-28",
+        "valid_start": "2019-01-02",
+        "valid_end": "2022-12-30",
+        "test_start": "2023-01-03",
+        "test_end": "2025-12-31",
+    }
+    feature_set = get_feature_set("governed-baseline")
+    artifact = _compiled_short_artifact(
+        monkeypatch,
+        feature_set=feature_set,
+        periods=periods,
+        dataset_identity_sha256="b" * 64,
+        incumbent_id=None,
+    )
+
+    config = materialize_strategy_candidate_config(
+        artifact,
+        source_research_artifact_id="a" * 32,
+        allowed_factor_ids=set(feature_set["features"]),
+    )
+
+    # The short horizon's 252-session OOS floor must still yield the five
+    # preregistered walk-forward folds; a fixed 252-day window yields one.
+    assert config["rolling_window_days"] == 252 // 5
+    assert config["rolling_step_days"] == 252 // 5
+    assert config["min_rolling_windows"] == 5
+
+
 def test_policy_queue_derives_competition_from_isolated_proposal_periods(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
