@@ -2580,7 +2580,28 @@ def test_ingestion_boundary_is_stable_across_duckdb_session_timezones() -> None:
     ]
 
 
-def test_flagless_provider_singleton_payload_uses_announcement_date() -> None:
+def test_recover_missing_ingested_at_routes_only_when_needed(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from quant_data.cli import _recover_missing_ingested_at
+
+    snapshot = tmp_path / "snap"
+    parquet_dir = snapshot / "parquet" / "fina_indicator"
+    parquet_dir.mkdir(parents=True)
+    pd.DataFrame({"ingested_at": [pd.Timestamp("2026-01-01")]}).to_parquet(
+        parquet_dir / "data.parquet"
+    )
+    context = SimpleNamespace(storage=SimpleNamespace(), checkpoint=None)
+
+    assert _recover_missing_ingested_at(context, snapshot) == snapshot
+
+    pd.DataFrame({"ingested_at": [None]}).to_parquet(parquet_dir / "data.parquet")
+    calls: list[dict] = []
+    context.storage.build_ingested_at_successor = lambda **kwargs: (
+        calls.append(kwargs) or tmp_path / "successor"
+    )
+    assert _recover_missing_ingested_at(context, snapshot) == tmp_path / "successor"
+    assert calls[0]["source_snapshot"] == snapshot
     revision_rows = _fundamental_revision_rows_sql(
         "SELECT * FROM revision_source",
         payload_columns=["ts_code", "ann_date", "end_date", "audit_result"],

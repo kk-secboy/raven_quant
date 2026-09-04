@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 import duckdb
@@ -707,7 +708,13 @@ def _read_parquet_union(
 ) -> pd.DataFrame:
     connection = duckdb.connect()
     try:
-        return connection.execute(query, [paths, *parameters]).fetchdf()
+        # The full-history anns_d scan exceeds anonymous DuckDB memory on the
+        # shared worker; bound it explicitly and spill instead of aborting the
+        # whole daily chain with OutOfMemoryException.
+        connection.execute("SET memory_limit='4GB'")
+        with TemporaryDirectory(prefix="cninfo-duckdb-spill-") as spill_dir:
+            connection.execute(f"SET temp_directory='{spill_dir}'")
+            return connection.execute(query, [paths, *parameters]).fetchdf()
     finally:
         connection.close()
 

@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
+import duckdb
 import pandas as pd
 import typer
 from rich.console import Console
@@ -3875,6 +3876,39 @@ def _build_snapshot(
     )
 
 
+def _recover_missing_ingested_at(context: Context, snapshot_path: Path) -> Path:
+    """Run the audited ingested_at recovery whenever a snapshot needs it.
+
+    Older fina_indicator units predate row-level acquisition timestamps, so
+    every fresh snapshot built from them would otherwise fail the Qlib
+    revision-conflict gate and need the same manual rescue.  Skip the heavy
+    audited rebuild entirely once a snapshot is already clean.
+    """
+
+    candidate = snapshot_path / "parquet" / "fina_indicator" / "data.parquet"
+    if candidate.is_file():
+        connection = duckdb.connect()
+        try:
+            missing = int(
+                connection.execute(
+                    "SELECT count(*) FROM read_parquet(?) WHERE ingested_at IS NULL",
+                    [str(candidate.resolve())],
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        if missing == 0:
+            return snapshot_path
+    successor = snapshot_path.with_name(f"{snapshot_path.name}-ingested-fix")
+    if successor.is_dir():
+        return successor
+    return context.storage.build_ingested_at_successor(
+        name=successor.name,
+        source_snapshot=snapshot_path,
+        checkpoint=context.checkpoint,
+    )
+
+
 def _build_qlib(
     context: Context,
     snapshot_path: Path,
@@ -3907,6 +3941,7 @@ def _build_qlib(
     # Production Qlib artifacts must carry the governed domestic-equity ETF
     # whitelist.  Direct QlibBuilder construction remains usable for isolated
     # forensic/unit fixtures that intentionally contain only A-share inputs.
+    snapshot_path = _recover_missing_ingested_at(context, snapshot_path)
     builder = QlibBuilder(snapshot_path, require_governed_etfs=True)
     staging = context.settings.data_root / "qlib_staging" / snapshot_path.name
     output = context.settings.data_root / "qlib" / snapshot_path.name
