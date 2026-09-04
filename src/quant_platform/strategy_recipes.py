@@ -5,11 +5,11 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v17, the narrowly scoped v18 consumed-history rehabilitation, and v20-v28
-# remain historical identities. v29 is the current ordinary three-horizon
-# recipe and seals the live-path derived market-value surface into the
-# complete governed research-to-paper economic closure.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-04-v29"
+# v17, the narrowly scoped v18 consumed-history rehabilitation, and v20-v29
+# remain historical identities. v30 is the current ordinary three-horizon
+# recipe and seals the strategy-scoped style missing gate into the complete
+# governed research-to-paper economic closure.
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-04-v30"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
