@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 from copy import deepcopy
@@ -999,7 +1000,12 @@ def main() -> None:
             "day": args.provider_uri,
             str(args.execution_frequency): str(args.execution_provider_uri),
         }
-    qlib.init(provider_uri=provider_uri, region="cn")
+    qlib_kernels = int(os.environ.get("QUANTLAB_QLIB_KERNELS", "1") or "1")
+    if not 1 <= qlib_kernels <= 64:
+        raise ValueError("QUANTLAB_QLIB_KERNELS must be between 1 and 64")
+    # Expression evaluation is embarrassingly parallel across instruments;
+    # the sequential account loop below stays single-core by design.
+    qlib.init(provider_uri=provider_uri, region="cn", kernels=qlib_kernels)
     historical_periods = manifest.get("historical_validation_periods")
     if not isinstance(historical_periods, dict) or set(historical_periods) != {
         "start",
