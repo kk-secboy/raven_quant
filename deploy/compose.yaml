@@ -226,6 +226,7 @@ services:
       WORKER_CONCURRENCY: "3"
       RESEARCH_CPU_BUDGET: "24"
       RESEARCH_MEMORY_BUDGET_GB: "40"
+      QUANTLAB_QLIB_KERNELS: ${QUANTLAB_QLIB_KERNELS:-8}
       RDAGENT_ENABLED: "false"
       DOCKER_HOST: tcp://rdagent-docker:2375
       FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
