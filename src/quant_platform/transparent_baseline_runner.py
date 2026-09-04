@@ -253,16 +253,27 @@ STRATEGY_RESEARCH_V31_TARGET_RUNNER_SHA256 = (
 STRATEGY_RESEARCH_V31_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "dac80be45fcae33d2bcdafff76aa2b71feac6624deb25b542bfc02961584f1b8"
 )
-STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+STRATEGY_RESEARCH_V32_TARGET_RECIPE_VERSION = (
     "qlib-rdagent-single-mainline-2026-09-04-v32"
+)
+STRATEGY_RESEARCH_V32_TARGET_RUNNER_SHA256 = (
+    "aa6a106935705f341608922f3ba7ef8cb7d8333412b19203917cf2b28613c9e8"
+)
+# Historical v32 seal. It remains independently addressable after v33 becomes
+# current so already-applied database constraints and evidence stay immutable.
+STRATEGY_RESEARCH_V32_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "4e35515b1778b7c6e85cd99211581102f17873f6d59f4a710ed6bc603c945630"
+)
+STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-09-04-v33"
 )
 STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
     "aa6a106935705f341608922f3ba7ef8cb7d8333412b19203917cf2b28613c9e8"
 )
-# Filled after the complete v32 source closure is stable. The source-closure
-# normalizer excludes both v32 seal assignments from their own digest.
+# Filled after the complete v33 source closure is stable. The source-closure
+# normalizer excludes both v33 seal assignments from their own digest.
 STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "4e35515b1778b7c6e85cd99211581102f17873f6d59f4a710ed6bc603c945630"
+    "f7e6511f0b8391b89713e483a1d01600033f984109af2961a902d23cc4437183"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
@@ -347,6 +358,9 @@ _TARGET_RUNNERS = {
     ),
     STRATEGY_RESEARCH_V31_TARGET_RECIPE_VERSION: (
         STRATEGY_RESEARCH_V31_TARGET_RUNNER_SHA256
+    ),
+    STRATEGY_RESEARCH_V32_TARGET_RECIPE_VERSION: (
+        STRATEGY_RESEARCH_V32_TARGET_RUNNER_SHA256
     ),
     STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
 }
@@ -466,6 +480,8 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return STRATEGY_RESEARCH_V30_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == STRATEGY_RESEARCH_V31_TARGET_RECIPE_VERSION:
         return STRATEGY_RESEARCH_V31_TARGET_RUNTIME_BUNDLE_SHA256
+    if normalized_recipe_version == STRATEGY_RESEARCH_V32_TARGET_RECIPE_VERSION:
+        return STRATEGY_RESEARCH_V32_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == STRATEGY_RESEARCH_TARGET_RECIPE_VERSION:
         return STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     return None
@@ -512,6 +528,7 @@ def target_worker_runtime_image_for_recipe(
             STRATEGY_RESEARCH_V29_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V30_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V31_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_V32_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
     ):
@@ -536,7 +553,8 @@ def target_worker_runtime_image_for_recipe(
         STRATEGY_RESEARCH_V29_TARGET_RECIPE_VERSION: "v29",
         STRATEGY_RESEARCH_V30_TARGET_RECIPE_VERSION: "v30",
         STRATEGY_RESEARCH_V31_TARGET_RECIPE_VERSION: "v31",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v32",
+        STRATEGY_RESEARCH_V32_TARGET_RECIPE_VERSION: "v32",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v33",
     }[normalized_recipe_version]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -688,7 +706,8 @@ def require_transparent_baseline_runner(
         STRATEGY_RESEARCH_V29_TARGET_RECIPE_VERSION: "v29",
         STRATEGY_RESEARCH_V30_TARGET_RECIPE_VERSION: "v30",
         STRATEGY_RESEARCH_V31_TARGET_RECIPE_VERSION: "v31",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v32",
+        STRATEGY_RESEARCH_V32_TARGET_RECIPE_VERSION: "v32",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v33",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -793,7 +812,8 @@ def require_transparent_baseline_runner(
             "v29": STRATEGY_RESEARCH_V29_TARGET_RUNTIME_BUNDLE_SHA256,
             "v30": STRATEGY_RESEARCH_V30_TARGET_RUNTIME_BUNDLE_SHA256,
             "v31": STRATEGY_RESEARCH_V31_TARGET_RUNTIME_BUNDLE_SHA256,
-            "v32": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v32": STRATEGY_RESEARCH_V32_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v33": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(
