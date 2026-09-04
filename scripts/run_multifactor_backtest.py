@@ -805,6 +805,7 @@ def _metadata_provider(
             styles,
             market_timestamp,
             preserve_missing=True,
+            required_instruments=instruments,
         )
         constrained = (
             str(strategy_config.get("portfolio_construction") or "")

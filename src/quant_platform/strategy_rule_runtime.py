@@ -84,6 +84,7 @@ def latest_governed_style_cross_section(
     when: pd.Timestamp,
     *,
     preserve_missing: bool = False,
+    required_instruments: Any = None,
 ) -> pd.DataFrame:
     """Resolve one PIT standardized style cross-section identically everywhere."""
 
@@ -105,6 +106,16 @@ def latest_governed_style_cross_section(
         [np.inf, -np.inf], np.nan
     )
     missing_rates = result.isna().mean()
+    if required_instruments is not None:
+        # The systemic-missing gate exists to guarantee the exposures a
+        # strategy actually consumes.  Recent IPOs sit inside their 120-day
+        # volatility warmup and are never tradable candidates, so a full-market
+        # missing rate would veto windows the strategy can safely trade.
+        scoped = result.reindex(
+            pd.Index([str(item) for item in required_instruments], dtype=str)
+        )
+        if len(scoped):
+            missing_rates = scoped.isna().mean()
     systemic = missing_rates[missing_rates > MAX_STYLE_CROSS_SECTION_MISSING_RATE]
     if not systemic.empty:
         details = ", ".join(

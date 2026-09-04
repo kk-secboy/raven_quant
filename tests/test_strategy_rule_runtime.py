@@ -176,6 +176,43 @@ def test_backtest_and_recommendation_share_standardized_style_artifact(tmp_path)
     assert backtest_evidence["max_cross_section_missing_rate"] == 0.05
 
 
+def test_style_missing_gate_scopes_to_strategy_instruments() -> None:
+    from quant_platform.strategy_rule_runtime import (
+        latest_governed_style_cross_section,
+    )
+
+    instruments = [f"S{index:04d}" for index in range(100)]
+    frame = pd.DataFrame(
+        {
+            "datetime": pd.Timestamp("2009-12-30"),
+            "instrument": instruments,
+            "size": 0.0,
+            "value": 0.0,
+            "growth": 0.0,
+            # 6% of the full market lacks volatility (recent IPO warmup),
+            # but none of the strategy's candidates miss it.
+            "volatility": [np.nan] * 6 + [0.5] * 94,
+        }
+    )
+
+    with pytest.raises(ValueError, match="missing rate exceeds"):
+        latest_governed_style_cross_section(frame, pd.Timestamp("2009-12-30"))
+
+    scoped = latest_governed_style_cross_section(
+        frame,
+        pd.Timestamp("2009-12-30"),
+        required_instruments=instruments[6:],
+    )
+    assert np.isfinite(scoped.to_numpy(dtype=float)).all()
+
+    with pytest.raises(ValueError, match="missing rate exceeds"):
+        latest_governed_style_cross_section(
+            frame,
+            pd.Timestamp("2009-12-30"),
+            required_instruments=instruments,
+        )
+
+
 def test_topk_requires_only_signal_and_holding_industries() -> None:
     metadata = build_portfolio_policy_runtime_metadata(
         {"portfolio_construction": "topk_equal_weight"},
