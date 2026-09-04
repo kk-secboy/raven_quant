@@ -785,6 +785,34 @@ def _metadata_provider(
     membership["in_date"] = pd.to_datetime(membership["in_date"], errors="coerce")
     membership["out_date"] = pd.to_datetime(membership["out_date"], errors="coerce")
     close_matrix = close_history["$close"].unstack("instrument").sort_index()
+    # YoY growth is undefined until a company has had the chance to publish
+    # one annual report; the systemic style gate is therefore evaluated only
+    # over candidates with a full year of dataset history.  Younger
+    # candidates keep their neutral (zero) style imputation.
+    _eligibility_first_datetime = eligibility_matrix.groupby("instrument")[
+        "datetime"
+    ].min()
+    _eligibility_calendar_index = {
+        day: index
+        for index, day in enumerate(sorted(eligibility_matrix["datetime"].unique()))
+    }
+
+    def _mature_style_scope(instruments: pd.Index, timestamp: pd.Timestamp) -> list[str]:
+        position = _eligibility_calendar_index.get(timestamp)
+        if position is None:
+            return [str(item) for item in instruments]
+        mature: list[str] = []
+        for instrument in instruments:
+            first = _eligibility_first_datetime.get(str(instrument))
+            if first is None:
+                continue
+            first_position = _eligibility_calendar_index.get(first)
+            if (
+                first_position is not None
+                and position - first_position + 1 >= 252
+            ):
+                mature.append(str(instrument))
+        return mature or [str(item) for item in instruments]
 
     def provide(when: Any, instruments: pd.Index) -> dict[str, Any]:
         timestamp = pd.Timestamp(when).tz_localize(None)
@@ -806,7 +834,7 @@ def _metadata_provider(
             styles,
             market_timestamp,
             preserve_missing=True,
-            required_instruments=instruments,
+            required_instruments=_mature_style_scope(instruments, market_timestamp),
         )
         constrained = (
             str(strategy_config.get("portfolio_construction") or "")
