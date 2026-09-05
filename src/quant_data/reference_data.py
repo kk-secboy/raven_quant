@@ -72,6 +72,9 @@ REFERENCE_REFRESH_POLICIES: dict[str, ReferenceRefreshPolicy] = {
         "daily": (
             "cb_basic",
             "cb_price_chg",
+            # Rating batches query full history by ts_code; new ratings must
+            # not remain hidden behind an earlier successful request key.
+            "cb_rating",
             "etf_basic",
             "fund_basic",
             "fut_basic",

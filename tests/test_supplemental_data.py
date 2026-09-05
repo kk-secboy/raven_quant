@@ -595,6 +595,34 @@ def test_bond_reference_batches_keep_conversion_results_below_provider_limit() -
     assert all(spec.params["start_date"] == "20240101" for spec in shares)
 
 
+def test_bond_rating_refreshes_daily_and_reuses_the_same_day_request() -> None:
+    def rating(start: date, end: date) -> FetchSpec:
+        return next(
+            spec
+            for spec in bond_reference_specs(
+                ["123001.SZ", "110001.SH"], start=start, end=end, max_attempts=3
+            )
+            if spec.dataset == "cb_rating"
+        )
+
+    previous = rating(date(2026, 8, 21), date(2026, 8, 28))
+    current = rating(date(2026, 8, 28), date(2026, 9, 4))
+    same_day = rating(date(2026, 9, 4), date(2026, 9, 4))
+    next_day = rating(date(2026, 9, 4), date(2026, 9, 5))
+    params = {"ts_code": "110001.SH,123001.SZ"}
+    legacy = FetchSpec("cb_rating", "cb_rating", {**params, "row_limit": 3_000}, params)
+
+    assert current.scope["reference_refresh_bucket"] == "2026-09-04"
+    assert current.scope["reference_refresh_cadence"] == "daily"
+    assert len({legacy.unit_key, previous.unit_key, current.unit_key, next_day.unit_key}) == 4
+    assert same_day.unit_key == current.unit_key
+    assert all(spec.params == params for spec in (previous, current, same_day, next_day))
+    assert current.api_name == legacy.api_name
+    assert current.fields == legacy.fields
+    assert current.scope["row_limit"] == legacy.scope["row_limit"]
+    assert legacy.scope == {**params, "row_limit": 3_000}
+
+
 def test_global_bundle_covers_index_and_fx() -> None:
     specs = supplemental_specs(
         "global_markets",

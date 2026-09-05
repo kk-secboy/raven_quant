@@ -100,6 +100,38 @@ def test_snapshot_selection_replaces_legacy_and_old_reference_generations() -> N
     assert [item["unit_key"] for item in selected] == ["day-2"]
 
 
+def test_rating_refresh_selection_preserves_historical_generations() -> None:
+    params = {"ts_code": "110001.SH,123001.SZ"}
+    legacy = FetchSpec("cb_rating", "cb_rating", {**params, "row_limit": 3_000}, params)
+    previous, current, future = [
+        apply_reference_refresh([legacy], as_of=day)[0]
+        for day in (date(2026, 8, 28), date(2026, 9, 4), date(2026, 9, 5))
+    ]
+    rows = [
+        {
+            "dataset": spec.dataset,
+            "unit_key": spec.unit_key,
+            "scope_json": spec.scope,
+            "params_json": spec.params,
+            "status": "succeeded",
+        }
+        for spec in (legacy, previous, current, future)
+    ]
+    original = json.dumps(rows, sort_keys=True)
+
+    for cutoff, expected in (
+        (date(2026, 8, 27), legacy),
+        (date(2026, 8, 28), previous),
+        (date(2026, 9, 4), current),
+        (date(2026, 8, 28), previous),
+    ):
+        selected = select_current_reference_units(rows, snapshot_end=cutoff)
+        assert [row["unit_key"] for row in selected] == [expected.unit_key]
+
+    assert json.dumps(rows, sort_keys=True) == original
+    assert "reference_refresh_bucket" not in legacy.scope
+
+
 def test_snapshot_selection_keeps_all_pages_in_latest_generation() -> None:
     rows = []
     for bucket in ("2026-07-07", "2026-07-14"):
