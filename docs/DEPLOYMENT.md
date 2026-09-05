@@ -49,6 +49,26 @@ Web 和同源网关隔离运行。持久数据保存在 PostgreSQL 与 Compose �
 恢复介质；数据库备份包含密文但不包含该密钥。部署到 HTTPS 反向代理后设置
 `AUTH_COOKIE_SECURE=true`，否则入口只绑定 `127.0.0.1`。
 
+### 评估任务资源
+
+`evaluation-worker` 默认一次执行一个任务，容器限制为 8 CPU、40 GiB 内存和
+512 个进程/线程。`memswap_limit=40g` 与内存上限相同，禁止该容器额外使用 swap。
+部署环境显式设置 `QUANTLAB_QLIB_KERNELS=1`，限制 baseline 和正式回测的 Qlib
+特征预处理进程数；升级前检查旧环境文件，已有的更大值会覆盖 Compose 默认值。
+训练日期、市场、Alpha158 特征、模型参数及统计门槛不因资源限制而缩减。
+
+Compose 中 OMP/MKL/OpenBLAS/NumExpr 的默认线程数为 1，仅限制 worker 本身与健康
+探针。任务执行器仍按既有资源账本设置最多 8 个数值线程及 Linux CPU affinity，
+baseline 的 LightGBM `num_threads=8` 保持不变。跨 worker 的研究预算仍为
+24 CPU / 40 GiB；baseline 占满 40 GiB 预算，其他受该账本治理的重研究任务必须等待。
+容器上限用于隔离资源耗尽，不保证全量训练一定能在上限内完成；运行时检查
+`memory.current`、`memory.peak`、`memory.events` 和 `pids.current`，保留失败证据。
+
+服务器重启不是取消任务。Worker 启动会将尚有尝试次数的中断任务重新排队并等待
+120 秒，`safe_mode` 不阻止通用任务认领。恢复前先检查旧任务的状态及
+`attempts/max_attempts`；若需禁止继续执行，用现有取消入口令该任务终结，并确认
+没有残留进程，再启动受控的新版本。不要通过重试旧任务覆盖需保留的中断制品。
+
 ## 3. 数据库迁移
 
 本地环境：

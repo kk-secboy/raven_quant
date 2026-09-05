@@ -209,8 +209,10 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
-    cpus: "24.0"
-    mem_limit: 48g
+    cpus: "8.0"
+    mem_limit: 40g
+    memswap_limit: 40g
+    pids_limit: 512
     logging: *default-logging
     labels: *release-labels
     environment:
@@ -223,10 +225,17 @@ services:
       QLIB_PYTHON: /usr/local/bin/python
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       WORKER_JOB_KINDS: minute_research,qlib_baseline,external_factor_evaluate,information_factor_evaluate,multiface_audit,factor_library_materialize,factor_library_cluster,factor_sota_evaluate,factor_evaluate,model_evaluate,model_ensemble_evaluate,quant_bundle_evaluate,strategy_backtest,strategy_health_collect,parameter_experiment
-      WORKER_CONCURRENCY: "3"
+      WORKER_CONCURRENCY: "1"
       RESEARCH_CPU_BUDGET: "24"
       RESEARCH_MEMORY_BUDGET_GB: "40"
-      QUANTLAB_QLIB_KERNELS: ${QUANTLAB_QLIB_KERNELS:-8}
+      QUANTLAB_QLIB_KERNELS: ${QUANTLAB_QLIB_KERNELS:-1}
+      # Bound the worker and probes; each governed job separately sets its
+      # existing numerical thread allowance and Linux CPU affinity (at most 8).
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      NUMEXPR_MAX_THREADS: "1"
       RDAGENT_ENABLED: "false"
       DOCKER_HOST: tcp://rdagent-docker:2375
       FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2

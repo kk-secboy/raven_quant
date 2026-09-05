@@ -83,7 +83,7 @@ def test_primary_data_worker_has_hard_limits_and_numerical_thread_caps() -> None
         assert f'{variable}: "8"' in worker_block
 
 
-def test_evaluation_worker_keeps_host_capacity_but_not_a_48gb_ledger() -> None:
+def test_evaluation_worker_contains_one_heavy_job_without_changing_host_ledger() -> None:
     compose = (Path(__file__).parents[1] / "deploy" / "compose.yaml").read_text(
         encoding="utf-8"
     )
@@ -91,11 +91,22 @@ def test_evaluation_worker_keeps_host_capacity_but_not_a_48gb_ledger() -> None:
         "\n  paper-worker:\n", 1
     )[0]
 
-    assert 'cpus: "24.0"' in evaluation_block
-    assert "mem_limit: 48g" in evaluation_block
-    assert 'WORKER_CONCURRENCY: "3"' in evaluation_block
+    assert 'cpus: "8.0"' in evaluation_block
+    assert "mem_limit: 40g" in evaluation_block
+    assert "memswap_limit: 40g" in evaluation_block
+    assert "pids_limit: 512" in evaluation_block
+    assert 'WORKER_CONCURRENCY: "1"' in evaluation_block
     assert 'RESEARCH_CPU_BUDGET: "24"' in evaluation_block
     assert 'RESEARCH_MEMORY_BUDGET_GB: "40"' in evaluation_block
+    assert "QUANTLAB_QLIB_KERNELS: ${QUANTLAB_QLIB_KERNELS:-1}" in evaluation_block
+    for variable in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "NUMEXPR_MAX_THREADS",
+    ):
+        assert f'{variable}: "1"' in evaluation_block
     assert "strategy_health_collect" in evaluation_block
 
 
