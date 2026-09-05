@@ -98,6 +98,7 @@ def test_baseline_cli_applies_bounded_kernels_to_qlib_init(
         "qlib.contrib.strategy": {"TopkDropoutStrategy": object},
         "qlib.data": {"D": object},
         "qlib.data.dataset": {"DatasetH": object},
+        "quant_platform.qlib_baseline_dataset": {"BaselineDataset": object},
     }
     for name, attributes in modules.items():
         module = ModuleType(name)

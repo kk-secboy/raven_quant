@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -78,7 +79,8 @@ def main() -> None:
     from qlib.contrib.model.gbdt import LGBModel
     from qlib.contrib.strategy import TopkDropoutStrategy
     from qlib.data import D
-    from qlib.data.dataset import DatasetH
+
+    from quant_platform.qlib_baseline_dataset import BaselineDataset
 
     provider_uri = Path(args.provider_uri).resolve()
     provenance_path = provider_uri / "metadata" / "provenance.json"
@@ -143,7 +145,12 @@ def main() -> None:
             }
         ],
     )
-    dataset = DatasetH(handler=handler, segments=segments)
+    dataset = BaselineDataset(handler=handler, segments=segments)
+    print(json.dumps({
+        "stage": "baseline_training_data_ready",
+        "learning_rows": len(handler._learn),
+        "inference_rows": len(handler._infer),
+    }), flush=True)
     model = LGBModel(
         loss="mse",
         learning_rate=0.05,
@@ -180,9 +187,21 @@ def main() -> None:
         model.fit(dataset)
         recorder_id = workflow.identity_dict()["recorder_id"]
         training_metrics = workflow.list_metrics()
+        print(json.dumps({
+            "stage": "baseline_training_complete",
+            "metric_count": len(training_metrics),
+        }), flush=True)
 
     predictions = model.predict(dataset, segment="test").rename("score")
-    labels = dataset.prepare("test", col_set="label")
+    labels = dataset.prepare("test", col_set="label").copy(deep=True)
+    print(json.dumps({
+        "stage": "baseline_prediction_complete",
+        "prediction_rows": len(predictions),
+        "label_rows": len(labels),
+    }), flush=True)
+    del model, dataset, handler
+    gc.collect()
+    print(json.dumps({"stage": "baseline_training_data_released"}), flush=True)
     label = labels.iloc[:, 0].rename("label")
     aligned = pd.concat([predictions, label], axis=1).dropna()
     daily_ic = aligned.groupby(level="datetime").apply(
