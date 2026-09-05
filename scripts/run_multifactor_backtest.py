@@ -120,9 +120,7 @@ from quant_platform.strategy_rule_runtime import (
     build_portfolio_policy_runtime_metadata,
     build_strategy_rule_runtime_metadata,
     load_market_trend_close_history,
-)
-from quant_platform.strategy_rule_runtime import (
-    latest_governed_style_cross_section as _latest_style_cross_section,
+    policy_style_cross_sections,
 )
 from quant_platform.strategy_rule_runtime import (
     load_governed_style_exposures as _load_governed_style_exposures,
@@ -830,10 +828,10 @@ def _metadata_provider(
             .drop_duplicates("instrument", keep="last")
         )
         industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
-        raw_style = _latest_style_cross_section(
+        raw_style, style = policy_style_cross_sections(
             styles,
             market_timestamp,
-            preserve_missing=True,
+            config=strategy_config,
             required_instruments=_mature_style_scope(instruments, market_timestamp),
         )
         constrained = (
@@ -848,11 +846,6 @@ def _metadata_provider(
             )
             if constrained and benchmark_weights is not None
             else None
-        )
-        style = (
-            _latest_style_cross_section(styles, market_timestamp)
-            if constrained
-            else raw_style
         )
         risk_instruments = instruments.astype(str)
         if constrained and benchmark is not None:

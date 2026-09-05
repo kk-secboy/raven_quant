@@ -68,6 +68,7 @@ def decode_response(api_name: str, body: bytes, status_code: int = 200) -> Provi
             "too many request",
             "too frequent",
             "frequency limit",
+            "限流",
             "频率",
             "限频",
             "请求过于频繁",
@@ -87,7 +88,7 @@ def decode_response(api_name: str, body: bytes, status_code: int = 200) -> Provi
             "service unavailable",
         )
     )
-    rate_limited = status_code == 429 or explicit_rate_limit
+    rate_limited = status_code == 429 or str(code) == "429" or explicit_rate_limit
     no_data = status_code == 200 and any(
         token in message_lower
         for token in (

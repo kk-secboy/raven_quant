@@ -105,7 +105,7 @@ def latest_governed_style_cross_section(
     result = result.apply(pd.to_numeric, errors="coerce").replace(
         [np.inf, -np.inf], np.nan
     )
-    missing_rates = result.isna().mean()
+    gate_values = result
     if required_instruments is not None:
         # The systemic-missing gate exists to guarantee the exposures a
         # strategy actually consumes.  Recent IPOs sit inside their 120-day
@@ -115,15 +115,22 @@ def latest_governed_style_cross_section(
             pd.Index([str(item) for item in required_instruments], dtype=str)
         )
         if len(scoped):
-            missing_rates = scoped.isna().mean()
+            gate_values = scoped
+    missing_rates = gate_values.isna().mean()
     systemic = missing_rates[missing_rates > MAX_STYLE_CROSS_SECTION_MISSING_RATE]
     if not systemic.empty:
         details = ", ".join(
             f"{column}={rate:.2%}" for column, rate in systemic.items()
         )
+        missing_instruments = gate_values.index[
+            gate_values[systemic.index].isna().any(axis=1)
+        ]
         raise ValueError(
             "point-in-time standardized style exposure missing rate exceeds "
-            f"{MAX_STYLE_CROSS_SECTION_MISSING_RATE:.0%}: {details}"
+            f"{MAX_STYLE_CROSS_SECTION_MISSING_RATE:.0%}: {details}; "
+            f"as_of={timestamp.date()}, exposure_date={values['datetime'].max().date()}, "
+            f"scope_count={len(gate_values)}, "
+            f"missing_instruments={','.join(missing_instruments[:10])}"
         )
     if preserve_missing:
         return result.astype(float)
@@ -133,6 +140,42 @@ def latest_governed_style_cross_section(
     if not np.isfinite(result.to_numpy(dtype=float)).all():
         raise ValueError("point-in-time style exposures are not finite")
     return result.astype(float)
+
+
+def policy_style_cross_sections(
+    frame: pd.DataFrame,
+    when: pd.Timestamp,
+    *,
+    config: Mapping[str, Any],
+    required_instruments: Any = None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Resolve only the style inputs consumed by the bound portfolio rules.
+
+    Trend TopK policies consume neither optimizer exposures nor valuation
+    ranks. Requiring daily stock style rows for their suspended holdings
+    prevents the risk-state projection from freezing those positions. Actual
+    style consumers retain the governed missing-data gate and PIT semantics.
+    """
+
+    constrained = str(config.get("portfolio_construction") or "") in (
+        _CONSTRAINED_PORTFOLIO_CONSTRUCTIONS
+    )
+    valuation_required = (
+        config.get("valuation_regime_max_percentile") is not None
+        or config.get("valuation_reduce_percentile") is not None
+    )
+    if not constrained and not valuation_required:
+        return pd.DataFrame(), None
+    raw = latest_governed_style_cross_section(
+        frame,
+        when,
+        preserve_missing=True,
+        required_instruments=required_instruments,
+    )
+    styles = (
+        latest_governed_style_cross_section(frame, when) if constrained else None
+    )
+    return raw, styles
 
 
 def apply_strategy_rule_alpha_weights(

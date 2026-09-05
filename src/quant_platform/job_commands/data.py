@@ -499,6 +499,7 @@ def data_qlib_command(
     worker, job: dict
 ) -> tuple[list[str], Path | None, dict[str, str]]:
     payload = job["payload"]
+    result_path = worker.settings.data_root / "artifacts" / "data-qlib" / job["id"] / "result.json"
     return (
         [
             sys.executable,
@@ -507,8 +508,10 @@ def data_qlib_command(
             "build-qlib",
             "--snapshot",
             payload["snapshot_name"],
+            "--result",
+            str(result_path),
         ],
-        None,
+        result_path,
         {},
     )
 

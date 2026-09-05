@@ -17,6 +17,7 @@ unit-tested with synthetic calendars before production orchestration is wired.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Iterable
@@ -33,8 +34,10 @@ from .announcement_nlp import (
     LOGIC_FACTOR_NAME,
     NLP_SUBDIR,
     PROMPT_VERSION,
+    _publication_fields,
     _sha256_file,
 )
+from .information_schedule import validate_information_market_snapshot
 
 LABEL_SCHEMA_VERSION = "event-market-response.v1"
 DEFAULT_HORIZONS = (1, 3, 5, 20)
@@ -372,7 +375,9 @@ def write_event_market_response_labels(
     )
 
 
-def _read_partition_years(dataset_dir: Path, years: set[int]) -> pd.DataFrame:
+def _read_partition_years(
+    dataset_dir: Path, years: set[int], *, file_manifest: list[dict[str, Any]]
+) -> pd.DataFrame:
     paths = [
         path
         for year in sorted(years)
@@ -382,30 +387,77 @@ def _read_partition_years(dataset_dir: Path, years: set[int]) -> pd.DataFrame:
         raise RuntimeError(
             f"no parquet partitions found in {dataset_dir} for years {sorted(years)}"
         )
+    sealed = {str(item["path"]): item for item in file_manifest}
+    snapshot = dataset_dir.parent.parent
+    for path in paths:
+        entry = sealed.get(path.relative_to(snapshot).as_posix())
+        if (
+            entry is None
+            or path.stat().st_size != entry.get("bytes")
+            or _sha256_file(path) != entry.get("sha256")
+        ):
+            raise RuntimeError("event-label market bars failed snapshot checksum verification")
     return pd.concat((pd.read_parquet(path) for path in paths), ignore_index=True)
 
 
+def _validated_publication_fields(fields: pd.DataFrame | None, source: dict) -> pd.DataFrame:
+    publication = source.get("publication_scope")
+    scope = source.get("scope")
+    requested_model = str(scope.get("requested_model") or "") if isinstance(scope, dict) else ""
+    if (
+        fields is None
+        or not isinstance(publication, dict)
+        or publication.get("mode") != "all_persisted_succeeded_fields_current_prompt"
+        or source.get("prompt_version") != PROMPT_VERSION
+        or not requested_model
+    ):
+        raise RuntimeError("governed logic factor publication scope is incompatible")
+    _require_columns(
+        fields,
+        {"process_key", "prompt_version", "model", "source_sha256", "processed_at"},
+        "announcement publication fields",
+    )
+    published = _publication_fields(fields, requested_model=requested_model)
+    keys = set(published["process_key"].astype(str))
+    digest = hashlib.sha256("\n".join(sorted(keys)).encode("utf-8")).hexdigest()
+    if (
+        digest != publication.get("process_keys_sha256")
+        or isinstance(publication.get("process_key_count"), bool)
+        or len(keys) != publication.get("process_key_count")
+    ):
+        raise RuntimeError("governed logic publication fields failed scope checksum verification")
+    return published
+
+
 def _validated_logic_source(
-    manifest_path: Path, *, prompt_version: str
+    manifest_path: Path, *, prompt_version: str, fields: pd.DataFrame | None = None
 ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
     """Return a checksum-verified logic manifest and its bound model set.
 
     Checkpoint reuse can legitimately combine rows produced by multiple
     governed models.  The factor manifest binds those rows with both a
-    canonical ``mixed[...]`` label and the exact list in ``scope.models``.
-    Validate that binding and return the concrete models for field selection.
+    canonical ``mixed[...]`` label. New manifests seal the complete publication
+    separately from this run's processing scope; verify that exact field set
+    before resolving models. Older manifests retain their scope-model contract.
     """
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("governed logic factor manifest is unreadable") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("governed logic factor manifest has an incompatible source")
     source = manifest.get("source")
     artifact_name = manifest.get("artifact")
     expected_sha256 = manifest.get("sha256")
     model = str(source.get("model") or "").strip() if isinstance(source, dict) else ""
     scope = source.get("scope") if isinstance(source, dict) else None
-    if model.startswith("mixed[") and model.endswith("]"):
+    if isinstance(source, dict) and "publication_scope" in source:
+        published = _validated_publication_fields(fields, source)
+        models = tuple(sorted(published["model"].dropna().astype(str).unique()))
+        expected_model = models[0] if len(models) == 1 else f"mixed[{','.join(models)}]"
+        model_binding_valid = bool(models) and model == expected_model
+    elif model.startswith("mixed[") and model.endswith("]"):
         raw_models = scope.get("models") if isinstance(scope, dict) else None
         models = tuple(
             sorted(
@@ -449,14 +501,13 @@ def process_event_market_response(
 ) -> MarketResponseSummary:
     """Build labels from a verified immutable snapshot and current NLP fields."""
 
+    try:
+        snapshot_manifest = validate_information_market_snapshot(data_root, snapshot_name)
+    except (OSError, KeyError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
     snapshot = data_root / "snapshots" / snapshot_name
     verification_path = snapshot / "verification.json"
     manifest_path = snapshot / "manifest.json"
-    if not verification_path.is_file() or not manifest_path.is_file():
-        raise RuntimeError(f"snapshot {snapshot_name} is missing manifest/verification evidence")
-    verification = json.loads(verification_path.read_text(encoding="utf-8"))
-    if verification.get("ok") is not True or verification.get("errors"):
-        raise RuntimeError(f"snapshot {snapshot_name} did not pass the blocking quality gate")
 
     fields_path = data_root / ANNOUNCEMENTS_DIR / NLP_SUBDIR / "fields.parquet"
     if not fields_path.is_file():
@@ -472,10 +523,12 @@ def process_event_market_response(
         raise RuntimeError(
             f"governed logic factor manifest is unavailable at {logic_manifest_path}"
         )
-    _, model, models = _validated_logic_source(
-        logic_manifest_path, prompt_version=prompt_version
-    )
     fields = pd.read_parquet(fields_path)
+    logic_manifest, model, models = _validated_logic_source(
+        logic_manifest_path, prompt_version=prompt_version, fields=fields
+    )
+    if "publication_scope" in logic_manifest["source"]:
+        fields = _validated_publication_fields(fields, logic_manifest["source"])
     _require_columns(
         fields, {"prompt_version", "model", "available_at"}, "announcement fields"
     )
@@ -492,8 +545,14 @@ def process_event_market_response(
     if available.isna().any():
         raise RuntimeError("announcement fields contain invalid available_at values")
     years = set(range(int(available.dt.year.min()) - 1, int(available.dt.year.max()) + 2))
-    daily = _read_partition_years(snapshot / "parquet" / "daily", years)
-    benchmark = _read_partition_years(snapshot / "parquet" / "index_daily", years)
+    daily = _read_partition_years(
+        snapshot / "parquet" / "daily", years,
+        file_manifest=snapshot_manifest["datasets"]["daily"]["files"],
+    )
+    benchmark = _read_partition_years(
+        snapshot / "parquet" / "index_daily", years,
+        file_manifest=snapshot_manifest["datasets"]["index_daily"]["files"],
+    )
     horizon_values = tuple(sorted({int(value) for value in horizons}))
     labels = build_event_market_response_labels(
         fields,

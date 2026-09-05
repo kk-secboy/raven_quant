@@ -244,7 +244,7 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   );
   assert.match(
     sourceByName["rdagent-panel.tsx"],
-    /HORIZON_RESEARCH_SCENARIOS = new Set<ScenarioId>\(\[[\s\S]{0,120}"fin_factor",[\s\S]{0,80}"fin_model",[\s\S]{0,80}"fin_quant",[\s\S]{0,80}"fin_strategy",[\s\S]{0,20}\]\)/,
+    /HORIZON_RESEARCH_SCENARIOS = new Set<ScenarioId>\(\[\s*"fin_quant",\s*"fin_strategy",?\s*\]\)/,
   );
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_factor_report/);
   assert.match(sourceByName["rdagent-panel.tsx"], /general_model/);

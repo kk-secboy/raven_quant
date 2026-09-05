@@ -142,6 +142,28 @@ def test_http_429_establishes_one_cooldown_and_returns_immediately() -> None:
     assert raised.value.retry_after_seconds == 180
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"code": 429, "msg": "触发限流：并发请求数超限!"},
+        {"code": "429", "msg": "request rejected"},
+        {"code": -1, "msg": "触发限流：并发请求数超限!"},
+    ],
+)
+def test_relay_http_200_rate_limit_starts_cooldown_without_burst_retry(payload: dict) -> None:
+    session = _Session([_Response(200, payload)])
+    gate = _Gate()
+
+    with pytest.raises(ProviderError) as raised:
+        _provider(session, gate, max_attempts=5).fetch("stk_factor_pro", {})
+
+    assert session.calls == 1
+    assert gate.cooldowns == 1
+    assert raised.value.rate_limited is True
+    assert raised.value.retryable is True
+    assert raised.value.retry_after_seconds == 180
+
+
 def test_http_503_uses_short_local_backoff_without_global_cooldown(monkeypatch) -> None:
     session = _Session(
         [

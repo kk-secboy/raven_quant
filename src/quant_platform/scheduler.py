@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import cast, select
+from sqlalchemy import cast, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 
 from quant_data.cninfo_announcements import load_trade_calendar_open_days
@@ -18,6 +18,7 @@ from quant_data.database import (
     model_artifacts,
     recommendation_portfolios,
     recommendation_snapshots,
+    research_run_artifacts,
     research_runs,
     row_dict,
     simulation_batches,
@@ -2155,9 +2156,13 @@ class SchedulerEngine:
                 )
             if payload["include_event_labels"]:
                 from .event_market_response import LABEL_SCHEMA_VERSION
+                from .information_schedule import validate_information_market_snapshot
 
                 snapshot_name = payload["snapshot_name"] or latest_verified_snapshot(
                     self.settings.data_root, as_of=local_date
+                )
+                validate_information_market_snapshot(
+                    self.settings.data_root, snapshot_name, as_of=local_date
                 )
                 steps.append(
                     {
@@ -2713,7 +2718,8 @@ class SchedulerEngine:
                 existing = connection.scalar(
                     select(research_runs.c.id)
                     .where(
-                        research_runs.c.kind == "strategy",
+                        research_runs.c.kind
+                        == get_rdagent_scenario("fin_strategy").research_kind,
                         trigger_path.op("@>")(cast([trigger_id], JSONB)),
                     )
                     .limit(1)
@@ -2732,9 +2738,26 @@ class SchedulerEngine:
                     research_runs.c.job_id,
                     research_runs.c.status,
                     research_runs.c.config_json,
+                    research_runs.c.error,
+                    select(research_run_artifacts.c.id)
+                    .where(research_run_artifacts.c.research_run_id == research_runs.c.id)
+                    .exists()
+                    .label("has_artifacts"),
+                    select(jobs.c.id)
+                    .where(
+                        or_(
+                            jobs.c.payload_json["research_run_id"].as_string()
+                            == research_runs.c.id,
+                            jobs.c.payload_json["fin_strategy_research_run_id"].as_string()
+                            == research_runs.c.id,
+                        )
+                    )
+                    .exists()
+                    .label("has_payload_jobs"),
                 )
                 .where(
-                    research_runs.c.kind == "strategy",
+                    research_runs.c.kind
+                    == get_rdagent_scenario("fin_strategy").research_kind,
                     research_runs.c.config_json["managed_fin_strategy_run"][
                         "run_sha256"
                     ].as_string()
@@ -2742,7 +2765,24 @@ class SchedulerEngine:
                 )
             ).all()
         if len(rows) > 1:
-            raise ValueError("managed fin_strategy run identity is not unique")
+            # Older schedulers queried the wrong research kind and could leave
+            # failed, unattached duplicates. Preserve those audit records, but
+            # ignore one only when it owns no artifact or payload-linked job.
+            # Formal OOS admission requires the registered research artifacts
+            # and an OOS job, so these empty records cannot own formal evidence.
+            # Every other ambiguity remains an error.
+            owners = [item for item in rows if item.job_id]
+            empty_failures = [
+                item
+                for item in rows
+                if not item.job_id
+                and str(item.status) == "failed"
+                and not item.has_artifacts
+                and not item.has_payload_jobs
+            ]
+            if len(owners) != 1 or len(empty_failures) != len(rows) - 1:
+                raise ValueError("managed fin_strategy run identity is not unique")
+            rows = owners
         if not rows:
             return None
         item = rows[0]

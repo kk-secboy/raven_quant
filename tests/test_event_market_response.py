@@ -8,7 +8,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from quant_platform.announcement_nlp import LOGIC_FACTOR_NAME, PROMPT_VERSION
+from quant_platform.announcement_nlp import (
+    LOGIC_FACTOR_NAME,
+    PROMPT_VERSION,
+    write_factor_artifact,
+)
 from quant_platform.event_market_response import (
     LABEL_ROLE,
     _validated_logic_source,
@@ -279,19 +283,60 @@ def test_logic_source_resolves_checksum_bound_mixed_models(tmp_path: Path) -> No
         _validated_logic_source(manifest_path, prompt_version=PROMPT_VERSION)
 
 
-def test_process_requires_verified_snapshot_and_binds_source_hashes(tmp_path: Path) -> None:
+def _mixed_publication_fields() -> pd.DataFrame:
+    fields = pd.concat([_fields(), _fields(), _fields()], ignore_index=True)
+    fields["process_key"] = ["a-flash", "a-pro", "b-pro"]
+    fields["source_sha256"] = ["a" * 64, "a" * 64, "b" * 64]
+    fields["model"] = ["flash", "pro", "pro"]
+    fields["prompt_version"] = PROMPT_VERSION
+    fields["processed_at"] = pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-02"])
+    fields["impact_horizon"] = "short_term"
+    fields["confidence"] = 0.8
+    return fields
+
+
+def test_logic_source_verifies_publication_models_separately_from_processing_scope(
+    tmp_path: Path,
+) -> None:
+    fields = _mixed_publication_fields()
+    artifact = write_factor_artifact(
+        fields, tmp_path, name=LOGIC_FACTOR_NAME, model="mixed[flash,pro]",
+        now=datetime(2025, 1, 3, tzinfo=UTC), process_keys={"a-flash", "b-pro"},
+        processing_process_keys={"a-flash"},
+        source_scope={"requested_model": "flash", "models": ["flash"]},
+    )
+    manifest_path = artifact["manifest_path"]
+    _, model, models = _validated_logic_source(
+        manifest_path, prompt_version=PROMPT_VERSION, fields=fields
+    )
+    assert model == "mixed[flash,pro]" and models == ("flash", "pro")
+
+    changed = fields.copy()
+    changed.loc[2, "process_key"] = "changed-key"
+    with pytest.raises(RuntimeError, match="scope checksum verification"):
+        _validated_logic_source(manifest_path, prompt_version=PROMPT_VERSION, fields=changed)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source"]["model"] = "mixed[flash,unpublished]"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="incompatible source"):
+        _validated_logic_source(manifest_path, prompt_version=PROMPT_VERSION, fields=fields)
+
+
+@pytest.mark.parametrize("publication_scope", [False, True])
+def test_process_requires_verified_snapshot_and_binds_source_hashes(
+    tmp_path: Path, publication_scope: bool
+) -> None:
     snapshot_name = "cn-fixture"
     snapshot = tmp_path / "snapshots" / snapshot_name
     snapshot.mkdir(parents=True)
     (snapshot / "verification.json").write_text(
         json.dumps({"ok": True, "errors": []}), encoding="utf-8"
     )
-    (snapshot / "manifest.json").write_text(
-        json.dumps({"snapshot": snapshot_name}), encoding="utf-8"
-    )
     fields = _fields()
     fields["prompt_version"] = PROMPT_VERSION
     fields["model"] = "test-model"
+    if publication_scope:
+        fields = _mixed_publication_fields()
     fields_dir = tmp_path / "announcements" / "nlp"
     fields_dir.mkdir(parents=True)
     fields.to_parquet(fields_dir / "fields.parquet", index=False)
@@ -314,11 +359,29 @@ def test_process_requires_verified_snapshot_and_binds_source_hashes(tmp_path: Pa
         ),
         encoding="utf-8",
     )
+    if publication_scope:
+        write_factor_artifact(
+            fields, factors_dir, name=LOGIC_FACTOR_NAME, model="mixed[flash,pro]",
+            now=datetime(2025, 1, 3, tzinfo=UTC), process_keys={"a-flash", "b-pro"},
+            processing_process_keys={"a-flash"},
+            source_scope={"requested_model": "flash", "models": ["flash"]},
+        )
 
+    datasets = {}
     for dataset, frame in (("daily", _stock()), ("index_daily", _benchmark())):
         target = snapshot / "parquet" / dataset / "partition_year=2024" / "partition_month=1"
         target.mkdir(parents=True)
-        frame.to_parquet(target / "data.parquet", index=False)
+        parquet_path = target / "data.parquet"
+        frame.to_parquet(parquet_path, index=False)
+        datasets[dataset] = {"files": [{
+            "path": parquet_path.relative_to(snapshot).as_posix(),
+            "bytes": parquet_path.stat().st_size,
+            "sha256": hashlib.sha256(parquet_path.read_bytes()).hexdigest(),
+        }]}
+    (snapshot / "manifest.json").write_text(
+        json.dumps({"name": snapshot_name, "profile": "full", "end_date": "2024-01-10",
+                    "datasets": datasets}), encoding="utf-8"
+    )
 
     summary = process_event_market_response(
         tmp_path, snapshot_name=snapshot_name, horizons=(1, 3)
@@ -327,9 +390,23 @@ def test_process_requires_verified_snapshot_and_binds_source_hashes(tmp_path: Pa
     assert manifest["source"]["snapshot_name"] == snapshot_name
     assert len(manifest["source"]["snapshot_manifest_sha256"]) == 64
     assert manifest["source"]["prompt_version"] == PROMPT_VERSION
-    assert manifest["source"]["model"] == "test-model"
-    assert manifest["source"]["models"] == ["test-model"]
+    assert manifest["source"]["model"] == (
+        "mixed[flash,pro]" if publication_scope else "test-model"
+    )
+    assert manifest["source"]["models"] == (
+        ["flash", "pro"] if publication_scope else ["test-model"]
+    )
     assert len(manifest["source"]["logic_factor_manifest_sha256"]) == 64
+    labels = pd.read_parquet(summary.labels_path)
+    assert set(labels["process_key"]) == (
+        {"a-flash", "b-pro"} if publication_scope else {"sha:v2:model"}
+    )
+
+    original_bars = parquet_path.read_bytes()
+    parquet_path.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="market bars failed snapshot checksum"):
+        process_event_market_response(tmp_path, snapshot_name=snapshot_name, horizons=(1,))
+    parquet_path.write_bytes(original_bars)
 
     logic_artifact_path.write_bytes(b"tampered")
     with pytest.raises(RuntimeError, match="checksum verification"):

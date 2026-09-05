@@ -415,6 +415,22 @@ class JobStore:
             .with_for_update(skip_locked=True)
         )
         with self.engine.begin() as connection:
+            if not allowed_kinds or "data_verify" in allowed_kinds:
+                # Distinct data pipelines may queue their own verification,
+                # but the old one-active-kind contract still applies when a
+                # worker starts it. Serialize the running-state check and
+                # claim across worker processes, without coupling other kinds.
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:kind))"),
+                    {"kind": "data_verify"},
+                )
+                running_verify = connection.scalar(
+                    select(jobs.c.id)
+                    .where(jobs.c.kind == "data_verify", jobs.c.status == "running")
+                    .limit(1)
+                )
+                if running_verify is not None:
+                    statement = statement.where(jobs.c.kind != "data_verify")
             if governed_resources:
                 connection.execute(
                     text(

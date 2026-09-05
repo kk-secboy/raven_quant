@@ -9,6 +9,7 @@ from sqlalchemy import func, insert, select
 from quant_data.config import Settings
 from quant_data.database import jobs, open_database, row_dict, system_health_snapshots
 
+from .rdagent_scenarios import FROZEN_RDAGENT_SCENARIOS
 from .runtime_secret_store import RuntimeSecretStore
 from .safe_mode import SafeModeStore
 from .services import list_qlib_datasets
@@ -123,11 +124,18 @@ class OperationalHealthStore:
             "/health",
             required=self.settings.rdagent_enabled and not self.settings.embedded_worker,
         )
-        components["rdagent_data_science_worker"] = self._probe_service(
-            self.settings.rdagent_data_science_worker_url,
-            "/health",
-            required=self.settings.rdagent_enabled and not self.settings.embedded_worker,
-        )
+        if "data_science" in FROZEN_RDAGENT_SCENARIOS:
+            components["rdagent_data_science_worker"] = {
+                "status": "not_applicable",
+                "message": "data_science is frozen; historical runs are read-only",
+                "details": {"scenario": "data_science", "frozen": True},
+            }
+        else:
+            components["rdagent_data_science_worker"] = self._probe_service(
+                self.settings.rdagent_data_science_worker_url,
+                "/health",
+                required=self.settings.rdagent_enabled and not self.settings.embedded_worker,
+            )
         if self.settings.rdagent_enabled and self.settings.rdagent_worker_url:
             components["rdagent_runtime"] = self._probe_runtime(
                 f"{self.settings.rdagent_worker_url}/rdagent/status"

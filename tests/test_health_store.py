@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -45,6 +46,90 @@ def _settings(database_url: str, data_root: Path, **values: object) -> Settings:
     }
     base.update(values)
     return Settings(**base)  # type: ignore[arg-type]
+
+
+def _component_health_store(tmp_path: Path, monkeypatch, **settings_overrides):
+    store = object.__new__(OperationalHealthStore)
+    values = {
+        "embedded_worker": False,
+        "rdagent_enabled": True,
+        "qlib_worker_url": "http://qlib-worker",
+        "rdagent_worker_url": "http://rdagent-worker",
+        "rdagent_evaluation_worker_url": "http://evaluation-worker",
+        "rdagent_data_science_worker_url": "http://retired-data-science-worker",
+        **settings_overrides,
+    }
+    store.settings = _settings("postgresql://unused", tmp_path, **values)
+    store.runtime_secrets = SimpleNamespace(health=lambda: {"status": "ok"})
+    monkeypatch.setattr(store, "_market_data_health", lambda _day: {"status": "ok"})
+    monkeypatch.setattr(store, "_job_queue_health", lambda _now: {"status": "ok"})
+    monkeypatch.setattr(store, "_safe_mode_health", lambda: {"status": "degraded"})
+    monkeypatch.setattr(store, "_tushare_credentials", lambda: ("https://example.test", "test"))
+    return store
+
+
+@pytest.mark.no_database
+def test_frozen_data_science_worker_does_not_block_safe_mode_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    requested = []
+
+    def get(url, **_kwargs):
+        requested.append(url)
+        if "data-science" in url:
+            raise AssertionError("a frozen scenario must not be probed")
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"ready": True})
+
+    monkeypatch.setattr("quant_platform.health_store.requests.get", get)
+    observation = _component_health_store(tmp_path, monkeypatch).collect()
+
+    assert observation["components"]["rdagent_data_science_worker"] == {
+        "status": "not_applicable",
+        "message": "data_science is frozen; historical runs are read-only",
+        "details": {"scenario": "data_science", "frozen": True},
+    }
+    assert requested
+    assert observation["status"] == "degraded"
+    assert safe_mode_recovery_health_status(observation) == "ok"
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize(
+    "component,setting",
+    [
+        ("qlib_worker", "qlib_worker_url"),
+        ("rdagent_worker", "rdagent_worker_url"),
+        ("rdagent_evaluation_worker", "rdagent_evaluation_worker_url"),
+        ("rdagent_data_science_worker", "rdagent_data_science_worker_url"),
+    ],
+)
+@pytest.mark.parametrize("missing_url", [True, False], ids=["unconfigured", "unreachable"])
+def test_active_worker_health_remains_required_for_safe_mode_recovery(
+    tmp_path: Path, monkeypatch, component: str, setting: str, missing_url: bool
+) -> None:
+    from quant_platform import health_store as module
+
+    # Also exercise the retained active contract if data_science is ever thawed.
+    if component == "rdagent_data_science_worker":
+        monkeypatch.setattr(
+            module, "FROZEN_RDAGENT_SCENARIOS", module.FROZEN_RDAGENT_SCENARIOS - {"data_science"}
+        )
+    bad_url = "" if missing_url else "http://unreachable-worker"
+
+    def get(url, **_kwargs):
+        if url.startswith("http://unreachable-worker"):
+            raise requests.ConnectionError("fixture service is unreachable")
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"ready": True})
+
+    monkeypatch.setattr(module.requests, "get", get)
+    observation = _component_health_store(
+        tmp_path, monkeypatch, **{setting: bad_url}
+    ).collect()
+
+    assert observation["components"][component]["status"] == (
+        "bootstrap_required" if missing_url else "unavailable"
+    )
+    assert safe_mode_recovery_health_status(observation) == "degraded"
 
 
 def test_health_history_records_fresh_data_and_api_exposes_it(

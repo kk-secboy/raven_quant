@@ -10,17 +10,15 @@ from quant_platform.strategy_rule_runtime import (
     apply_strategy_rule_alpha_weights,
     build_portfolio_policy_runtime_metadata,
     build_strategy_rule_runtime_metadata,
+    policy_style_cross_sections,
     required_rule_history_sessions,
-)
-from scripts.run_multifactor_backtest import (
-    _latest_style_cross_section as _backtest_latest_style_cross_section,
 )
 from scripts.run_multifactor_backtest import (
     _load_governed_style_exposures as _backtest_load_governed_style_exposures,
 )
 from scripts.run_multifactor_backtest import _market_trend_close_history
-from scripts.run_recommendation_refresh import (
-    _latest_style_cross_section as _recommendation_latest_style_cross_section,
+from scripts.run_multifactor_backtest import (
+    policy_style_cross_sections as _backtest_policy_styles,
 )
 from scripts.run_recommendation_refresh import (
     _load_governed_style_exposures as _recommendation_load_governed_style_exposures,
@@ -30,6 +28,9 @@ from scripts.run_recommendation_refresh import (
 )
 from scripts.run_recommendation_refresh import (
     _recommendation_rule_runtime_metadata,
+)
+from scripts.run_recommendation_refresh import (
+    policy_style_cross_sections as _recommendation_policy_styles,
 )
 
 pytestmark = pytest.mark.no_database
@@ -154,16 +155,15 @@ def test_backtest_and_recommendation_share_standardized_style_artifact(tmp_path)
     recommendation_frame, recommendation_evidence = (
         _recommendation_load_governed_style_exposures(tmp_path)
     )
-    backtest_cross_section = _backtest_latest_style_cross_section(
-        backtest_frame, pd.Timestamp("2026-01-30")
+    _, backtest_cross_section = _backtest_policy_styles(
+        backtest_frame,
+        pd.Timestamp("2026-01-30"),
+        config={"portfolio_construction": "benchmark_relative_qp"},
     )
-    recommendation_cross_section = _recommendation_latest_style_cross_section(
-        recommendation_frame, pd.Timestamp("2026-01-30")
-    )
-    recommendation_raw_cross_section = _recommendation_latest_style_cross_section(
+    recommendation_raw_cross_section, recommendation_cross_section = _recommendation_policy_styles(
         recommendation_frame,
         pd.Timestamp("2026-01-30"),
-        preserve_missing=True,
+        config={"portfolio_construction": "benchmark_relative_qp"},
     )
 
     pd.testing.assert_frame_equal(backtest_frame, recommendation_frame)
@@ -211,6 +211,50 @@ def test_style_missing_gate_scopes_to_strategy_instruments() -> None:
             pd.Timestamp("2009-12-30"),
             required_instruments=instruments,
         )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"portfolio_construction": "benchmark_relative_qp"},
+        {"portfolio_construction": "industry_neutral_qp"},
+        {"portfolio_construction": "topk_equal_weight", "valuation_reduce_percentile": 0.9},
+        {"portfolio_construction": "topk_equal_weight", "valuation_regime_max_percentile": 0.8},
+    ],
+)
+def test_style_consumers_keep_the_missing_rate_gate(config: dict[str, object]) -> None:
+    when = pd.Timestamp("2015-02-09")
+    frame = pd.DataFrame(
+        {
+            "instrument": ["ACTIVE"],
+            "datetime": [when],
+            "size": [0.1],
+            "value": [0.2],
+            "growth": [0.3],
+            "volatility": [0.4],
+        }
+    )
+    with pytest.raises(
+        ValueError,
+        match="missing rate exceeds 5%.*as_of=2015-02-09.*missing_instruments=SUSPENDED_HELD",
+    ):
+        policy_style_cross_sections(
+            frame,
+            when,
+            config=config,
+            required_instruments=["ACTIVE", "SUSPENDED_HELD"],
+        )
+
+
+def test_trend_topk_does_not_consume_styles_from_suspended_holdings() -> None:
+    raw, optimizer = policy_style_cross_sections(
+        pd.DataFrame(),
+        pd.Timestamp("2015-02-09"),
+        config={"portfolio_construction": "topk_equal_weight"},
+        required_instruments=["ACTIVE", "SUSPENDED_HELD"],
+    )
+    assert raw.empty
+    assert optimizer is None
 
 
 def test_topk_requires_only_signal_and_holding_industries() -> None:

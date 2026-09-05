@@ -271,6 +271,110 @@ def test_cash_guard_reduces_buy_without_negative_balance() -> None:
     result = _run(cash=1_050.0, target_weights={"SH600000": 1.0})
     assert result["orders"][0]["filled_quantity"] == 100
     assert result["cash"] >= 0
+
+
+def test_later_sell_cannot_fund_earlier_buy_but_can_fund_same_bar_buy() -> None:
+    sell_bars = pd.concat(
+        [_bars(price=20.0, up_limit=22.0, down_limit=18.0)] * 2, ignore_index=True
+    )
+    buy_bars = pd.concat([_bars(instrument="SH600001")] * 2, ignore_index=True)
+    for frame in (sell_bars, buy_bars):
+        frame["datetime"] = ["2025-01-03 10:00:00", "2025-01-03 14:50:00"]
+    sell_bars.loc[0, "paused"] = 1
+    result = _run(
+        cash=0.0,
+        prior_nav=20_000.0,
+        high_water_mark=20_000.0,
+        positions={
+            "SH600000": {
+                "quantity": 1000,
+                "available_quantity": 1000,
+                "average_cost": 20.0,
+                "last_trade_date": date(2025, 1, 2),
+            }
+        },
+        target_weights={"SH600001": 0.5},
+        minute_bars=pd.concat([buy_bars, sell_bars], ignore_index=True),
+        closing_prices={
+            "SH600000": {"price": 20.0, "market_date": date(2025, 1, 3)},
+            "SH600001": {"price": 10.0, "market_date": date(2025, 1, 3)},
+        },
+        execution_policy={
+            "execution_algorithm": "twap",
+            "slice_minutes": 20,
+            "max_slices": 2,
+            "max_participation": 0.01,
+        },
+    )
+
+    assert [(fill["side"], fill["quantity"]) for fill in result["fills"]] == [
+        ("sell", 500),
+        ("buy", 500),
+    ]
+    assert all(fill["executed_at"].strftime("%H:%M") == "14:50" for fill in result["fills"])
+    balance = 0.0
+    for fill in sorted(result["fills"], key=lambda item: item["executed_at"]):
+        balance += (
+            fill["gross_value"] - fill["fee"]
+            if fill["side"] == "sell"
+            else -fill["gross_value"] - fill["fee"]
+        )
+        assert balance >= 0.0
+    assert result["cash"] == pytest.approx(balance)
+    assert all(flow["balance_after"] >= 0.0 for flow in result["cash_flows"])
+    assert result["positions"]["SH600001"]["available_quantity"] == 0
+    assert result["orders"][1]["status"] == "partial_filled_expired"
+    assert result["orders"][1]["reject_reason"] == "insufficient_cash"
+
+
+def test_multiple_orders_share_one_instrument_bar_participation_capacity() -> None:
+    result = _run(
+        minute_bars=_bars(volume=100_000),
+        order_specs_override=[
+            {
+                "instrument": "SH600000",
+                "side": "buy",
+                "requested_quantity": 700,
+                "order_ref": reference,
+            }
+            for reference in ("first", "second")
+        ],
+    )
+    assert [(fill["order_ref"], fill["quantity"]) for fill in result["fills"]] == [
+        ("first", 700),
+        ("second", 300),
+    ]
+    assert sum(fill["quantity"] for fill in result["fills"]) == 1000
+    assert [order["status"] for order in result["orders"]] == [
+        "filled", "partial_filled_expired"
+    ]
+    assert result["orders"][1]["reject_reason"] == "capacity"
+
+
+def test_order_cash_reservation_is_retained_between_chronological_slices() -> None:
+    bars = pd.concat([_bars()] * 2, ignore_index=True)
+    bars["datetime"] = ["2025-01-03 10:00:00", "2025-01-03 14:50:00"]
+    result = _run(
+        minute_bars=bars,
+        order_specs_override=[
+            {
+                "instrument": "SH600000",
+                "side": "buy",
+                "requested_quantity": 1000,
+                "order_ref": "reserved",
+                "reserved_cash": 6020.0,
+            }
+        ],
+        execution_policy={
+            "execution_algorithm": "twap",
+            "slice_minutes": 20,
+            "max_slices": 2,
+            "max_participation": 0.01,
+        },
+    )
+    assert [fill["quantity"] for fill in result["fills"]] == [500, 100]
+    assert sum(fill["gross_value"] + fill["fee"] for fill in result["fills"]) <= 6020.0
+    assert result["orders"][0]["filled_quantity"] == 600
     assert result["orders"][0]["status"] == "partial_filled_expired"
 
 

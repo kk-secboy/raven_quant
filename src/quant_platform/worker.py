@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from quant_data.config import Settings
 from quant_data.database import autopilot_cycles, research_sota_versions
+from quant_data.qlib_publication import validate_qlib_publication_receipt
 from quant_data.supplemental_data import SUPPORTED_BUNDLES
 
 from .allocation_store import AllocationStore
@@ -1571,7 +1572,7 @@ class LocalJobWorker:
             chained_pipeline = self._has_data_pipeline_successor(job)
             if exit_code == 0 and (pipeline_stage or bootstrap_finalize or chained_pipeline):
                 try:
-                    self._queue_data_pipeline_successor(job)
+                    self._queue_data_pipeline_successor(job, result=result)
                 except Exception as exc:
                     logical_error = f"could not enqueue next data pipeline stage: {exc}"
                     exit_code = 4
@@ -2520,9 +2521,15 @@ class LocalJobWorker:
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         return build_command(self, job)
 
-    def _queue_data_pipeline_successor(self, job: dict) -> dict:
+    def _queue_data_pipeline_successor(self, job: dict, *, result: dict | None = None) -> dict:
         payload = dict(job["payload"])
         snapshot_name = str(payload["snapshot_name"])
+        if job["kind"] == "data_qlib":
+            payload["qlib_publication"] = validate_qlib_publication_receipt(
+                self.settings.data_root,
+                snapshot_name,
+                result if result is not None else job.get("result"),
+            )
         pipeline_snapshot_name = str(
             payload.get("pipeline_snapshot_name") or snapshot_name
         )
@@ -2614,6 +2621,7 @@ class LocalJobWorker:
                 "download_workers",
                 "requests_per_minute",
                 "industry_history_anchor",
+                "qlib_publication",
             ):
                 if key in payload and key not in successor_payload:
                     successor_payload[key] = payload[key]
@@ -2626,8 +2634,6 @@ class LocalJobWorker:
             if kind == "qlib_baseline":
                 successor_payload.update(
                     {
-                        "dataset": snapshot_name,
-                        "dataset_path": str(self.settings.data_root / "qlib" / snapshot_name),
                         "market": "cn_all",
                         "benchmark": "SH000300",
                         "account": 5_000_000,
@@ -2661,8 +2667,6 @@ class LocalJobWorker:
             kind = "qlib_baseline"
             successor_payload = {
                 **payload,
-                "dataset": snapshot_name,
-                "dataset_path": str(self.settings.data_root / "qlib" / snapshot_name),
                 "market": "cn_all",
                 "benchmark": "SH000300",
                 "account": 5_000_000,
@@ -2674,6 +2678,20 @@ class LocalJobWorker:
             }
         else:
             raise ValueError(f"job {job['kind']} is not a data pipeline stage")
+        if kind == "qlib_baseline":
+            publication = payload.get("qlib_publication")
+            if job["kind"] != "data_qlib":
+                publication = validate_qlib_publication_receipt(
+                    self.settings.data_root, snapshot_name, publication
+                )
+            successor_payload.update(
+                {
+                    "dataset": publication["dataset"],
+                    "dataset_path": publication["dataset_path"],
+                    "dataset_identity_sha256": publication["dataset_identity_sha256"],
+                    "qlib_publication": publication,
+                }
+            )
         # Normalize legacy and non-step branches as well, so no successor can
         # accidentally reinterpret a prior step's download range as the
         # publication range.
@@ -2692,6 +2710,7 @@ class LocalJobWorker:
             log_path,
             idempotency_key=f"data-finalize:{pipeline_snapshot_name}:{kind}",
             max_attempts=pipeline_max_attempts,
+            **({"dedupe_active_kind": False} if kind == "data_verify" else {}),
         )
         self.notify()
         return successor

@@ -93,20 +93,6 @@ def test_backtest_metadata_projects_pit_risk_and_freezes_non_tradable_price(
         }
     )
     monkeypatch.setattr(backtest, "filter_available", lambda _name, frame, _when: frame)
-    monkeypatch.setattr(
-        backtest,
-        "_latest_style_cross_section",
-        lambda *_args, **_kwargs: pd.DataFrame(
-            {"value": [0.0, 0.0]}, index=pd.Index(["A", "B"], dtype=str)
-        ),
-    )
-    monkeypatch.setattr(
-        backtest, "build_portfolio_policy_runtime_metadata", lambda *_args, **_kwargs: {}
-    )
-    monkeypatch.setattr(
-        backtest, "build_strategy_rule_runtime_metadata", lambda *_args, **_kwargs: {}
-    )
-
     provider = backtest._metadata_provider(
         memberships,
         None,
@@ -124,6 +110,8 @@ def test_backtest_metadata_projects_pit_risk_and_freezes_non_tradable_price(
     assert pd.isna(result["prices"]["B"])
     assert pd.isna(result["average_daily_values"]["B"])
     assert result["current_prices"]["B"] == 20.5
+    assert result["industries"].to_dict() == {"A": "one", "B": "two"}
+    assert "style_exposures" not in result
 
 
 def test_recommendation_execution_evidence_blocks_missing_close_and_suspension(

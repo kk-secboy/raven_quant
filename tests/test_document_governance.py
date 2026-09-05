@@ -253,6 +253,8 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "D 日完整收盘数据 → D+1 开盘或保守日线成交模型",
         "`reporting_only` 基准只用于绩效对照",
         "不能因为运行时提供了基准权重，就给 `topk_equal_weight` 偷加基准行业权重偏离带",
+        "风格数据质量门只检查冻结策略实际消费的输入",
+        "正式回测和推荐刷新必须采用同一选择规则",
         "没有合格股票时输出现金/`NO_ACTION`",
         "初始资金是首次使用时必填的账户配置",
         "也没有 10 万或 50 万元硬下限",
@@ -660,6 +662,9 @@ def test_single_execution_core_and_forward_stages_have_no_shadow_path() -> None:
         "Qlib 内部账户状态不能代替持久模拟账户",
         "历史分钟数据盘后补齐不能回写并美化当天的前向模拟成交或提醒",
         "多个候选可以共用进程和只读数据，但不得共用账本或资本",
+        "同一账户的全部订单切片按成交时点排序，同一时点先卖后买",
+        "未来卖出回款不能为较早买入融资",
+        "同一证券、同一分钟的所有订单共享参与率容量",
     ):
         assert required in specification
 

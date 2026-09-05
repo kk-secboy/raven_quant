@@ -91,6 +91,7 @@ from .qlib_builder import (
     QlibBuilder,
     verify_qlib_output_manifest,
 )
+from .qlib_publication import build_qlib_publication_receipt
 from .rate_limit import GlobalRateGate
 from .reference_data import (
     STK_SURV_PROVIDER_PAGE_LIMIT,
@@ -3563,6 +3564,7 @@ def supplemental_download(
 def build_qlib_command(
     snapshot_name: Annotated[str | None, typer.Option("--snapshot")] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
     skip_quality_gate: Annotated[
         bool,
         typer.Option(
@@ -3572,6 +3574,8 @@ def build_qlib_command(
     ] = False,
 ) -> None:
     """Normalize a Parquet snapshot and build Qlib binary data."""
+    if staging_only and result_path is not None:
+        raise typer.BadParameter("a publication receipt requires a complete Qlib build")
     context = load_context(require_credentials=False)
     if snapshot_name:
         snapshot_path = context.storage.snapshots_root / snapshot_name
@@ -3585,6 +3589,13 @@ def build_qlib_command(
     result = _build_qlib(
         context, snapshot_path, staging_only=staging_only, skip_quality_gate=skip_quality_gate
     )
+    if result_path is not None:
+        _write_optional_result(
+            result_path,
+            build_qlib_publication_receipt(
+                context.settings.data_root, snapshot_path.name, result
+            ),
+        )
     console.print(result)
 
 

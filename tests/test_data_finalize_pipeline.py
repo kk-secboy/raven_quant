@@ -15,6 +15,23 @@ from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES
 from quant_platform.worker import LocalJobWorker
 
 
+def _stub_publication_validation(monkeypatch, data_root: Path, name: str) -> dict:
+    # These database tests exercise job durability. The actual filesystem seals
+    # and recovery-to-baseline handoff are covered in test_qlib_publication.py.
+    receipt = {
+        "dataset": name,
+        "dataset_path": str(data_root / "qlib" / name),
+        "dataset_identity_sha256": "a" * 64,
+    }
+
+    def validate(root, requested, result):
+        assert root == data_root and requested == name and result == receipt
+        return receipt
+
+    monkeypatch.setattr("quant_platform.worker.validate_qlib_publication_receipt", validate)
+    return receipt
+
+
 def _completed_unit(database_url: str) -> None:
     checkpoint = CheckpointStore(database_url)
     spec = FetchSpec(
@@ -163,7 +180,8 @@ def test_data_finalize_stages_are_durable_idempotent_and_retryable(
     assert qlib["kind"] == "data_qlib"
     assert "build-qlib" in worker._command(qlib)[0]
 
-    baseline = worker._queue_data_pipeline_successor(qlib)
+    receipt = _stub_publication_validation(monkeypatch, settings.data_root, "cn-durable-fixture")
+    baseline = worker._queue_data_pipeline_successor(qlib, result=receipt)
     assert baseline["kind"] == "qlib_baseline"
     assert baseline["payload"]["dataset"] == "cn-durable-fixture"
 
@@ -232,9 +250,12 @@ def test_chained_data_pipeline_keeps_each_download_and_build_as_separate_job(
     }
 
     expected = [step["kind"] for step in steps]
+    receipt = _stub_publication_validation(monkeypatch, settings.data_root, "cn-chain-fixture")
     created = []
     for _kind in expected:
-        successor = worker._queue_data_pipeline_successor(current)
+        successor = worker._queue_data_pipeline_successor(
+            current, result=receipt if current["kind"] == "data_qlib" else None
+        )
         created.append(successor)
         current = successor
 

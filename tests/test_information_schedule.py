@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,9 @@ from quant_platform.information_schedule import (
     latest_verified_snapshot,
     normalize_information_factor_refresh_payload,
     normalize_information_schedule_payload,
+    validate_information_market_snapshot,
 )
+from quant_platform.scheduler import SchedulerEngine
 from quant_platform.worker import LocalJobWorker
 
 pytestmark = pytest.mark.no_database
@@ -27,11 +30,24 @@ def _snapshot(
     end: str,
     ok: bool,
     errors: list[str] | None = None,
+    profile: str = "full",
+    datasets: tuple[str, ...] = ("daily", "index_daily"),
 ) -> None:
     root = data_root / "snapshots" / name
     root.mkdir(parents=True)
+    entries = {}
+    for dataset in datasets:
+        relative = f"parquet/{dataset}/partition_year=2025/data.parquet"
+        path = root / relative
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"sealed-fixture")
+        entries[dataset] = {"files": [{
+            "path": relative, "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }]}
     (root / "manifest.json").write_text(
-        json.dumps({"name": name, "start_date": "2008-01-01", "end_date": end}),
+        json.dumps({"name": name, "profile": profile, "start_date": "2008-01-01",
+                    "end_date": end, "datasets": entries}),
         encoding="utf-8",
     )
     (root / "verification.json").write_text(
@@ -246,6 +262,42 @@ def test_latest_verified_snapshot_ignores_failed_invalid_and_future_candidates(
     (invalid / "manifest.json").write_text("not json", encoding="utf-8")
 
     assert latest_verified_snapshot(data_root, as_of=date(2025, 1, 3)) == "verified-current"
+
+
+def test_market_snapshot_selection_excludes_newer_pdf_and_incomplete_publications(
+    tmp_path: Path,
+) -> None:
+    _snapshot(tmp_path, "market", end="2025-01-02", ok=True)
+    _snapshot(tmp_path, "research-assets", end="2025-01-03", ok=True,
+              profile="research-assets", datasets=("trade_cal", "research_report"))
+    _snapshot(tmp_path, "missing-index", end="2025-01-03", ok=True, datasets=("daily",))
+    assert latest_verified_snapshot(tmp_path, as_of=date(2025, 1, 3)) == "market"
+    with pytest.raises(ValueError, match="market snapshot"):
+        validate_information_market_snapshot(tmp_path, "research-assets")
+    with pytest.raises(ValueError, match="index_daily"):
+        validate_information_market_snapshot(tmp_path, "missing-index")
+    with pytest.raises(ValueError, match="safe path component"):
+        validate_information_market_snapshot(tmp_path, "../market")
+
+
+def test_information_scheduler_rejects_explicit_pdf_snapshot_before_enqueue(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _snapshot(tmp_path, "pdf-only", end="2025-01-03", ok=True,
+              profile="research-assets", datasets=("trade_cal", "research_report"))
+    monkeypatch.setattr("quant_platform.announcement_nlp.load_llm_credentials", lambda _: None)
+    engine = object.__new__(SchedulerEngine)
+    engine.settings = SimpleNamespace(data_root=tmp_path)
+    engine.jobs = SimpleNamespace(count=lambda **_: 0)
+    engine.runtime_secrets = object()
+    with pytest.raises(ValueError, match="market snapshot"):
+        engine._enqueue_information_pipeline(
+            {"id": "run", "timezone": "UTC", "payload": {
+                "enable_nlp": True, "include_corpus_nlp": False,
+                "snapshot_name": "pdf-only",
+            }},
+            datetime(2025, 1, 3, tzinfo=UTC),
+        )
 
 
 def test_information_evaluation_resolves_only_pinned_reproducible_daily_dataset(

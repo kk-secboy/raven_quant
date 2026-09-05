@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from quant_data.config import Settings
 from quant_platform.feature_set_registry import get_feature_set
@@ -17,10 +18,150 @@ from quant_platform.fin_strategy_schedule import (
     select_latest_reproducible_daily_dataset,
     validate_managed_fin_strategy_payload,
 )
+from quant_platform.rdagent_scenarios import get_rdagent_scenario
 from quant_platform.research_store import ResearchStore
 from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import SchedulerEngine
 from quant_platform.strategy_recipes import get_strategy_recipe
+
+
+def _managed_lookup_engine(records: list[dict]) -> SchedulerEngine:
+    """Exercise the production query bindings against stored run identities."""
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def scalar(self, statement):
+            params = statement.compile(dialect=postgresql.dialect()).params
+            return next(
+                (
+                    row["id"]
+                    for row in records
+                    if row["kind"] == params["kind_1"]
+                    and params["param_2"][0] in row["trigger_ids"]
+                ),
+                None,
+            )
+
+        def execute(self, statement):
+            params = statement.compile(dialect=postgresql.dialect()).params
+            rows = [
+                SimpleNamespace(**row)
+                for row in records
+                if row["kind"] == params["kind_1"]
+                and row["run_sha256"] == params["param_2"]
+            ]
+            return SimpleNamespace(all=lambda: rows)
+
+    engine = object.__new__(SchedulerEngine)
+    engine.jobs = SimpleNamespace(engine=SimpleNamespace(connect=Connection))
+    return engine
+
+
+def _stored_managed_run(**overrides) -> dict:
+    return {
+        "id": "original-run",
+        "kind": get_rdagent_scenario("fin_strategy").research_kind,
+        "job_id": "original-job",
+        "status": "succeeded",
+        "error": None,
+        "has_artifacts": True,
+        "has_payload_jobs": True,
+        "trigger_ids": ["a" * 64],
+        "run_sha256": "b" * 64,
+        **overrides,
+    }
+
+
+@pytest.mark.no_database
+def test_managed_lookups_use_the_persisted_scenario_kind() -> None:
+    engine = _managed_lookup_engine(
+        [
+            _stored_managed_run(),
+            _stored_managed_run(id="legacy-decoy", kind="strategy", job_id="legacy-job"),
+        ]
+    )
+
+    assert engine._consumed_managed_fin_strategy_trigger_ids(["a" * 64]) == {"a" * 64}
+    assert engine._existing_managed_fin_strategy_run("b" * 64) == {
+        "id": "original-run", "job_id": "original-job", "status": "succeeded"
+    }
+
+
+@pytest.mark.no_database
+def test_terminal_unattached_run_still_consumes_its_trigger() -> None:
+    engine = _managed_lookup_engine(
+        [_stored_managed_run(job_id=None, status="failed", has_payload_jobs=False)]
+    )
+
+    assert engine._consumed_managed_fin_strategy_trigger_ids(["a" * 64, "c" * 64]) == {
+        "a" * 64
+    }
+
+
+@pytest.mark.no_database
+def test_existing_job_owner_survives_empty_failed_duplicate_audit_records() -> None:
+    records = [_stored_managed_run()]
+    for index, error in enumerate(
+        [
+            "idempotency key is already bound to a different job payload",
+            "strategy validation window is shorter than its preregistered OOS",
+        ]
+    ):
+        records.append(
+            _stored_managed_run(
+                id=f"empty-failure-{index}", job_id=None, status="failed", error=error,
+                has_artifacts=False, has_payload_jobs=False,
+            )
+        )
+    before = deepcopy(records)
+    engine = _managed_lookup_engine(records)
+
+    assert engine._existing_managed_fin_strategy_run("b" * 64)["id"] == "original-run"
+    assert records == before
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"has_artifacts": True},
+        {"has_payload_jobs": True},
+        {"status": "queued"},
+        {"status": "cancelled"},
+        {"job_id": "second-job"},
+    ],
+)
+def test_existing_managed_run_rejects_duplicates_that_may_own_evidence(overrides) -> None:
+    duplicate = _stored_managed_run(
+        id="duplicate", job_id=None, status="failed",
+        has_artifacts=False, has_payload_jobs=False,
+    )
+    duplicate.update(overrides)
+    engine = _managed_lookup_engine([_stored_managed_run(), duplicate])
+
+    with pytest.raises(ValueError, match="identity is not unique"):
+        engine._existing_managed_fin_strategy_run("b" * 64)
+
+
+@pytest.mark.no_database
+def test_empty_failures_cannot_be_selected_as_an_original_job_owner() -> None:
+    engine = _managed_lookup_engine(
+        [
+            _stored_managed_run(
+                id=f"empty-{index}", job_id=None, status="failed",
+                has_artifacts=False, has_payload_jobs=False,
+            )
+            for index in range(2)
+        ]
+    )
+
+    with pytest.raises(ValueError, match="identity is not unique"):
+        engine._existing_managed_fin_strategy_run("b" * 64)
 
 
 @pytest.mark.no_database
@@ -231,7 +372,7 @@ def test_managed_trigger_consumption_includes_unattached_research_run(
     trigger_id = "a" * 64
     research = ResearchStore(database_url)
     created = research.create_run(
-        kind="strategy",
+        kind=get_rdagent_scenario("fin_strategy").research_kind,
         objective="test managed trigger consumption",
         dataset="test-dataset",
         requested_by="test",

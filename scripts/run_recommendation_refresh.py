@@ -64,10 +64,8 @@ from quant_platform.strategy_rule_runtime import (
     build_portfolio_policy_runtime_metadata,
     build_strategy_rule_runtime_metadata,
     load_market_trend_close_history,
+    policy_style_cross_sections,
     required_rule_history_sessions,
-)
-from quant_platform.strategy_rule_runtime import (
-    latest_governed_style_cross_section as _latest_style_cross_section,
 )
 from quant_platform.strategy_rule_runtime import (
     load_governed_style_exposures as _load_governed_style_exposures,
@@ -881,11 +879,8 @@ def main() -> None:
     required_instruments = signal.index.astype(str).union(
         pd.Index(previous, dtype=str)
     )
-    raw_styles = _latest_style_cross_section(
-        styles_frame, as_of, preserve_missing=True
-    )
-    styles = (
-        _latest_style_cross_section(styles_frame, as_of) if constrained else None
+    raw_styles, styles = policy_style_cross_sections(
+        styles_frame, as_of, config=config
     )
     risk_instruments = required_instruments
     if constrained and benchmark is not None:

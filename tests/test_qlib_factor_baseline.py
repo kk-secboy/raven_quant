@@ -247,7 +247,7 @@ def test_formal_runner_restricts_exchange_universe_to_eligible_assets() -> None:
 
 
 def test_standardized_style_snapshot_neutral_imputes_only_sparse_missing() -> None:
-    from scripts.run_multifactor_backtest import _latest_style_cross_section
+    from quant_platform.strategy_rule_runtime import latest_governed_style_cross_section
 
     instruments = [f"S{index:04d}" for index in range(100)]
     frame = pd.DataFrame(
@@ -262,7 +262,7 @@ def test_standardized_style_snapshot_neutral_imputes_only_sparse_missing() -> No
     )
     frame.loc[0, "growth"] = np.nan
 
-    result = _latest_style_cross_section(frame, pd.Timestamp("2025-01-03"))
+    result = latest_governed_style_cross_section(frame, pd.Timestamp("2025-01-03"))
 
     assert result.loc["S0000", "growth"] == pytest.approx(0.0)
     assert result.loc["S0001", "growth"] == pytest.approx(0.25)
@@ -270,7 +270,7 @@ def test_standardized_style_snapshot_neutral_imputes_only_sparse_missing() -> No
 
 
 def test_standardized_style_snapshot_rejects_systemic_missing() -> None:
-    from scripts.run_multifactor_backtest import _latest_style_cross_section
+    from quant_platform.strategy_rule_runtime import latest_governed_style_cross_section
 
     frame = pd.DataFrame(
         {
@@ -284,7 +284,7 @@ def test_standardized_style_snapshot_rejects_systemic_missing() -> None:
     )
 
     with pytest.raises(ValueError, match=r"growth=10.00%"):
-        _latest_style_cross_section(frame, pd.Timestamp("2025-01-02"))
+        latest_governed_style_cross_section(frame, pd.Timestamp("2025-01-02"))
 
 
 def test_formal_runner_loads_versioned_builder_style_contract(tmp_path: Path) -> None:

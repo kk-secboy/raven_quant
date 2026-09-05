@@ -560,8 +560,10 @@ def execute_simulation_day(
                 }
             )
 
-    # A-share sell proceeds are available for buys on the same trading day.
+    # Same-day proceeds become spendable only at the sell fill timestamp.
     order_specs.sort(key=lambda item: 0 if item["side"] == "sell" else 1)
+    working_orders: list[dict[str, Any]] = []
+    scheduled_slices: list[tuple[pd.Timestamp, int, int, dict[str, Any]]] = []
     for spec in order_specs:
         if "status" in spec:
             orders.append(spec)
@@ -592,182 +594,222 @@ def execute_simulation_day(
             signal_at=signal_at,
             instrument=instrument,
         )
-        remaining = requested
-        order_fills: list[dict[str, Any]] = []
-        rejection_reasons: list[str] = []
-        limit_price = spec.get("limit_price")
-        reserved_cash = (
-            float(spec["reserved_cash"])
-            if spec.get("reserved_cash") is not None
-            else None
-        )
-        if reserved_cash is not None and reserved_cash < 0:
+        context = {
+            "spec": spec,
+            "order_slot": len(orders),
+            "remaining": requested,
+            "fills": [],
+            "rejection_reasons": [],
+            "bars": instrument_bars,
+            "reserved_cash": (
+                float(spec["reserved_cash"])
+                if spec.get("reserved_cash") is not None
+                else None
+            ),
+            "not_before": _window_bound(spec.get("not_before")),
+            "not_after": _window_bound(spec.get("not_after")),
+        }
+        if context["reserved_cash"] is not None and context["reserved_cash"] < 0:
             raise ValueError("persistent order reserved cash must be non-negative")
-        not_before = _window_bound(spec.get("not_before"))
-        not_after = _window_bound(spec.get("not_after"))
+        order_index = len(working_orders)
+        orders.append(spec)
+        working_orders.append(context)
         for execution_slice in slices:
-            if remaining <= 0:
-                break
             scheduled = pd.Timestamp(execution_slice["scheduled_for"])
             if scheduled.tzinfo is not None:
                 scheduled = scheduled.tz_convert(_SHANGHAI).tz_localize(None)
             else:
                 scheduled = scheduled.tz_localize(None)
-            if not_before is not None and scheduled < not_before:
-                rejection_reasons.append("before_execution_window")
-                continue
-            if not_after is not None and scheduled > not_after:
-                rejection_reasons.append("execution_window_elapsed")
-                break
-            if scheduled not in instrument_bars.index:
-                rejection_reasons.append("missing_minute_bar")
-                continue
-            bar = instrument_bars.loc[scheduled]
-            if isinstance(bar, pd.DataFrame):
-                raise ValueError("minute execution bars contain duplicate timestamps")
-            reason = _bar_rejection_reason(bar, side)
-            if reason:
-                rejection_reasons.append(reason)
-                continue
-            price = float(bar["vwap"])
-            if limit_price is not None and (
-                (side == "buy" and price > float(limit_price))
-                or (side == "sell" and price < float(limit_price))
-            ):
-                # 价格保护：限价位之外不成交，余量留给后续批次。
-                rejection_reasons.append("price_protection")
-                continue
-            minute_volume = int(floor(float(bar["volume"])))
-            capacity = int(floor(minute_volume * float(policy["max_participation"])))
-            slice_request = min(remaining, int(execution_slice["quantity"]))
-            fill_quantity = min(slice_request, capacity)
-            if side == "buy":
-                fill_quantity = lot_floor(fill_quantity, lot_rules[instrument])
-                spendable = available_cash
-                if reserved_cash is not None:
-                    spendable = min(spendable, reserved_cash)
-                fill_quantity = _affordable_buy_quantity(
-                    fill_quantity,
-                    cash=spendable,
-                    price=price,
-                    participation=(fill_quantity / minute_volume if minute_volume else 0.0),
-                    asset_type=infer_cn_asset_type(instrument),
-                    trade_date=trade_date,
-                    costs=cost_model,
-                    rules=lot_rules[instrument],
-                    instrument=instrument,
-                )
-            if side == "sell":
-                sell_position = state.get(instrument) or {}
-                fill_quantity = min(
-                    fill_quantity,
-                    _sellable_quantity(sell_position, trade_date),
-                )
-            if fill_quantity <= 0:
-                rejection_reasons.append(
-                    "insufficient_cash"
-                    if side == "buy" and cash <= price * lot_rules[instrument].min_lot
-                    else "capacity"
-                )
-                continue
-            participation = fill_quantity / minute_volume
-            breakdown = cost_model.estimate_breakdown(
-                side=side,
-                gross_value=fill_quantity * price,
-                participation=participation,
+            scheduled_slices.append(
+                (scheduled, 0 if side == "sell" else 1, order_index, execution_slice)
+            )
+
+    # Interleave all orders on one chronological account clock. A same-bar sell
+    # settles before buys, but a later sell cannot finance an earlier buy.
+    used_capacity: dict[tuple[str, pd.Timestamp], int] = {}
+    for scheduled, _side_priority, order_index, execution_slice in sorted(
+        scheduled_slices, key=lambda item: item[:3]
+    ):
+        context = working_orders[order_index]
+        spec = context["spec"]
+        instrument = spec["instrument"]
+        side = spec["side"]
+        remaining = context["remaining"]
+        if remaining <= 0:
+            continue
+        order_fills = context["fills"]
+        rejection_reasons = context["rejection_reasons"]
+        instrument_bars = context["bars"]
+        reserved_cash = context["reserved_cash"]
+        limit_price = spec.get("limit_price")
+        not_before = context["not_before"]
+        not_after = context["not_after"]
+        if not_before is not None and scheduled < not_before:
+            rejection_reasons.append("before_execution_window")
+            continue
+        if not_after is not None and scheduled > not_after:
+            rejection_reasons.append("execution_window_elapsed")
+            continue
+        if scheduled not in instrument_bars.index:
+            rejection_reasons.append("missing_minute_bar")
+            continue
+        bar = instrument_bars.loc[scheduled]
+        if isinstance(bar, pd.DataFrame):
+            raise ValueError("minute execution bars contain duplicate timestamps")
+        reason = _bar_rejection_reason(bar, side)
+        if reason:
+            rejection_reasons.append(reason)
+            continue
+        price = float(bar["vwap"])
+        if limit_price is not None and (
+            (side == "buy" and price > float(limit_price))
+            or (side == "sell" and price < float(limit_price))
+        ):
+            # 价格保护：限价位之外不成交，余量留给后续批次。
+            rejection_reasons.append("price_protection")
+            continue
+        minute_volume = int(floor(float(bar["volume"])))
+        capacity = int(floor(minute_volume * float(policy["max_participation"])))
+        slice_request = min(remaining, int(execution_slice["quantity"]))
+        capacity_key = (instrument, scheduled)
+        remaining_capacity = max(0, capacity - used_capacity.get(capacity_key, 0))
+        fill_quantity = min(slice_request, remaining_capacity)
+        if side == "buy":
+            fill_quantity = lot_floor(fill_quantity, lot_rules[instrument])
+            spendable = available_cash
+            if reserved_cash is not None:
+                spendable = min(spendable, reserved_cash)
+            fill_quantity = _affordable_buy_quantity(
+                fill_quantity,
+                cash=spendable,
+                price=price,
+                participation=(fill_quantity / minute_volume if minute_volume else 0.0),
                 asset_type=infer_cn_asset_type(instrument),
                 trade_date=trade_date,
+                costs=cost_model,
+                rules=lot_rules[instrument],
                 instrument=instrument,
-                quantity=fill_quantity,
             )
-            gross = fill_quantity * price
-            fee = float(breakdown["total"])
-            cash_delta = -(gross + fee) if side == "buy" else gross - fee
-            if cash + cash_delta < -1e-6:
-                raise RuntimeError("simulation execution would create negative cash")
-            cash += cash_delta
-            available_cash += cash_delta
-            if side == "buy" and reserved_cash is not None:
-                reserved_cash += cash_delta
-            fill = {
-                "instrument": instrument,
-                "side": side,
-                "executed_at": scheduled.to_pydatetime().replace(tzinfo=_SHANGHAI),
-                "quantity": fill_quantity,
-                "price": price,
-                "gross_value": gross,
-                "fee": fee,
-                "cost_breakdown": breakdown,
-                "minute_volume": minute_volume,
-                "capacity_quantity": capacity,
+        if side == "sell":
+            sell_position = state.get(instrument) or {}
+            fill_quantity = min(
+                fill_quantity,
+                _sellable_quantity(sell_position, trade_date),
+            )
+        if fill_quantity <= 0:
+            rejection_reasons.append(
+                "insufficient_cash"
+                if side == "buy" and cash <= price * lot_rules[instrument].min_lot
+                else "capacity"
+            )
+            continue
+        participation = fill_quantity / minute_volume
+        breakdown = cost_model.estimate_breakdown(
+            side=side,
+            gross_value=fill_quantity * price,
+            participation=participation,
+            asset_type=infer_cn_asset_type(instrument),
+            trade_date=trade_date,
+            instrument=instrument,
+            quantity=fill_quantity,
+        )
+        gross = fill_quantity * price
+        fee = float(breakdown["total"])
+        cash_delta = -(gross + fee) if side == "buy" else gross - fee
+        if cash + cash_delta < -1e-6:
+            raise RuntimeError("simulation execution would create negative cash")
+        cash += cash_delta
+        available_cash += cash_delta
+        if side == "buy" and reserved_cash is not None:
+            reserved_cash += cash_delta
+        fill = {
+            "instrument": instrument,
+            "side": side,
+            "executed_at": scheduled.to_pydatetime().replace(tzinfo=_SHANGHAI),
+            "quantity": fill_quantity,
+            "price": price,
+            "gross_value": gross,
+            "fee": fee,
+            "cost_breakdown": breakdown,
+            "minute_volume": minute_volume,
+            "capacity_quantity": capacity,
+        }
+        if spec.get("order_ref") is not None:
+            fill["order_ref"] = spec["order_ref"]
+        order_fills.append(fill)
+        fill["_seq"] = len(fills)
+        fills.append(fill)
+        cash_flows.append(
+            {
+                "trade_date": trade_date,
+                "flow_type": "buy_settlement" if side == "buy" else "sell_settlement",
+                "amount": cash_delta,
+                "balance_after": cash,
+                "fill_seq": int(fill["_seq"]),
+                "order_ref": fill.get("order_ref"),
             }
-            if spec.get("order_ref") is not None:
-                fill["order_ref"] = spec["order_ref"]
-            order_fills.append(fill)
-            fill["_seq"] = len(fills)
-            fills.append(fill)
-            cash_flows.append(
-                {
-                    "trade_date": trade_date,
-                    "flow_type": "buy_settlement" if side == "buy" else "sell_settlement",
-                    "amount": cash_delta,
-                    "balance_after": cash,
-                    "fill_seq": int(fill["_seq"]),
-                    "order_ref": fill.get("order_ref"),
-                }
-            )
-            consumed_lots = _apply_fill(state, fill, trade_date)
-            if side == "sell" and instrument not in choice_sale_warned:
-                pending_choice = (state.get(instrument) or {}).get("choice_pending")
-                if pending_choice:
-                    # 待人工处置的持有人选择事件：卖出不硬阻断，但必须可见。
-                    choice_sale_warned.add(instrument)
-                    events.append(
-                        {
-                            "severity": "warning",
-                            "event_type": "corporate_action_choice_pending_sale",
-                            "instrument": instrument,
-                            "reason": "sold_while_holder_choice_pending",
-                            "details": {
-                                "event_key": str(pending_choice.get("event_key")),
-                                "fill_quantity": fill_quantity,
-                            },
-                        }
-                    )
-            if side == "sell" and consumed_lots:
-                dividend_tax, dividend_tax_details, dividend_tax_released = (
-                    settle_dividend_tax(
-                        instrument=instrument,
-                        consumed=consumed_lots,
-                        sale_date=trade_date,
-                        tax_book=tax_book,
-                    )
-                )
-                if dividend_tax > 0:
-                    if cash - dividend_tax < -1e-6:
-                        raise RuntimeError("dividend tax would create negative cash")
-                    cash -= dividend_tax
-                    available_cash -= dividend_tax
-                    cash_flows.append(
-                        {
-                            "trade_date": trade_date,
-                            "flow_type": "dividend_tax",
-                            "amount": -dividend_tax,
-                            "balance_after": cash,
-                            "fill_seq": int(fill["_seq"]),
-                            "order_ref": fill.get("order_ref"),
-                        }
-                    )
-                if dividend_tax > 0 or dividend_tax_released > 0:
-                    # 现金只流出实际税额；已提负债随批次消耗释放（见 NAV 减项），
-                    # 卖出对 NAV 的净影响 = 释放额 − 实际税额（差额确认）。
-                    fill["cost_breakdown"] = {
-                        **fill["cost_breakdown"],
-                        "dividend_tax": dividend_tax,
-                        "dividend_tax_details": dividend_tax_details,
-                        "dividend_tax_liability_released": dividend_tax_released,
+        )
+        consumed_lots = _apply_fill(state, fill, trade_date)
+        if side == "sell" and instrument not in choice_sale_warned:
+            pending_choice = (state.get(instrument) or {}).get("choice_pending")
+            if pending_choice:
+                # 待人工处置的持有人选择事件：卖出不硬阻断，但必须可见。
+                choice_sale_warned.add(instrument)
+                events.append(
+                    {
+                        "severity": "warning",
+                        "event_type": "corporate_action_choice_pending_sale",
+                        "instrument": instrument,
+                        "reason": "sold_while_holder_choice_pending",
+                        "details": {
+                            "event_key": str(pending_choice.get("event_key")),
+                            "fill_quantity": fill_quantity,
+                        },
                     }
-            remaining -= fill_quantity
+                )
+        if side == "sell" and consumed_lots:
+            dividend_tax, dividend_tax_details, dividend_tax_released = (
+                settle_dividend_tax(
+                    instrument=instrument,
+                    consumed=consumed_lots,
+                    sale_date=trade_date,
+                    tax_book=tax_book,
+                )
+            )
+            if dividend_tax > 0:
+                if cash - dividend_tax < -1e-6:
+                    raise RuntimeError("dividend tax would create negative cash")
+                cash -= dividend_tax
+                available_cash -= dividend_tax
+                cash_flows.append(
+                    {
+                        "trade_date": trade_date,
+                        "flow_type": "dividend_tax",
+                        "amount": -dividend_tax,
+                        "balance_after": cash,
+                        "fill_seq": int(fill["_seq"]),
+                        "order_ref": fill.get("order_ref"),
+                    }
+                )
+            if dividend_tax > 0 or dividend_tax_released > 0:
+                # 现金只流出实际税额；已提负债随批次消耗释放（见 NAV 减项），
+                # 卖出对 NAV 的净影响 = 释放额 − 实际税额（差额确认）。
+                fill["cost_breakdown"] = {
+                    **fill["cost_breakdown"],
+                    "dividend_tax": dividend_tax,
+                    "dividend_tax_details": dividend_tax_details,
+                    "dividend_tax_liability_released": dividend_tax_released,
+                }
+        context["remaining"] -= fill_quantity
+        context["reserved_cash"] = reserved_cash
+        used_capacity[capacity_key] = used_capacity.get(capacity_key, 0) + fill_quantity
+
+    for context in working_orders:
+        spec = context["spec"]
+        requested = int(spec["requested_quantity"])
+        remaining = context["remaining"]
+        order_fills = context["fills"]
+        rejection_reasons = context["rejection_reasons"]
         filled = requested - remaining
         status = (
             "filled"
@@ -786,7 +828,7 @@ def execute_simulation_day(
             "reject_reason": reject_reason,
             "expires_at": datetime.combine(trade_date, time(15, 0), _SHANGHAI),
         }
-        orders.append(order)
+        orders[context["order_slot"]] = order
         if remaining:
             events.append(_rejection_event(order))
 

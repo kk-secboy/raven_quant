@@ -400,9 +400,59 @@ def resolve_information_evaluation_dataset(
 
 
 def latest_verified_snapshot(data_root: Path, *, as_of: date) -> str:
-    """Return the latest immutable snapshot that passed its blocking gate."""
+    """Return a verified market snapshot suitable for post-event labels."""
 
     return _latest_verified_snapshot(data_root, as_of=as_of)
+
+
+def validate_information_market_snapshot(
+    data_root: Path, snapshot_name: str, *, as_of: date | None = None
+) -> dict[str, Any]:
+    """Require market bars, rather than a PDF/reference publication, for labels."""
+
+    if (
+        not snapshot_name
+        or snapshot_name in {".", ".."}
+        or "/" in snapshot_name
+        or "\\" in snapshot_name
+    ):
+        raise ValueError("information market snapshot name must be one safe path component")
+    root = (data_root / "snapshots").resolve()
+    snapshot = (root / snapshot_name).resolve(strict=True)
+    if snapshot.parent != root:
+        raise ValueError("information market snapshot escapes the immutable snapshot root")
+    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    verification = json.loads((snapshot / "verification.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("profile") not in {
+        "core", "research", "full"
+    }:
+        raise ValueError("event labels require a core, research, or full market snapshot")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("ok") is not True
+        or verification.get("errors")
+    ):
+        raise ValueError("information market snapshot did not pass the blocking quality gate")
+    end_date = date.fromisoformat(str(manifest["end_date"]))
+    if as_of is not None and end_date > as_of:
+        raise ValueError("information market snapshot is later than the scheduled day")
+    datasets = manifest.get("datasets")
+    for dataset in ("daily", "index_daily"):
+        entry = datasets.get(dataset) if isinstance(datasets, dict) else None
+        files = entry.get("files") if isinstance(entry, dict) else None
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"information market snapshot is missing sealed {dataset} files")
+        for item in files:
+            relative = Path(str(item.get("path") or "")) if isinstance(item, dict) else Path()
+            path = (snapshot / relative).resolve(strict=True)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not path.is_relative_to(snapshot / "parquet" / dataset)
+                or not path.is_file()
+            ):
+                raise ValueError(f"information market snapshot {dataset} file path is invalid")
+    return manifest
 
 
 def latest_verified_research_asset_snapshot(data_root: Path, *, as_of: date) -> str:
@@ -442,14 +492,14 @@ def _latest_verified_snapshot(
             manifest = (
                 validate_research_asset_source_snapshot(data_root, path.name)
                 if required_profile == "research-assets"
-                else json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+                else validate_information_market_snapshot(data_root, path.name, as_of=as_of)
             )
             verification = json.loads((path / "verification.json").read_text(encoding="utf-8"))
             if not isinstance(manifest, dict) or not isinstance(verification, dict):
                 continue
             end_date = date.fromisoformat(str(manifest["end_date"]))
         except (
-            FileNotFoundError,
+            OSError,
             KeyError,
             TypeError,
             ValueError,
