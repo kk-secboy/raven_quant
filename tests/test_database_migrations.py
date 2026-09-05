@@ -1276,6 +1276,10 @@ def test_0084_downgrade_rejects_each_v7_evidence_atomically(
                 )
             )
 
+    with engine.connect() as connection:
+        starting_revision = connection.execute(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ).scalar_one()
     with pytest.raises(RuntimeError, match="immutable v16 strategy"):
         command.downgrade(
             alembic_config(database_url), "0083_baseline_v15_evidence"
@@ -1283,7 +1287,7 @@ def test_0084_downgrade_rejects_each_v7_evidence_atomically(
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ).scalar_one() == "0087_recovery_recipe_path"
+        ).scalar_one() == starting_revision
 
 
 def test_same_lineage_repair_constraint_is_limited_to_exact_v2_through_v7(
@@ -1465,6 +1469,10 @@ def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
             )
         )
 
+    with engine.connect() as connection:
+        starting_revision = connection.execute(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ).scalar_one()
     with pytest.raises(RuntimeError, match="runtime input-scope repair evidence"):
         command.downgrade(
             alembic_config(database_url), "0076_baseline_runtime_repair"
@@ -1473,7 +1481,7 @@ def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0087_recovery_recipe_path"
+        ) == starting_revision
 
 
 def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
@@ -1545,13 +1553,17 @@ def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
             )
         )
 
+    with engine.connect() as connection:
+        starting_revision = connection.execute(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ).scalar_one()
     with pytest.raises(RuntimeError, match="runtime-alignment repair evidence"):
         command.downgrade(alembic_config(database_url), "0075_baseline_lf_repair")
 
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0087_recovery_recipe_path"
+        ) == starting_revision
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1613,13 +1625,17 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
             )
         )
 
+    with engine.connect() as connection:
+        starting_revision = connection.execute(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ).scalar_one()
     with pytest.raises(RuntimeError, match="canonical-LF v3"):
         command.downgrade(alembic_config(database_url), "0074_baseline_repair_chain")
 
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0087_recovery_recipe_path"
+        ) == starting_revision
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1673,6 +1689,10 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
             )
         )
 
+    with engine.connect() as connection:
+        starting_revision = connection.execute(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ).scalar_one()
     with pytest.raises(RuntimeError, match="append-only same-lineage v2"):
         command.downgrade(
             alembic_config(database_url), "0073_baseline_pre_result_repair"
@@ -1681,4 +1701,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0087_recovery_recipe_path"
+        ) == starting_revision
