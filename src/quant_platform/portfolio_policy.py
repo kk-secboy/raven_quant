@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .cost_model import CostModelConfig
-from .discrete_constraints import validate_discrete_constraints
+from .discrete_constraints import ExecutionLotContext, validate_discrete_constraints
 from .portfolio_optimizer import optimize_benchmark_relative_weights
 
 POLICY_VERSION = "portfolio-policy-v3"
@@ -250,6 +250,7 @@ class PortfolioPolicy:
         daily_return: float = 0.0,
         rebalance_due: bool = True,
         rebalance_instruments: Collection[str] | None = None,
+        execution_lot_context: ExecutionLotContext | None = None,
     ) -> PolicyDecision:
         signal = pd.to_numeric(scores, errors="coerce").dropna().astype(float)
         signal.index = signal.index.astype(str)
@@ -899,8 +900,11 @@ class PortfolioPolicy:
         deferred_target_weights: dict[str, float] = {}
         price_values: pd.Series | None = None
         max_change: pd.Series | None = None
+        physical_lots: pd.DataFrame | None = None
         if (prices is None) != (portfolio_value is None):
             raise ValueError("prices and portfolio_value must be supplied together")
+        if execution_lot_context is not None and prices is None:
+            raise ValueError("execution lot context requires prices and portfolio value")
         if prices is not None and portfolio_value is not None:
             if portfolio_value <= 0:
                 raise ValueError("portfolio_value must be positive")
@@ -936,6 +940,19 @@ class PortfolioPolicy:
             frozen_instruments = {
                 str(instrument) for instrument in all_instruments[invalid_execution]
             }
+            if execution_lot_context is not None:
+                physical_lots = execution_lot_context.prepare(
+                    previous, portfolio_value=portfolio_value,
+                    frozen_instruments=frozen_instruments,
+                )
+                if not np.allclose(
+                    price_values.loc[~invalid_prices],
+                    physical_lots.loc[~invalid_prices, "execution_prices"],
+                    rtol=1e-12, atol=0.0,
+                ):
+                    raise ValueError(
+                        "execution lot raw execution prices do not match policy prices"
+                    )
             desired_before_freeze = target.reindex(all_instruments, fill_value=0.0).copy()
             for instrument in sorted(frozen_instruments):
                 desired_weight = float(desired_before_freeze[instrument])
@@ -987,6 +1004,11 @@ class PortfolioPolicy:
                 max_change = (
                     daily_values * self.cost_model.max_volume_participation / portfolio_value
                 )
+                if physical_lots is not None:
+                    max_change = (
+                        max_change * physical_lots["valuation_prices"]
+                        / physical_lots["execution_prices"]
+                    )
                 target.loc[tradable] = target.loc[tradable].clip(
                     lower=(previous - max_change).clip(lower=0.0).loc[tradable],
                     upper=(previous + max_change).loc[tradable],
@@ -1000,15 +1022,21 @@ class PortfolioPolicy:
                 previous_weights=previous,
                 max_weight_changes=max_change,
                 max_position_weight=self.config.max_position_weight,
+                physical_lots=physical_lots,
             )
-        target, max_position_repair_events = self._repair_max_position_weight(
-            target,
-            max_position_weight=self.config.max_position_weight,
-            frozen_instruments=frozen_instruments,
-            prices=price_values,
-            portfolio_value=portfolio_value,
-            lot_size=self.cost_model.lot_size,
-        )
+        if physical_lots is None:
+            target, max_position_repair_events = self._repair_max_position_weight(
+                target,
+                max_position_weight=self.config.max_position_weight,
+                frozen_instruments=frozen_instruments,
+                prices=price_values,
+                portfolio_value=portfolio_value,
+                lot_size=self.cost_model.lot_size,
+            )
+        else:
+            # The physical-order projection already intersects the position cap
+            # with capacity, locks and board increments in one quantity space.
+            max_position_repair_events = []
         repaired_instruments = {
             str(event["instrument"]) for event in max_position_repair_events
         }
@@ -1072,6 +1100,7 @@ class PortfolioPolicy:
                     previous_weights=previous,
                     max_weight_changes=max_change,
                     max_position_weight=self.config.max_position_weight,
+                    physical_lots=physical_lots,
                 )
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
@@ -1087,10 +1116,12 @@ class PortfolioPolicy:
                     previous_weights=previous,
                     max_weight_changes=max_change,
                     max_position_weight=self.config.max_position_weight,
+                    physical_lots=physical_lots,
                 )
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
-        target[target.abs() < 1e-10] = 0.0
+        if physical_lots is None:
+            target[target.abs() < 1e-10] = 0.0
         constrained_policy = self.config.portfolio_construction in {
             "benchmark_relative_qp",
             "industry_neutral_qp",
@@ -1178,6 +1209,10 @@ class PortfolioPolicy:
             risk_ceiling=risk_ceiling,
             risk_turnover_exempt_instruments=risk_turnover_exempt_instruments,
             frozen_instruments=frozen_instruments,
+            execution_lot_context=execution_lot_context,
+            execution_target_quantities=(
+                physical_lots["target_quantities"] if physical_lots is not None else None
+            ),
         )
         if discrete_validation["status"] != "passed":
             failures = ", ".join(
@@ -1275,6 +1310,13 @@ class PortfolioPolicy:
             cost_model=self.cost_model.to_dict(),
             risk_events=risk_events,
             position_state={
+                **(
+                    {"execution_lot_target_quantities": {
+                        str(key): float(value)
+                        for key, value in physical_lots["target_quantities"].items()
+                    }}
+                    if physical_lots is not None else {}
+                ),
                 "take_profit_stages": stages,
                 "execution": next_execution_state,
                 "holding_age_sessions": next_holding_ages,
@@ -1370,6 +1412,116 @@ class PortfolioPolicy:
         return result
 
     @staticmethod
+    def _round_physical_order_lots(
+        target: pd.Series,
+        previous: pd.Series,
+        context: pd.DataFrame,
+        *,
+        portfolio_value: float,
+        frozen_instruments: set[str],
+        max_weight_changes: pd.Series | None,
+        max_position_weight: float | None,
+    ) -> pd.Series:
+        """Project real order increments while preserving the valuation/NAV basis."""
+
+        result = target.copy().astype(float)
+        context["target_quantities"] = context["previous_quantities"].copy()
+        nav = Decimal(str(portfolio_value))
+        for instrument in result.index:
+            prior_weight = float(previous[instrument])
+            if instrument in frozen_instruments:
+                result[instrument] = prior_weight
+                continue
+            row = context.loc[instrument]
+            prior_quantity = Decimal(str(row["previous_quantities"]))
+            mark = Decimal(str(row["valuation_prices"]))
+            execution = Decimal(str(row["execution_prices"]))
+            weight_delta = Decimal(str(float(target[instrument]))) - Decimal(str(prior_weight))
+            desired_change = weight_delta * nav / mark
+            ledger_tolerance = Decimal("1e-10") * nav / mark
+            grid_tolerance = min(Decimal("0.0000001"), ledger_tolerance)
+            if abs(weight_delta) <= Decimal("1e-10"):
+                desired_change = Decimal(0)
+            capacity_quantity = (
+                Decimal(str(float(max_weight_changes[instrument]))) * nav / mark
+                + Decimal("0.0001") / execution
+                if max_weight_changes is not None else Decimal("Infinity")
+            )
+            cap_change = (
+                (Decimal(str(max_position_weight)) - Decimal(str(prior_weight))) * nav / mark
+                if max_position_weight is not None else Decimal("Infinity")
+            )
+            required_reduction = (
+                max(Decimal(0), -cap_change)
+                if max_position_weight is not None
+                and prior_weight > max_position_weight + _DISCRETE_CONSTRAINT_TOLERANCE
+                else Decimal(0)
+            )
+            if desired_change > 0 and required_reduction == 0:
+                minimum = Decimal(str(row["buy_minimum"]))
+                increment = Decimal(str(row["buy_increment"]))
+                maximum = min(
+                    desired_change + grid_tolerance,
+                    capacity_quantity,
+                    cap_change + grid_tolerance,
+                )
+                change = (
+                    minimum + ((maximum - minimum) / increment).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    ) * increment
+                    if maximum >= minimum else Decimal(0)
+                )
+            elif desired_change < 0 or required_reduction > 0:
+                increment = Decimal(str(row["sell_increment"]))
+                locked = Decimal(str(row["locked_quantities"]))
+                maximum = min(capacity_quantity, max(Decimal(0), prior_quantity - locked))
+                available_steps = max(0, int(
+                    (maximum / increment).to_integral_value(rounding=ROUND_FLOOR)
+                ))
+                desired_steps = max(0, int(
+                    ((-desired_change - grid_tolerance) / increment).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                ))
+                required_steps = max(0, int(
+                    ((required_reduction - grid_tolerance) / increment).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                ))
+                if required_steps > available_steps:
+                    raise ValueError(
+                        "no feasible physical-share order within capacity, locks and position cap: "
+                        + str(instrument)
+                    )
+                change = (
+                    -Decimal(max(required_steps, min(desired_steps, available_steps))) * increment
+                )
+            else:
+                change = Decimal(0)
+            target_quantity = prior_quantity + change
+            if (
+                float(target[instrument]) == 0.0
+                and Decimal(str(row["locked_quantities"])) == 0
+                and (
+                    context.attrs.get("allow_full_liquidation", False)
+                    or Decimal(0) <= target_quantity <= grid_tolerance
+                )
+                and prior_quantity <= capacity_quantity
+            ):
+                # Qlib explicitly supports exact full-position liquidation of
+                # corporate-action share equivalents. Other consumers may only
+                # remove floating noise, never a substantive fractional share.
+                target_quantity = Decimal(0)
+                change = -prior_quantity
+            context.loc[instrument, "target_quantities"] = float(target_quantity)
+            result[instrument] = (
+                0.0 if target_quantity == 0
+                else prior_weight if change == 0
+                else float(Decimal(str(prior_weight)) + change * mark / nav)
+            )
+        return result
+
+    @staticmethod
     def _round_tradable_lots(
         target: pd.Series,
         prices: pd.Series,
@@ -1380,6 +1532,7 @@ class PortfolioPolicy:
         previous_weights: pd.Series | None = None,
         max_weight_changes: pd.Series | None = None,
         max_position_weight: float | None = None,
+        physical_lots: pd.DataFrame | None = None,
     ) -> pd.Series:
         """Project total-position lots inside the original capacity/direction interval.
 
@@ -1389,6 +1542,15 @@ class PortfolioPolicy:
         total-position lot contract; it does not authorize odd-lot transactions.
         """
 
+        if physical_lots is not None:
+            if previous_weights is None:
+                raise ValueError("physical lot projection requires previous weights")
+            return PortfolioPolicy._round_physical_order_lots(
+                target, previous_weights, physical_lots,
+                portfolio_value=portfolio_value, frozen_instruments=frozen_instruments,
+                max_weight_changes=max_weight_changes,
+                max_position_weight=max_position_weight,
+            )
         result = target.copy().astype(float)
         tradable = ~result.index.isin(frozen_instruments)
         quantities = (

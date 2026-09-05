@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -804,6 +805,13 @@ def _market_trend_close_history(
     )
 
 
+def _execution_quantity_mode(execution_method: str, *, historical_proxy: bool = False) -> str:
+    """Resolve account units from the effective executor, not the signal frequency."""
+    if execution_method not in {"open", "twap", "vwap", "next_bar"}:
+        raise ValueError("unsupported Qlib execution quantity mode")
+    return "daily_adjusted" if historical_proxy or execution_method == "open" else "minute_raw"
+
+
 def _metadata_provider(
     memberships: pd.DataFrame,
     benchmark_weights: pd.DataFrame | None,
@@ -814,8 +822,8 @@ def _metadata_provider(
     benchmark_close_history: pd.DataFrame | None,
     *,
     strategy_config: dict[str, Any],
-    open_field: str = "$open",
-    close_field: str = "$close",
+    open_field: str = "$open/$factor",
+    close_field: str = "$close/$factor",
     intraday_prices: pd.DataFrame | None = None,
 ):
     membership = memberships.copy()
@@ -858,7 +866,11 @@ def _metadata_provider(
                 mature.append(str(instrument))
         return mature or [str(item) for item in instruments]
 
-    def provide(when: Any, instruments: pd.Index) -> dict[str, Any]:
+    def provide(
+        when: Any, instruments: pd.Index, *, execution_quantity_mode: str = "daily_adjusted",
+    ) -> dict[str, Any]:
+        if execution_quantity_mode not in {"daily_adjusted", "minute_raw"}:
+            raise ValueError("unsupported Qlib execution quantity mode")
         timestamp = pd.Timestamp(when).tz_localize(None)
         market_timestamp = (
             timestamp.normalize() - pd.Timedelta(nanoseconds=1)
@@ -934,6 +946,16 @@ def _metadata_provider(
             **portfolio_metadata,
             "prices": execution_prices,
             "current_prices": current_prices,
+            # Account units belong to the actual Exchange. A daily signal can
+            # execute in raw minute shares, whereas its historical daily proxy
+            # uses adjusted amounts. Signal-price sampling is unchanged.
+            "qlib_factors": (
+                pd.Series(1.0, index=instruments.astype(str))
+                if execution_quantity_mode == "minute_raw"
+                else execution_lookup.lookup(market_timestamp, "$factor").reindex(
+                    instruments.astype(str)
+                )
+            ),
             # $amount is CNY yuan under the v3 daily field contract.
             "average_daily_values": average_daily_values,
             "instrument_risk_states": risk_projection["risk_state"],
@@ -1563,11 +1585,11 @@ def main() -> None:
         end_time=data_periods["end"],
         freq="day",
     )
-    open_field = "$open/$factor" if minute_execution else "$open"
-    close_field = "$close/$factor" if minute_execution else "$close"
+    open_field = "$open/$factor"
+    close_field = "$close/$factor"
     execution_metadata = D.features(
         instruments,
-        [open_field, close_field, "Ref(Mean($amount, 20), 1)"],
+        [open_field, close_field, "$factor", "Ref(Mean($amount, 20), 1)"],
         start_time=data_periods["start"],
         end_time=data_periods["end"],
         freq="day",
@@ -1751,7 +1773,12 @@ def main() -> None:
                 else governed_signal
             ),
             policy=scenario_policy,
-            metadata_provider=metadata,
+            metadata_provider=partial(
+                metadata,
+                execution_quantity_mode=_execution_quantity_mode(
+                    execution_method, historical_proxy=historical_proxy,
+                ),
+            ),
         )
         return run_formal_qlib_backtest(
             strategy=strategy,

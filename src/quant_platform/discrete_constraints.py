@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from math import sqrt
 from typing import Any
 
@@ -9,7 +10,83 @@ import pandas as pd
 from .portfolio_optimizer import validate_covariance
 
 DISCRETE_CONSTRAINT_MODEL_VERSION = "discrete-constraint-validation-v3"
+EXECUTION_LOT_CONTRACT_VERSION = "execution-order-lot-v1"
 _TOLERANCE = 1e-8
+
+
+@dataclass(frozen=True)
+class ExecutionLotContext:
+    """Share quantities and raw prices at the policy's valuation boundary.
+
+    The adapter owns conversion from adjusted units. Position weights and NAV
+    must use ``valuation_prices``; order capacity uses ``execution_prices``.
+    Board increments govern orders relative to existing quantities, not the
+    absolute position. A legal unchanged position need not lie on a buy grid.
+    Qlib may supply share-equivalent holdings after corporate-action adjustment;
+    only its explicit full-liquidation contract may close a fractional remainder.
+    Other consumers retain physical-share order rules.
+    """
+
+    previous_quantities: pd.Series | dict[str, float]
+    valuation_prices: pd.Series | dict[str, float]
+    execution_prices: pd.Series | dict[str, float]
+    buy_minimum: pd.Series | dict[str, float]
+    buy_increment: pd.Series | dict[str, float]
+    sell_increment: pd.Series | dict[str, float]
+    locked_quantities: pd.Series | dict[str, float] | None = None
+    allow_full_liquidation: bool = False
+
+    def prepare(
+        self,
+        previous: pd.Series,
+        *,
+        portfolio_value: float,
+        frozen_instruments: set[str],
+    ) -> pd.DataFrame:
+        if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+            raise ValueError("execution lot context requires a positive finite NAV")
+        if not isinstance(self.allow_full_liquidation, bool):
+            raise ValueError("execution full-liquidation permission must be an explicit boolean")
+        columns: dict[str, pd.Series] = {}
+        for name in (
+            "previous_quantities", "valuation_prices", "execution_prices",
+            "buy_minimum", "buy_increment", "sell_increment", "locked_quantities",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                value = pd.Series(0.0, index=previous.index)
+            series = pd.Series(value, dtype=float).copy()
+            series.index = series.index.astype(str)
+            if not series.index.is_unique:
+                raise ValueError(f"execution lot {name} must use a unique instrument index")
+            columns[name] = series.reindex(previous.index)
+        frame = pd.DataFrame(columns, index=previous.index)
+        frame.attrs["allow_full_liquidation"] = self.allow_full_liquidation
+        for name in ("previous_quantities", "locked_quantities"):
+            if not np.isfinite(frame[name]).all() or (frame[name] < 0).any():
+                raise ValueError(f"execution lot {name} must cover every instrument")
+        for name in ("buy_minimum", "buy_increment", "sell_increment"):
+            values = frame[name]
+            if (
+                not np.isfinite(values).all() or (values <= 0).any()
+                or (values != np.floor(values)).any()
+            ):
+                raise ValueError(f"execution lot {name} must contain positive whole-share units")
+        frozen = frame.index.isin(frozen_instruments)
+        held = frame["previous_quantities"] > 0
+        for name in ("valuation_prices", "execution_prices"):
+            invalid = ~np.isfinite(frame[name]) | (frame[name] <= 0)
+            required = (~frozen | held) if name == "valuation_prices" else ~frozen
+            if (invalid & required).any():
+                raise ValueError(f"execution lot {name} does not cover the required positions")
+        if (frame["locked_quantities"] > frame["previous_quantities"] + 1e-7).any():
+            raise ValueError("execution lot locked quantities exceed actual holdings")
+        marked_weights = (
+            frame["previous_quantities"] * frame["valuation_prices"] / portfolio_value
+        ).where(held, 0.0)
+        if ((marked_weights - previous).abs() > 1e-10).any():
+            raise ValueError("execution lot quantities and valuation do not match previous weights")
+        return frame
 
 
 def _finite_weights(
@@ -105,6 +182,8 @@ def validate_discrete_constraints(
         set[str] | frozenset[str] | list[str] | tuple[str, ...] | None
     ) = None,
     frozen_instruments: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
+    execution_lot_context: ExecutionLotContext | None = None,
+    execution_target_quantities: pd.Series | dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Validate the final, discrete account target against frozen hard limits.
 
@@ -134,6 +213,33 @@ def validate_discrete_constraints(
             "frozen instruments are outside the target contract: "
             + ", ".join(sorted(unknown_frozen))
         )
+    lot_context = None
+    physical_targets = None
+    if execution_lot_context is not None:
+        if prices is None or portfolio_value is None or lot_size is None:
+            raise ValueError("execution lot context requires complete execution inputs")
+        lot_context = execution_lot_context.prepare(
+            previous, portfolio_value=portfolio_value, frozen_instruments=frozen,
+        )
+        if execution_target_quantities is not None:
+            physical_targets = _finite_weights(
+                execution_target_quantities, label="execution target quantities",
+            ).reindex(instruments)
+            if physical_targets.isna().any() or (physical_targets < 0).any():
+                raise ValueError("execution target quantities must cover every instrument")
+            frozen_quantity_changes = (
+                physical_targets - lot_context["previous_quantities"]
+            ).loc[sorted(frozen)]
+            if (frozen_quantity_changes.abs() > 1e-7).any():
+                raise ValueError("frozen instruments must retain actual physical quantities")
+            implied_weights = previous + (
+                (physical_targets - lot_context["previous_quantities"])
+                * lot_context["valuation_prices"] / portfolio_value
+            ).where(~instruments.isin(frozen), 0.0)
+            if ((implied_weights - target).abs() > 1e-10).any():
+                raise ValueError("execution target quantities do not match final target weights")
+    elif execution_target_quantities is not None:
+        raise ValueError("execution target quantities require an execution lot context")
     frozen_changes = (target - previous).abs().reindex(sorted(frozen), fill_value=0.0)
     if (frozen_changes > _TOLERANCE).any():
         raise ValueError("frozen instruments must retain their previous target weight")
@@ -467,6 +573,13 @@ def validate_discrete_constraints(
                 "positive average daily values must cover every requested trade"
             )
         trade_values = (target - previous).abs() * float(portfolio_value)
+        if lot_context is not None:
+            trade_values = (
+                (physical_targets - lot_context["previous_quantities"]).abs()
+                * lot_context["execution_prices"]
+                if physical_targets is not None else
+                trade_values / lot_context["valuation_prices"] * lot_context["execution_prices"]
+            ).where(~instruments.isin(frozen), 0.0)
         capacities = daily_values * float(max_volume_participation)
         for instrument in instruments:
             if str(instrument) in frozen:
@@ -513,6 +626,20 @@ def validate_discrete_constraints(
         if invalid_unfrozen.any():
             raise ValueError("prices must cover every instrument")
         quantities = target * float(portfolio_value) / price_values
+        if lot_context is not None:
+            if not np.allclose(
+                price_values.loc[~invalid_prices],
+                lot_context.loc[~invalid_prices, "execution_prices"],
+                rtol=1e-12, atol=0.0,
+            ):
+                raise ValueError("execution lot raw execution prices do not match policy prices")
+            quantities = (
+                lot_context["previous_quantities"]
+                + (target - previous) * float(portfolio_value)
+                / lot_context["valuation_prices"]
+            ).where(~instruments.isin(frozen), lot_context["previous_quantities"])
+            if physical_targets is not None:
+                quantities = physical_targets
         for instrument, quantity in quantities.items():
             if str(instrument) in frozen:
                 _record(
@@ -523,6 +650,47 @@ def validate_discrete_constraints(
                     limit=0.0,
                     relation="<=",
                     passed=abs(float(target[instrument] - previous[instrument])) <= _TOLERANCE,
+                )
+                continue
+            if lot_context is not None:
+                prior_quantity = float(lot_context.loc[instrument, "previous_quantities"])
+                delta = float(quantity) - prior_quantity
+                locked = float(lot_context.loc[instrument, "locked_quantities"])
+                full_liquidation = (
+                    execution_lot_context.allow_full_liquidation
+                    and float(target[instrument]) == 0.0 and float(quantity) == 0.0
+                    and prior_quantity > 0.0 and locked == 0.0
+                )
+                holding = abs(delta) <= 1e-7
+                if holding:
+                    distance = 0.0
+                    valid_order = True
+                elif delta > 0:
+                    minimum = float(lot_context.loc[instrument, "buy_minimum"])
+                    increment = float(lot_context.loc[instrument, "buy_increment"])
+                    steps = (delta - minimum) / increment
+                    distance = abs(steps - round(steps)) * increment
+                    valid_order = delta >= minimum - 1e-7 and distance <= 1e-7
+                else:
+                    increment = float(lot_context.loc[instrument, "sell_increment"])
+                    steps = -delta / increment
+                    distance = abs(steps - round(steps)) * increment
+                    valid_order = distance <= 1e-7 and -delta <= prior_quantity + 1e-7
+                if full_liquidation:
+                    _record(
+                        checks, name="full_position_liquidation", scope=str(instrument),
+                        observed=-delta, limit=prior_quantity, relation="==",
+                        passed=-delta == prior_quantity,
+                    )
+                else:
+                    _record(
+                        checks, name="physical_order_lot", scope=str(instrument),
+                        observed=distance, limit=1e-7, relation="<=", passed=valid_order,
+                    )
+                _record(
+                    checks, name="physical_locked_quantity", scope=str(instrument),
+                    observed=float(quantity), limit=locked, relation=">=",
+                    passed=float(quantity) >= locked - 1e-7,
                 )
                 continue
             lots = float(quantity) / int(lot_size)
@@ -556,6 +724,18 @@ def validate_discrete_constraints(
     violations = [item for item in checks if not item["passed"]]
     return {
         "model_version": DISCRETE_CONSTRAINT_MODEL_VERSION,
+        **(
+            {"lot_contract": {
+                "version": EXECUTION_LOT_CONTRACT_VERSION,
+                "quantity_basis": (
+                    "qlib_share_equivalent" if execution_lot_context.allow_full_liquidation
+                    else "physical_share"
+                ),
+                "rounding_basis": "order_increment",
+                "full_liquidation_allowed": execution_lot_context.allow_full_liquidation,
+            }}
+            if execution_lot_context is not None else {}
+        ),
         "status": "passed" if not violations else "failed",
         "cash_weight": cash_weight,
         "turnover": turnover,

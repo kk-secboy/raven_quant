@@ -160,7 +160,10 @@ class SquareRootImpactExchange(Exchange):
             asset_type=infer_cn_asset_type(str(order.stock_id)),
             trade_date=trade_date,
             instrument=str(order.stock_id),
-            quantity=trade_value / trade_price if trade_price > 0 else 0.0,
+            # Qlib trade_price is adjusted; fees charged per physical share
+            # must use amount * factor.  CNY trade_value is already invariant.
+            quantity=(trade_value / trade_price * self._physical_factor(order)
+                      if trade_price > 0 else 0.0),
         )
         self._record_fill(
             order,
@@ -169,6 +172,18 @@ class SquareRootImpactExchange(Exchange):
             cost=actual_cost,
         )
         return trade_price, trade_value, actual_cost
+
+    def _physical_factor(self, order: Order) -> float:
+        factor = order.factor
+        if factor is None:
+            factor = self.get_factor(order.stock_id, order.start_time, order.end_time)
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            factor = float("nan")
+        if not np.isfinite(factor) or factor <= 0:
+            raise ValueError("formal Qlib execution has no physical-share factor")
+        return factor
 
     def _record_fill(
         self,
@@ -180,12 +195,20 @@ class SquareRootImpactExchange(Exchange):
     ) -> None:
         requested_amount = max(0.0, float(order.amount))
         try:
-            raw_price = float(trade_price)
+            adjusted_price = float(trade_price)
         except (TypeError, ValueError):
-            raw_price = 0.0
-        price = raw_price if np.isfinite(raw_price) and raw_price > 0 else 0.0
+            adjusted_price = 0.0
+        price = adjusted_price if np.isfinite(adjusted_price) and adjusted_price > 0 else 0.0
         value = max(0.0, float(trade_value))
         executed_amount = value / price if price > 0 else 0.0
+        try:
+            factor = self._physical_factor(order)
+        except ValueError:
+            if value > 0:
+                raise
+            # A no-quote rejection need not have a factor.  Its physical
+            # quantity is unknown, not an invented factor-one fill.
+            factor = None
         self.fill_log.append(
             {
                 "instrument": str(order.stock_id),
@@ -201,6 +224,12 @@ class SquareRootImpactExchange(Exchange):
                 "trade_price": price,
                 "trade_value": value,
                 "cost": max(0.0, float(cost)),
+                # Existing amount/price fields intentionally retain Qlib's
+                # continuous adjusted units for cross-date trade statistics.
+                "qlib_factor": factor,
+                "raw_requested_amount": requested_amount * factor if factor is not None else None,
+                "raw_amount": executed_amount * factor if factor is not None else None,
+                "raw_trade_price": price / factor if factor is not None and price > 0 else None,
             }
         )
 

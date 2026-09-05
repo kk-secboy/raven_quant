@@ -102,6 +102,8 @@ def test_metadata_provider_prepares_each_panel_once_and_matches_legacy(monkeypat
     index = pd.MultiIndex.from_product([dates, ["A", "B"]], names=["datetime", "instrument"])
     execution = pd.DataFrame({
         "$open": [1.0, 2.0, 3.0, 4.0], "$close": [1.5, 2.5, 3.5, 4.5],
+        "$open/$factor": [2.0, 4.0, 6.0, 8.0],
+        "$close/$factor": [3.0, 5.0, 7.0, 9.0], "$factor": [0.5] * 4,
         "Ref(Mean($amount, 20), 1)": [100.0, 200.0, 300.0, np.nan],
     }, index=index)
     minute = pd.DataFrame({"$vwap": [10.0, 20.0], "$close": [11.0, 21.0]},
@@ -167,8 +169,9 @@ def test_metadata_provider_prepares_each_panel_once_and_matches_legacy(monkeypat
     if not intraday:
         queries.extend(reversed(dates.to_list()))
     for when in queries:
-        actual = actual_provider(when, pd.Index(["B", "A"]))
-        expected = expected_provider(when, pd.Index(["B", "A"]))
+        mode = {"execution_quantity_mode": "minute_raw" if intraday else "daily_adjusted"}
+        actual = actual_provider(when, pd.Index(["B", "A"]), **mode)
+        expected = expected_provider(when, pd.Index(["B", "A"]), **mode)
         assert actual.keys() == expected.keys()
         for name, value in expected.items():
             if isinstance(value, pd.Series):

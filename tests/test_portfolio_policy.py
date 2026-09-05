@@ -1207,8 +1207,9 @@ def test_rebalance_period_gate_handles_day_week_and_month() -> None:
 
 def test_qlib_adapter_and_recommendation_call_return_identical_targets(monkeypatch) -> None:
     class WeightStrategyBase:
-        def __init__(self, signal):
+        def __init__(self, signal, *, risk_degree):
             self.signal = signal
+            assert risk_degree == 1.0
 
     module = types.ModuleType("qlib.contrib.strategy.signal_strategy")
     module.WeightStrategyBase = WeightStrategyBase
@@ -1272,8 +1273,9 @@ def test_qlib_adapter_preserves_holding_age_when_an_exit_is_not_filled(
     monkeypatch,
 ) -> None:
     class WeightStrategyBase:
-        def __init__(self, signal):
+        def __init__(self, signal, *, risk_degree):
             self.signal = signal
+            assert risk_degree == 1.0
 
     module = types.ModuleType("qlib.contrib.strategy.signal_strategy")
     module.WeightStrategyBase = WeightStrategyBase

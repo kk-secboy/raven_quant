@@ -300,18 +300,29 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
         "### 5.6 公司行动"
     )[0]
     for contract in (
-        "整手取整必须留在原持仓的容量与买卖方向可行区间内",
-        "不存在可行整手目标时失败关闭",
-        "不自动扩展零碎股交易语义",
+        "申报单位约束作用于本次买卖增量",
+        "合法持仓保持不动时必须保留原数量",
+        "真实交易约束不可同时满足时失败关闭",
+        "内部数量乘信号日 factor 得到等价原始股数",
+        "与 NAV 一致的原始估值价格",
+        "数量口径由每次回测实际使用的执行器决定",
+        "原价分钟执行采用 factor=1，即使信号是日线",
+        "历史代理切回日线撮合时仍采用日线复权因子",
+        "禁止下单器再按另一个价格、默认风险比例或统一 100 股单位二次缩放",
+        "T+1 下限必须进入同一次数量校验",
+        "仅显式启用 Qlib 原有完整清仓特例",
+        "部分卖出不获得任意小数数量权限",
+        "推荐目标历史不能冒充真实持仓",
         "离散后的全部硬约束继续复检",
-        "`qlib-rdagent-single-mainline-2026-09-06-v37`",
+        "`qlib-rdagent-single-mainline-2026-09-06-v38`",
+        "`0109_strategy_runtime_v38`",
         "`0108_strategy_runtime_v37`",
         "受影响回测必须重新计算",
-        "v36 及更早版本的身份、制品和 OOS 消费记录保持只读",
+        "v37 及更早版本的身份、制品和 OOS 消费记录保持只读",
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v37`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v38`" in readme
     assert "不能沿用旧结果宣称等价" in readme
 
 

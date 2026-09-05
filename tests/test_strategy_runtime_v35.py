@@ -120,6 +120,7 @@ def test_v35_job_binding_preserves_old_seals_and_rejects_current_code(
     runtime.STRATEGY_RESEARCH_V34_TARGET_RECIPE_VERSION,
     runtime.STRATEGY_RESEARCH_V35_TARGET_RECIPE_VERSION,
     runtime.STRATEGY_RESEARCH_V36_TARGET_RECIPE_VERSION,
+    runtime.STRATEGY_RESEARCH_V37_TARGET_RECIPE_VERSION,
     runtime.STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
 ])
 def test_formal_evidence_preserves_historical_and_current_worker_image_checks(

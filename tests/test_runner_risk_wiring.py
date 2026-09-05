@@ -77,8 +77,9 @@ def test_backtest_metadata_projects_pit_risk_and_freezes_non_tradable_price(
     )
     execution = pd.DataFrame(
         {
-            "$open": [10.0, 20.0],
-            "$close": [10.5, 20.5],
+            "$open/$factor": [10.0, 20.0],
+            "$close/$factor": [10.5, 20.5],
+            "$factor": [0.5, 0.25],
             "Ref(Mean($amount, 20), 1)": [1_000_000.0, 2_000_000.0],
         },
         index=index,
@@ -110,8 +111,27 @@ def test_backtest_metadata_projects_pit_risk_and_freezes_non_tradable_price(
     assert pd.isna(result["prices"]["B"])
     assert pd.isna(result["average_daily_values"]["B"])
     assert result["current_prices"]["B"] == 20.5
+    assert result["qlib_factors"].to_dict() == {"A": 0.5, "B": 0.25}
     assert result["industries"].to_dict() == {"A": "one", "B": "two"}
     assert "style_exposures" not in result
+
+    # Daily signals executing on the minute snapshot use raw account units;
+    # the same signal's historical daily proxy uses daily adjusted units.
+    minute = provider(when, pd.Index(["A", "B"]), execution_quantity_mode="minute_raw")
+    assert minute["qlib_factors"].to_dict() == {"A": 1.0, "B": 1.0}
+    pd.testing.assert_series_equal(minute["prices"], result["prices"])
+    pd.testing.assert_series_equal(minute["current_prices"], result["current_prices"])
+
+
+@pytest.mark.parametrize("method", ["open", "twap", "vwap", "next_bar"])
+@pytest.mark.parametrize("historical", [False, True])
+def test_execution_quantity_mode_follows_effective_executor(
+    runners: tuple[ModuleType, ModuleType], method: str, historical: bool,
+) -> None:
+    backtest, _ = runners
+    assert backtest._execution_quantity_mode(method, historical_proxy=historical) == (
+        "daily_adjusted" if historical or method == "open" else "minute_raw"
+    )
 
 
 def test_recommendation_execution_evidence_blocks_missing_close_and_suspension(

@@ -93,8 +93,8 @@ def test_v36_job_binding_preserves_history_and_rejects_current_code(
         ),
         runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: image,
     }
-    # Same script bytes cannot authorize execution under a different imported source seal.
-    with pytest.raises(ValueError, match="transparent v36 runtime bundle differs"):
+    # Historical binding is retained; current runner bytes cannot execute it.
+    with pytest.raises(ValueError, match="transparent v36 runner bytes differ"):
         runtime.require_transparent_baseline_runner(
             config=config, job_payload=payload,
             runner_path=ROOT / "scripts/run_multifactor_backtest.py",
