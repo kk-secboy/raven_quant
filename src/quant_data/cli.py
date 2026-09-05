@@ -3486,6 +3486,7 @@ def supplemental_download(
         reference_rows = _require_specs_complete(context, reference_specs)
         specs.extend(reference_specs)
         rows.extend(reference_rows)
+        datasets.update(reference_datasets)
     if bundle in {"hk_market", "us_market"}:
         market = bundle.split("_", 1)[0]
         basic_dataset = f"{market}_basic"
