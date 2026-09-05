@@ -136,6 +136,12 @@ def main() -> None:
         fit_start_time=segments["train"][0],
         fit_end_time=segments["train"][1],
         instruments=args.market,
+        learn_processors=[
+            {
+                "class": "BaselineLabelProcessor",
+                "module_path": "quant_platform.qlib_baseline_processors",
+            }
+        ],
     )
     dataset = DatasetH(handler=handler, segments=segments)
     model = LGBModel(
