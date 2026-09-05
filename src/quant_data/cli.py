@@ -519,7 +519,7 @@ def _supersede_legacy_report_period_windows(context: Context, specs: list[FetchS
     target_datasets = {spec.dataset for spec in replacements.values()}
     for row in context.checkpoint.unfinished_units(target_datasets):
         params = dict(row.get("params_json") or {})
-        if set(params) != {"ts_code", "start_date", "end_date"}:
+        if row.get("fields_json") or set(params) != {"ts_code", "start_date", "end_date"}:
             continue
         identity = (row["dataset"], row["api_name"], params["ts_code"], params["end_date"])
         if identity in replacements:

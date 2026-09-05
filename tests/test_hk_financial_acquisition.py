@@ -148,7 +148,7 @@ class _Checkpoint:
 def _row(spec, status="pending"):
     return {
         "unit_key": spec.unit_key, "dataset": spec.dataset, "api_name": spec.api_name,
-        "params_json": spec.params, "scope_json": spec.scope, "fields_json": [],
+        "params_json": spec.params, "scope_json": spec.scope, "fields_json": list(spec.fields),
         "status": status, "row_count": 0, "allow_empty": True, "max_attempts": 3,
     }
 
@@ -213,6 +213,10 @@ def test_window_retirement_preserves_other_symbols_asofs_and_request_shapes():
     scoped = _legacy(current, start="20260101")
     protected.append(FetchSpec(
         scoped.dataset, scoped.api_name, scoped.scope, {**scoped.params, "report_type": "3"},
+    ))
+    protected.append(FetchSpec(
+        obsolete.dataset, obsolete.api_name, obsolete.scope, obsolete.params,
+        fields=("ts_code", "end_date", "custom_nondefault_field"),
     ))
     checkpoint = _Checkpoint([_row(obsolete), *[_row(spec) for spec in protected]])
     checkpoint.add([current])
