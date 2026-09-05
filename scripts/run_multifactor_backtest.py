@@ -28,8 +28,8 @@ from quant_data.execution_contract import (
 from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostScheduleBook
 from quant_platform.eligibility import (
+    PreparedPointInTimeRiskStates,
     eligibility_statistics,
-    project_point_in_time_risk_states,
 )
 from quant_platform.execution_algorithms import execution_time_slots
 from quant_platform.factor_recompute import (
@@ -731,6 +731,45 @@ def _qlib_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) ->
     ).astype(float)
 
 
+class _PreparedQlibCrossSections:
+    """Own one normalized panel; select the latest whole-date slice per query.
+
+    The source and returned Series may be changed by their callers without
+    changing this lookup. No panel is cached outside its metadata provider.
+    """
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        values = frame.copy()
+        dates = pd.to_datetime(values.index.get_level_values("datetime")).tz_localize(None)
+        values.index = pd.MultiIndex.from_arrays(
+            [dates, values.index.get_level_values("instrument").astype(str)],
+            names=["datetime", "instrument"],
+        )
+        self._values = values.sort_index()
+        self._dates = self._values.index.get_level_values("datetime").unique()
+        self._monotonic = self._values.index.is_monotonic_increasing
+
+    def lookup(self, when: pd.Timestamp, column: str) -> pd.Series:
+        if not self._monotonic:
+            # For example, NaT index entries retain the original MultiIndex
+            # slicing failure rather than silently dropping invalid dates.
+            available = self._values.loc[(slice(None, when), slice(None)), column]
+            if available.empty:
+                raise ValueError(f"Qlib has no {column} data at {when.date()}")
+            snapshot = available.xs(available.index.get_level_values("datetime").max())
+        else:
+            # Resolve the column before the empty-date guard, as the original
+            # helper does. DatetimeIndex slicing preserves inclusive/partial
+            # date and timezone comparison semantics without copying history.
+            values = self._values[column]
+            date_slice = self._dates.slice_indexer(end=when)
+            available_dates = self._dates[date_slice]
+            if available_dates.empty:
+                raise ValueError(f"Qlib has no {column} data at {when.date()}")
+            snapshot = values.xs(available_dates[-1], level="datetime")
+        return pd.to_numeric(snapshot, errors="coerce").astype(float)
+
+
 def _portfolio_return_covariance(
     strategy_config: dict[str, Any],
     close_matrix: pd.DataFrame,
@@ -783,6 +822,13 @@ def _metadata_provider(
     membership["in_date"] = pd.to_datetime(membership["in_date"], errors="coerce")
     membership["out_date"] = pd.to_datetime(membership["out_date"], errors="coerce")
     close_matrix = close_history["$close"].unstack("instrument").sort_index()
+    execution_lookup = _PreparedQlibCrossSections(execution_metadata)
+    risk_lookup = PreparedPointInTimeRiskStates(eligibility_matrix)
+    price_lookup = (
+        _PreparedQlibCrossSections(intraday_prices)
+        if intraday_prices is not None
+        else execution_lookup
+    )
     # YoY growth is undefined until a company has had the chance to publish
     # one annual report; the systemic style gate is therefore evaluated only
     # over candidates with a full year of dataset history.  Younger
@@ -863,23 +909,19 @@ def _metadata_provider(
             style_exposures=style,
             return_covariance=return_covariance,
         )
-        risk_projection = project_point_in_time_risk_states(
-            eligibility_matrix,
+        risk_projection = risk_lookup.project(
             as_of=market_timestamp,
             instruments=instruments,
         ).set_index("instrument")
-        execution_prices = _qlib_cross_section(
-            intraday_prices if intraday_prices is not None else execution_metadata,
+        execution_prices = price_lookup.lookup(
             timestamp if intraday_prices is not None else market_timestamp,
             "$vwap" if intraday_prices is not None else open_field,
         ).reindex(instruments.astype(str))
-        current_prices = _qlib_cross_section(
-            intraday_prices if intraday_prices is not None else execution_metadata,
+        current_prices = price_lookup.lookup(
             timestamp if intraday_prices is not None else market_timestamp,
             "$close" if intraday_prices is not None else close_field,
         ).reindex(instruments.astype(str))
-        average_daily_values = _qlib_cross_section(
-            execution_metadata,
+        average_daily_values = execution_lookup.lookup(
             market_timestamp,
             "Ref(Mean($amount, 20), 1)",
         ).reindex(instruments.astype(str))

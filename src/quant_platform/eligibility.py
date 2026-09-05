@@ -279,6 +279,71 @@ def build_point_in_time_eligibility(
     return base[columns].sort_values(["datetime", "instrument"]).reset_index(drop=True)
 
 
+class PreparedPointInTimeRiskStates:
+    """Reuse validated eligibility history without scanning it on every trading day.
+
+    Each query selects at most one existing row per requested instrument and
+    delegates the risk rules to the unchanged projection below. Binary searches
+    are independent of query order, including restarts and validation windows.
+    The instance owns its prepared frame; no cache is shared between datasets.
+    """
+
+    def __init__(self, values: pd.DataFrame) -> None:
+        required = {
+            "datetime", "instrument", "eligible", "reasons", "is_st", "suspended",
+            "delisted", "normal_listing_status", "equity", "audit_opinion",
+            "financial_gate_required", "regulatory_data_available", "major_violation",
+            "contract_version",
+        }
+        source = _required_frame(values, required, "eligibility risk projection")
+        source["datetime"] = pd.to_datetime(source["datetime"], errors="coerce").dt.normalize()
+        source["instrument"] = source["instrument"].astype(str).str.upper()
+        if source[["datetime", "instrument"]].isna().any().any():
+            raise ValueError("eligibility risk projection has invalid dates or instruments")
+        if source.duplicated(["datetime", "instrument"]).any():
+            raise ValueError("eligibility risk projection observations are duplicated")
+        if source["contract_version"].ne(ELIGIBILITY_CONTRACT_VERSION).any():
+            raise ValueError("eligibility risk projection contract is obsolete")
+        self._source = source.sort_values(["instrument", "datetime"], ignore_index=True)
+        dates = pd.DatetimeIndex(self._source["datetime"])
+        counts = self._source.groupby("instrument", sort=False).size()
+        self._history: dict[str, tuple[pd.DatetimeIndex, int]] = {}
+        start = 0
+        for instrument, count in counts.items():
+            stop = start + int(count)
+            self._history[str(instrument)] = (dates[start:stop], start)
+            start = stop
+
+    def project(
+        self, *, as_of: Any, instruments: Iterable[str] | None = None
+    ) -> pd.DataFrame:
+        timestamp = pd.Timestamp(as_of).normalize()
+        if pd.isna(timestamp):
+            raise ValueError("eligibility risk projection as_of is invalid")
+        requested = (
+            sorted(self._history)
+            if instruments is None
+            else sorted({str(instrument).upper() for instrument in instruments})
+        )
+        positions = []
+        for instrument in requested:
+            history = self._history.get(instrument)
+            if history is None:
+                continue
+            dates, start = history
+            offset = int(dates.searchsorted(timestamp, side="right")) - 1
+            if offset >= 0:
+                positions.append(start + offset)
+        # Keep original datatypes/timezones even for an empty selection. The
+        # legacy projection also validates comparison compatibility in that
+        # case and retains its exact missing/stale-evidence behavior.
+        selected = self._source.iloc[positions]
+        return project_point_in_time_risk_states(
+            selected, as_of=timestamp,
+            instruments=None if instruments is None else requested,
+        )
+
+
 def project_point_in_time_risk_states(
     values: pd.DataFrame,
     *,
