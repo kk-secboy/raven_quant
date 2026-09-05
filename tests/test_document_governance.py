@@ -294,6 +294,27 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         assert obsolete not in specification
 
 
+def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    capacity = specification.partition("### 5.5 容量与离散交易")[2].partition(
+        "### 5.6 公司行动"
+    )[0]
+    for contract in (
+        "整手取整必须留在原持仓的容量与买卖方向可行区间内",
+        "不存在可行整手目标时失败关闭",
+        "不自动扩展零碎股交易语义",
+        "离散后的全部硬约束继续复检",
+        "`qlib-rdagent-single-mainline-2026-09-06-v37`",
+        "`0108_strategy_runtime_v37`",
+        "受影响回测必须重新计算",
+        "v36 及更早版本的身份、制品和 OOS 消费记录保持只读",
+    ):
+        assert contract in capacity
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v37`" in readme
+    assert "不能沿用旧结果宣称等价" in readme
+
+
 def test_run_status_presentation_keeps_audit_evidence_and_financial_permissions() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
     reliability = specification.partition("### 11.2 任务可靠性")[2].partition(

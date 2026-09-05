@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import asdict, dataclass
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 import numpy as np
@@ -898,6 +898,7 @@ class PortfolioPolicy:
         frozen_instruments: set[str] = set()
         deferred_target_weights: dict[str, float] = {}
         price_values: pd.Series | None = None
+        max_change: pd.Series | None = None
         if (prices is None) != (portfolio_value is None):
             raise ValueError("prices and portfolio_value must be supplied together")
         if prices is not None and portfolio_value is not None:
@@ -996,6 +997,9 @@ class PortfolioPolicy:
                 portfolio_value=portfolio_value,
                 lot_size=self.cost_model.lot_size,
                 frozen_instruments=frozen_instruments,
+                previous_weights=previous,
+                max_weight_changes=max_change,
+                max_position_weight=self.config.max_position_weight,
             )
         target, max_position_repair_events = self._repair_max_position_weight(
             target,
@@ -1065,6 +1069,9 @@ class PortfolioPolicy:
                     portfolio_value=portfolio_value,
                     lot_size=self.cost_model.lot_size,
                     frozen_instruments=frozen_instruments,
+                    previous_weights=previous,
+                    max_weight_changes=max_change,
+                    max_position_weight=self.config.max_position_weight,
                 )
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
@@ -1077,6 +1084,9 @@ class PortfolioPolicy:
                     portfolio_value=portfolio_value,
                     lot_size=self.cost_model.lot_size,
                     frozen_instruments=frozen_instruments,
+                    previous_weights=previous,
+                    max_weight_changes=max_change,
+                    max_position_weight=self.config.max_position_weight,
                 )
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
@@ -1367,7 +1377,18 @@ class PortfolioPolicy:
         portfolio_value: float,
         lot_size: int,
         frozen_instruments: set[str],
+        previous_weights: pd.Series | None = None,
+        max_weight_changes: pd.Series | None = None,
+        max_position_weight: float | None = None,
     ) -> pd.Series:
+        """Project total-position lots inside the original capacity/direction interval.
+
+        Flooring a capacity-clipped sell target can exceed the permitted sale by
+        one lot. Reapply the interval after every rounding pass, including those
+        after turnover scaling and risk overrides. This retains the existing
+        total-position lot contract; it does not authorize odd-lot transactions.
+        """
+
         result = target.copy().astype(float)
         tradable = ~result.index.isin(frozen_instruments)
         quantities = (
@@ -1380,6 +1401,81 @@ class PortfolioPolicy:
             * lot_size
         )
         result.loc[tradable] = quantities * prices.loc[tradable] / portfolio_value
+        if previous_weights is None:
+            return result
+        previous = previous_weights.reindex(result.index, fill_value=0.0)
+        portfolio_decimal = Decimal(str(portfolio_value))
+        # The final validator uses the same 1e-4 CNY comparison tolerance.
+        # Decimal bounds avoid converting an exact boundary into another lot.
+        capacity_tolerance = Decimal("0.0001")
+        # Direction and hold bounds use the changes ledger's weight threshold,
+        # independently of the validator's monetary capacity tolerance.
+        direction_tolerance = Decimal("1e-10") * portfolio_decimal
+        active = tradable & ((target > 0.0) | (previous > 0.0))
+        for instrument in result.index[active]:
+            previous_notional = Decimal(str(previous[instrument])) * portfolio_decimal
+            target_notional = Decimal(str(target[instrument])) * portfolio_decimal
+            lot_notional = Decimal(str(prices[instrument])) * Decimal(lot_size)
+            lower = Decimal(0)
+            upper: Decimal | None = None
+            if max_weight_changes is not None:
+                capacity = Decimal(str(max_weight_changes[instrument])) * portfolio_decimal
+                lower = max(lower, previous_notional - capacity - capacity_tolerance)
+                upper = previous_notional + capacity + capacity_tolerance
+            direction = (
+                1 if target_notional > previous_notional
+                else -1 if target_notional < previous_notional else 0
+            )
+            if direction > 0:
+                lower = max(lower, previous_notional - direction_tolerance)
+                target_upper = target_notional + direction_tolerance
+                upper = target_upper if upper is None else min(upper, target_upper)
+                if max_position_weight is not None:
+                    # A buy must not round above the cap and then be repaired
+                    # into a sell of an otherwise compliant existing holding.
+                    position_cap = (
+                        Decimal(str(max_position_weight)) * portfolio_decimal + capacity_tolerance
+                    )
+                    upper = position_cap if upper is None else min(upper, position_cap)
+            elif direction < 0:
+                direction_upper = previous_notional + direction_tolerance
+                upper = direction_upper if upper is None else min(upper, direction_upper)
+            else:
+                # A hold (including a cadence/holding-period lock) does not
+                # authorize a sale just to put an old position on the lot grid.
+                lower = max(lower, previous_notional - direction_tolerance)
+                direction_upper = previous_notional + direction_tolerance
+                upper = direction_upper if upper is None else min(upper, direction_upper)
+            minimum_lots = max(0, int(
+                (lower / lot_notional).to_integral_value(rounding=ROUND_CEILING)
+            ))
+            maximum_lots = (
+                int((upper / lot_notional).to_integral_value(rounding=ROUND_FLOOR))
+                if upper is not None else None
+            )
+            if maximum_lots is not None and minimum_lots > maximum_lots:
+                raise ValueError(
+                    "no feasible whole-lot target within capacity and direction: "
+                    + str(instrument)
+                )
+            raw_lots = target_notional / lot_notional
+            nearest_lots = int(raw_lots.to_integral_value())
+            desired_lots = (
+                nearest_lots
+                if abs(target_notional - nearest_lots * lot_notional) <= capacity_tolerance
+                else int(raw_lots.to_integral_value(rounding=ROUND_FLOOR))
+            )
+            lots = max(minimum_lots, desired_lots)
+            if maximum_lots is not None:
+                lots = min(lots, maximum_lots)
+            result[instrument] = lots * lot_size * float(prices[instrument]) / portfolio_value
+            actual_change = result[instrument] - float(previous[instrument])
+            if abs(actual_change) > 1e-10 and (direction == 0 or actual_change * direction < 0):
+                # Check the emitted float using the ledger's exact predicate.
+                raise ValueError(
+                    "no feasible whole-lot target within capacity and direction: "
+                    + str(instrument)
+                )
         return result
 
     @staticmethod

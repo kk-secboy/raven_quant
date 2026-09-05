@@ -1,41 +1,31 @@
 from __future__ import annotations
 
-import hashlib
 import runpy
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from quant_data.database import strategy_versions
 from quant_platform import transparent_baseline_runner as runtime
-from quant_platform.runtime_source_closure import (
-    _normalized_seal_payload,
-    closure_paths,
-    position_risk_source_closure_inventory,
-)
+from quant_platform.runtime_source_closure import _normalized_seal_payload
 from quant_platform.strategy_recipes import RECIPE_VERSION
 
 pytestmark = pytest.mark.no_database
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_v36_seals_the_actual_runner_and_both_prepared_lookup_modules() -> None:
-    assert RECIPE_VERSION == "qlib-rdagent-single-mainline-2026-09-06-v36"
-    assert runtime.STRATEGY_RESEARCH_TARGET_RECIPE_VERSION == RECIPE_VERSION
-    assert runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 == hashlib.sha256(
-        (ROOT / "scripts/run_multifactor_backtest.py").read_bytes()
-    ).hexdigest()
-    assert runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 == (
-        runtime.position_risk_bundle_sha256(ROOT)
+def test_v36_preserves_its_historical_runtime_seal() -> None:
+    assert runtime.STRATEGY_RESEARCH_V36_TARGET_RECIPE_VERSION == (
+        "qlib-rdagent-single-mainline-2026-09-06-v36"
     )
-    assert {
-        "scripts/run_multifactor_backtest.py",
-        "scripts/run_recommendation_refresh.py",
-        "src/quant_platform/eligibility.py",
-        "src/quant_platform/strategy_rule_runtime.py",
-        "src/quant_platform/simulation_engine.py",
-        "src/quant_data/reference_data.py",
-    } <= set(closure_paths(position_risk_source_closure_inventory(ROOT)))
+    assert runtime.STRATEGY_RESEARCH_V36_TARGET_RUNNER_SHA256 == (
+        "372d8744947144be822aeda155fa2907b6aefda464422b759d1083b772148054"
+    )
+    assert runtime.STRATEGY_RESEARCH_V36_TARGET_RUNTIME_BUNDLE_SHA256 == (
+        "4066cbaa642bc30133dde1603de0516755f80d3fd8c90b7ff60c950e7777b93e"
+    )
+    assert RECIPE_VERSION != runtime.STRATEGY_RESEARCH_V36_TARGET_RECIPE_VERSION
 
 
 def test_v36_migration_and_metadata_preserve_the_previous_runtime_seals() -> None:
@@ -53,10 +43,10 @@ def test_v36_migration_and_metadata_preserve_the_previous_runtime_seals() -> Non
         if hasattr(item, "sqltext")
     }
     assert current["revision"] == "0107_strategy_runtime_v36"
-    assert current["RECIPE_VERSION"] == RECIPE_VERSION
-    assert current["RUNNER_SHA256"] == runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+    assert current["RECIPE_VERSION"] == runtime.STRATEGY_RESEARCH_V36_TARGET_RECIPE_VERSION
+    assert current["RUNNER_SHA256"] == runtime.STRATEGY_RESEARCH_V36_TARGET_RUNNER_SHA256
     assert current["RUNTIME_BUNDLE_SHA256"] == (
-        runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+        runtime.STRATEGY_RESEARCH_V36_TARGET_RUNTIME_BUNDLE_SHA256
     )
     for previous, following in zip(migrations, migrations[1:], strict=False):
         assert following["down_revision"] == previous["revision"]
@@ -74,46 +64,43 @@ def test_v36_migration_and_metadata_preserve_the_previous_runtime_seals() -> Non
 @pytest.mark.parametrize(
     "recipe_id", ["short_relative_strength", "swing_trend", "long_quality_value"],
 )
-def test_v36_bound_job_checks_current_runner_bundle_and_worker_image(
+def test_v36_job_binding_preserves_history_and_rejects_current_code(
     monkeypatch: pytest.MonkeyPatch, recipe_id: str,
 ) -> None:
     image = "sha256:" + "1" * 64
     monkeypatch.setenv(runtime.WORKER_RUNTIME_IMAGE_DIGEST_ENV, image)
     config = {
         "recipe_id": recipe_id,
-        "recipe_version": RECIPE_VERSION,
+        "recipe_version": runtime.STRATEGY_RESEARCH_V36_TARGET_RECIPE_VERSION,
         "transparent_baseline_bootstrap": {
             runtime.TRANSPARENT_BASELINE_RUNNER_FIELD: (
-                runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+                runtime.STRATEGY_RESEARCH_V36_TARGET_RUNNER_SHA256
             ),
             runtime.TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: (
-                runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+                runtime.STRATEGY_RESEARCH_V36_TARGET_RUNTIME_BUNDLE_SHA256
             ),
             runtime.TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: image,
         },
     }
+    before = deepcopy(config)
     payload = runtime.bind_transparent_baseline_job_identity(config=config, job_payload={})
-    runner_path = ROOT / "scripts/run_multifactor_backtest.py"
-    assert runtime.require_transparent_baseline_runner(
-        config=config, job_payload=payload, runner_path=runner_path
-    ) == runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
-    with monkeypatch.context() as changed:
-        changed.setattr(runtime, "_file_sha256", lambda _path: "0" * 64)
-        with pytest.raises(ValueError, match="transparent v36 runner bytes differ"):
-            runtime.require_transparent_baseline_runner(
-                config=config, job_payload=payload, runner_path=runner_path
-            )
-    with monkeypatch.context() as changed:
-        changed.setattr(runtime, "position_risk_bundle_sha256", lambda _root: "0" * 64)
-        with pytest.raises(ValueError, match="transparent v36 runtime bundle differs"):
-            runtime.require_transparent_baseline_runner(
-                config=config, job_payload=payload, runner_path=runner_path
-            )
-    payload[runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = "sha256:" + "2" * 64
-    with pytest.raises(ValueError, match="transparent v36 worker runtime image differs"):
+    expected_payload = {
+        runtime.TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+            runtime.STRATEGY_RESEARCH_V36_TARGET_RUNNER_SHA256
+        ),
+        runtime.TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+            runtime.STRATEGY_RESEARCH_V36_TARGET_RUNTIME_BUNDLE_SHA256
+        ),
+        runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: image,
+    }
+    # Same script bytes cannot authorize execution under a different imported source seal.
+    with pytest.raises(ValueError, match="transparent v36 runtime bundle differs"):
         runtime.require_transparent_baseline_runner(
-            config=config, job_payload=payload, runner_path=runner_path
+            config=config, job_payload=payload,
+            runner_path=ROOT / "scripts/run_multifactor_backtest.py",
         )
+    assert config == before
+    assert payload == expected_payload
 
 
 def test_v36_seal_normalization_keeps_economic_source_changes_visible() -> None:
