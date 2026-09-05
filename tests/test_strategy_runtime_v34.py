@@ -92,9 +92,17 @@ def test_v34_job_binding_preserves_old_seals_and_rejects_current_bundle(
         runtime.TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: image,
     }
 
-    # The runner is unchanged, so only the source-closure guard can reject v35.
-    assert runner_sha256 == runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+    # New runtime code cannot execute a job frozen against the historical runner.
+    assert runner_sha256 != runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
     assert bundle_sha256 != runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+    with pytest.raises(ValueError, match="transparent v34 runner bytes differ"):
+        runtime.require_transparent_baseline_runner(
+            config=config,
+            job_payload=payload,
+            runner_path=ROOT / "scripts/run_multifactor_backtest.py",
+        )
+    # Independently exercise the historical closure guard with matching runner bytes.
+    monkeypatch.setattr(runtime, "_file_sha256", lambda _path: runner_sha256)
     monkeypatch.setattr(
         runtime,
         "position_risk_bundle_sha256",

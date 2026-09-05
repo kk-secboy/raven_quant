@@ -48,6 +48,7 @@ _RUNNER_SEAL_ASSIGNMENT = re.compile(
     r"STRATEGY_RESEARCH_V26|STRATEGY_RESEARCH_V27|STRATEGY_RESEARCH_V28|"
     r"STRATEGY_RESEARCH_V29|STRATEGY_RESEARCH_V30|STRATEGY_RESEARCH_V31|"
     r"STRATEGY_RESEARCH_V32|STRATEGY_RESEARCH_V33|STRATEGY_RESEARCH_V34|"
+    r"STRATEGY_RESEARCH_V35|"
     r"STRATEGY_RESEARCH)_TARGET_"
     r"(?:RUNNER|RUNTIME_BUNDLE)_SHA256\s*=\s*\(\s*)"
     r'"[0-9a-f]{64}"(\s*\))'
@@ -77,6 +78,7 @@ _DATABASE_RUNTIME_IDENTITY_CONSTRAINTS = (
     "ck_strategy_versions_v33_runtime_identity",
     "ck_strategy_versions_v34_runtime_identity",
     "ck_strategy_versions_v35_runtime_identity",
+    "ck_strategy_versions_v36_runtime_identity",
 )
 _DYNAMIC_IMPORT_CALLS = frozenset(
     {
@@ -338,7 +340,7 @@ def _normalized_seal_payload(relative: str, source: str) -> bytes:
             lambda match: f'{match.group(1)}"<sealed-at-release>"{match.group(2)}',
             source,
         )
-        if replacements != 46:
+        if replacements != 48:
             raise ValueError("transparent runner seal constants cannot be normalized")
     elif relative == "src/quant_data/database.py":
         for constraint in _DATABASE_RUNTIME_IDENTITY_CONSTRAINTS:

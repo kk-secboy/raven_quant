@@ -5,10 +5,10 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v17, the narrowly scoped v18 consumed-history rehabilitation, and v20-v34
-# remain historical identities. v35 seals daily convertible-bond rating
-# refreshes into the complete governed research-to-paper economic closure.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-05-v35"
+# v17, the narrowly scoped v18 consumed-history rehabilitation, and v20-v35
+# remain historical identities. v36 seals prepared point-in-time lookups
+# without changing input selection, trading rules, costs, or OOS boundaries.
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-06-v36"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
