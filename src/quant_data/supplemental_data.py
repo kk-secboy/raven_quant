@@ -1637,17 +1637,9 @@ def market_financial_specs(
                     )
                 )
         for symbol in sorted({str(value).strip() for value in symbols if str(value).strip()}):
-            params = {
-                "ts_code": symbol,
-                "start_date": compact_date(start),
-                "end_date": compact_date(end),
-            }
             specs.append(
-                _spec(
-                    "us_fina_indicator",
-                    "us_fina_indicator",
-                    params,
-                    scope={**params, "row_limit": 200},
+                _report_period_history_spec(
+                    "us_fina_indicator", symbol, end=end,
                     max_attempts=max_attempts,
                 )
             )
@@ -1661,21 +1653,37 @@ def market_financial_specs(
     specs: list[FetchSpec] = []
     for symbol in sorted({str(value).strip() for value in symbols if str(value).strip()}):
         for dataset in endpoints:
-            params = {
-                "ts_code": symbol,
-                "start_date": compact_date(start),
-                "end_date": compact_date(end),
-            }
             specs.append(
-                _spec(
-                    dataset,
-                    dataset,
-                    params,
-                    scope={**params, "row_limit": 10_000},
+                _report_period_history_spec(
+                    dataset, symbol, end=end,
                     max_attempts=max_attempts,
                 )
             )
     return specs
+
+
+def _report_period_history_spec(
+    dataset: str, symbol: str, *, end: date, max_attempts: int
+) -> FetchSpec:
+    # These endpoints filter accounting periods, not announcement dates. No
+    # documented maximum disclosure/revision lag justifies a lower bound, and
+    # nonstandard fiscal calendars rule out a fixed set of calendar quarters.
+    # end_date changes the request key each as-of day; the marker also prevents
+    # legacy narrow-window successes from standing in for this full refresh.
+    # Acquisition does not create announcement dates or relax PIT availability.
+    params = {"ts_code": symbol, "end_date": compact_date(end)}
+    return _spec(
+        dataset, dataset, params,
+        scope={
+            **params,
+            "report_period_query": "all-history-through-as-of-v1",
+            "as_of": end.isoformat(),
+            # Indicator docs mention both 200 and 10000. The smaller documented
+            # ceiling must fail closed instead of accepting possible truncation.
+            "row_limit": 200 if dataset.endswith("fina_indicator") else 10_000,
+        },
+        max_attempts=max_attempts,
+    )
 
 
 def _global_market_specs(start: date, end: date, max_attempts: int) -> list[FetchSpec]:

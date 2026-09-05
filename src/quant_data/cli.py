@@ -393,6 +393,7 @@ def _run_paginated_specs(
     if not specs:
         return [], [], 0
     specs, inserted = _activate_stk_surv_plan(context, specs)
+    _supersede_legacy_report_period_windows(context, specs)
     specs = _rehydrate_durable_pagination_specs(context, specs)
     datasets = {spec.dataset for spec in specs}
     ignored_keys: set[str] = set()
@@ -486,6 +487,49 @@ _RANGE_REUSE_DATASETS = {
     "cyq_perf",
     "cyq_chips",
 }
+
+
+def _supersede_legacy_report_period_windows(context: Context, specs: list[FetchSpec]) -> None:
+    """Retire obsolete narrow queries only after their exact replacement is durable."""
+
+    datasets = {
+        "hk_income", "hk_balancesheet", "hk_cashflow", "hk_fina_indicator", "us_fina_indicator",
+    }
+    replacements = {
+        (spec.dataset, spec.api_name, spec.params["ts_code"], spec.params["end_date"]): spec
+        for spec in specs
+        if spec.dataset in datasets
+        and spec.api_name == spec.dataset
+        and spec.scope.get("report_period_query") == "all-history-through-as-of-v1"
+        and set(spec.params) == {"ts_code", "end_date"}
+        and not spec.fields
+    }
+    if not replacements:
+        return
+    replacement_keys = {spec.unit_key for spec in replacements.values()}
+    durable_keys = {
+        str(row["unit_key"])
+        for row in context.checkpoint.unit_rows(replacement_keys)
+        if str(row.get("status") or "") in {"pending", "running", "failed", "succeeded"}
+    }
+    if durable_keys != replacement_keys:
+        raise RuntimeError("missing active durable report-period replacement; refusing retirement")
+
+    obsolete = []
+    target_datasets = {spec.dataset for spec in replacements.values()}
+    for row in context.checkpoint.unfinished_units(target_datasets):
+        params = dict(row.get("params_json") or {})
+        if set(params) != {"ts_code", "start_date", "end_date"}:
+            continue
+        identity = (row["dataset"], row["api_name"], params["ts_code"], params["end_date"])
+        if identity in replacements:
+            obsolete.append(str(row["unit_key"]))
+    # Successful files/rows remain immutable. An old request for another symbol,
+    # as-of date, endpoint, or parameter shape is outside this plan's authority.
+    context.checkpoint.supersede_units(
+        obsolete,
+        "legacy report-period window superseded by durable all-history-through-as-of-v1 request",
+    )
 
 
 def _activate_stk_surv_plan(
