@@ -51,6 +51,7 @@ _REASONS = {
     "identity_conflict": "任务身份与已有记录冲突，未创建重复执行。",
     "data_validation_failed": "输入数据或回测窗口未通过校验，本次执行未完成。",
     "capacity_validation_failed": "交易容量约束校验未通过，本次执行未完成。",
+    "lot_validation_failed": "持仓数量与交易整手约束无法匹配，本次执行未完成。",
     "runtime_validation_failed": "运行环境或代码身份未通过校验，本次执行未完成。",
     "execution_failed": "本次执行未完成；详细诊断保留在受限审计记录中。",
     "gate_not_passed": "本次研究未通过准入检查，具体结论以审计记录为准。",
@@ -68,6 +69,8 @@ def _failure_code(error: Any) -> str:
         return "resource_exhausted"
     if "idempotency key is already bound to a different job payload" in value:
         return "identity_conflict"
+    if re.search(r"\bno feasible whole-lot target within capacity and direction:", value):
+        return "lot_validation_failed"
     if re.search(
         r"\bpost-discretization hard constraint violation:\s*capacity_trade_value\b", value
     ):

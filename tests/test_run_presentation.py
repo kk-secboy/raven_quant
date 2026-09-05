@@ -43,6 +43,10 @@ pytestmark = pytest.mark.no_database
             "post-discretization hard constraint violation: capacity_trade_value[SZ000878]",
             "capacity_validation_failed",
         ),
+        (
+            "no feasible whole-lot target within capacity and direction: SZ002308",
+            "lot_validation_failed",
+        ),
         ("point-in-time styles have no valid rows", "data_validation_failed"),
         ("point-in-time value missing rate exceeds 5%", "data_validation_failed"),
         ("governed signal has no eligible trading dates", "data_validation_failed"),
@@ -70,6 +74,8 @@ def test_failure_reason_is_fixed_and_never_echoes_private_error(error, code):
     assert presented["safe_reason"]
     if code == "capacity_validation_failed":
         assert presented["safe_reason"] == "交易容量约束校验未通过，本次执行未完成。"
+    if code == "lot_validation_failed":
+        assert presented["safe_reason"] == "持仓数量与交易整手约束无法匹配，本次执行未完成。"
     assert record == before
     public_text = json.dumps(presented)
     for private in ("password", "example.test", "private", "Authorization", "secret", error):
@@ -102,6 +108,8 @@ def test_active_retry_does_not_display_previous_attempt_failure():
     "capacity trade value is low", "capacity_trade_value budget is available",
     "post-discretization hard constraint violation: max_position",
     "post-discretization hard constraint violation: capacity_trade_value_extra",
+    "whole-lot target within capacity and direction is feasible",
+    "no feasible whole-lot target within capacity and directional preference",
 ])
 def test_informational_terms_and_exit_code_do_not_claim_a_specific_failure(error):
     assert run_presentation({"status": "failed", "error": error})[
