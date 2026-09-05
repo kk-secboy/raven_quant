@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--open-cost", type=float, default=0.0005)
     parser.add_argument("--close-cost", type=float, default=0.0015)
     parser.add_argument("--min-cost", type=float, default=5.0)
-    return parser.parse_args()
+    parser.add_argument(
+        "--num-kernels",
+        type=int,
+        default=os.environ.get("QUANTLAB_QLIB_KERNELS", "1") or "1",
+    )
+    args = parser.parse_args()
+    if not 1 <= args.num_kernels <= 64:
+        parser.error("--num-kernels must be between 1 and 64")
+    return args
 
 
 def finite(value: Any) -> float | None:
@@ -91,7 +100,7 @@ def main() -> None:
                 return
         shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=False)
-    qlib.init(provider_uri=str(provider_uri), region=REG_CN)
+    qlib.init(provider_uri=str(provider_uri), region=REG_CN, kernels=args.num_kernels)
     calendar = list(pd.to_datetime(D.calendar(freq="day")))
     if len(calendar) < 180:
         raise RuntimeError(

@@ -156,6 +156,8 @@ def qlib_baseline_command(
             str(payload["close_cost"]),
             "--min-cost",
             str(payload["min_cost"]),
+            "--num-kernels",
+            os.environ.get("QUANTLAB_QLIB_KERNELS", "1") or "1",
         ]
     )
     return (
