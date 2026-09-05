@@ -130,6 +130,14 @@ def test_migrated_v38_check_rejects_incomplete_or_mismatched_identity(
             runtime.STRATEGY_RESEARCH_V37_TARGET_RUNTIME_BUNDLE_SHA256
         )
         cases.append(("old v37 bundle", old_bundle, "sealed_final_oos"))
+        unaccepted_candidate = deepcopy(valid)
+        unaccepted_candidate["transparent_baseline_bootstrap"].update({
+            "target_runner_sha256":
+                "48f241a9d03f63a87a54413f77b37577443a49285a28774716a4567382545c45",
+            "target_runtime_bundle_sha256":
+                "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7",
+        })
+        cases.append(("unaccepted v38 candidate", unaccepted_candidate, "sealed_final_oos"))
         wrong_runner = deepcopy(valid)
         wrong_runner["transparent_baseline_bootstrap"]["target_runner_sha256"] = "0" * 64
         cases.append(("wrong SHA256 runner", wrong_runner, "sealed_final_oos"))

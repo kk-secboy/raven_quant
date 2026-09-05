@@ -771,6 +771,39 @@ class _PreparedQlibCrossSections:
         return pd.to_numeric(snapshot, errors="coerce").astype(float)
 
 
+class _PreparedQlibFactorHistory:
+    """Keep past-only account conversion factors separate from quote availability.
+
+    A held adjusted position survives a missing quote. Its latest known positive
+    factor can still convert its stored amount and valuation into matching share
+    equivalents. This history never supplies an open/close or makes it tradable.
+    """
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        factors = pd.to_numeric(frame["$factor"], errors="coerce").copy()
+        dates = pd.to_datetime(frame.index.get_level_values("datetime")).tz_localize(None)
+        if dates.isna().any():
+            raise ValueError("Qlib factor history has an unknown observation time")
+        factors.index = pd.MultiIndex.from_arrays(
+            [dates, frame.index.get_level_values("instrument").astype(str)],
+            names=["datetime", "instrument"],
+        )
+        # Unstack rejects duplicate observations. Preserve the provider's
+        # float32 storage; only returned cross sections are converted to float.
+        factors = factors.where(np.isfinite(factors) & factors.gt(0))
+        self._values = factors.unstack("instrument").sort_index().ffill()
+
+    def lookup(self, when: pd.Timestamp, instruments: pd.Index) -> pd.Series:
+        if pd.isna(when):
+            raise ValueError("Qlib factor lookup has an unknown signal time")
+        dates = self._values.index
+        available = dates[dates.slice_indexer(end=when)]
+        if available.empty:
+            return pd.Series(np.nan, index=instruments.astype(str), name="$factor", dtype=float)
+        snapshot = self._values.loc[available[-1]].reindex(instruments.astype(str))
+        return snapshot.astype(float).rename("$factor")
+
+
 def _portfolio_return_covariance(
     strategy_config: dict[str, Any],
     close_matrix: pd.DataFrame,
@@ -831,6 +864,7 @@ def _metadata_provider(
     membership["out_date"] = pd.to_datetime(membership["out_date"], errors="coerce")
     close_matrix = close_history["$close"].unstack("instrument").sort_index()
     execution_lookup = _PreparedQlibCrossSections(execution_metadata)
+    factor_lookup = _PreparedQlibFactorHistory(execution_metadata)
     risk_lookup = PreparedPointInTimeRiskStates(eligibility_matrix)
     price_lookup = (
         _PreparedQlibCrossSections(intraday_prices)
@@ -952,9 +986,7 @@ def _metadata_provider(
             "qlib_factors": (
                 pd.Series(1.0, index=instruments.astype(str))
                 if execution_quantity_mode == "minute_raw"
-                else execution_lookup.lookup(market_timestamp, "$factor").reindex(
-                    instruments.astype(str)
-                )
+                else factor_lookup.lookup(market_timestamp, instruments)
             ),
             # $amount is CNY yuan under the v3 daily field contract.
             "average_daily_values": average_daily_values,

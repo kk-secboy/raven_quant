@@ -275,3 +275,44 @@ def test_v38_migration_only_adds_and_removes_its_own_constraint(
             "schema": "quantlab", "type_": "check",
         }),
     ]
+
+
+@pytest.mark.parametrize(
+    "recipe_id", ["short_relative_strength", "swing_trend", "long_quality_value"],
+)
+def test_resealed_v38_rejects_the_unaccepted_candidate_without_mutating_its_binding(
+    monkeypatch: pytest.MonkeyPatch, recipe_id: str,
+) -> None:
+    # Candidate 113ac7e was used only in an isolated IS diagnostic; preserve its
+    # identity as evidence and reject it under the corrected pre-release seal.
+    candidate_runner = "48f241a9d03f63a87a54413f77b37577443a49285a28774716a4567382545c45"
+    candidate_bundle = "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7"
+    image = "sha256:" + "1" * 64
+    monkeypatch.setenv(runtime.WORKER_RUNTIME_IMAGE_DIGEST_ENV, image)
+    config = {
+        "recipe_id": recipe_id, "recipe_version": RECIPE_VERSION,
+        "transparent_baseline_bootstrap": {
+            runtime.TRANSPARENT_BASELINE_RUNNER_FIELD: candidate_runner,
+            runtime.TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: candidate_bundle,
+            runtime.TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: image,
+        },
+    }
+    payload = {
+        runtime.TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: candidate_runner,
+        runtime.TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: candidate_bundle,
+        runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: image,
+    }
+    before = deepcopy((config, payload))
+    with pytest.raises(ValueError, match="bootstrap runtime identity is invalid"):
+        runtime.bind_transparent_baseline_job_identity(config=config, job_payload=payload)
+    assert (config, payload) == before
+    current = deepcopy(config)
+    current["transparent_baseline_bootstrap"].update({
+        runtime.TRANSPARENT_BASELINE_RUNNER_FIELD: runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
+        runtime.TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: (
+            runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+        ),
+    })
+    with pytest.raises(ValueError, match="job runtime identity changed"):
+        runtime.bind_transparent_baseline_job_identity(config=current, job_payload=payload)
+    assert (config, payload) == before

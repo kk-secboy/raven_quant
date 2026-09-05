@@ -318,12 +318,12 @@ STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
     "qlib-rdagent-single-mainline-2026-09-06-v38"
 )
 STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
-    "48f241a9d03f63a87a54413f77b37577443a49285a28774716a4567382545c45"
+    "59f2552f6c8eb5b13600a4785aa019ef9cfe045798114533b792a2731bb3d43a"
 )
 # Filled after the complete v38 source closure is stable. The source-closure
 # normalizer excludes both v38 seal assignments from their own digest.
 STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7"
+    "00b2b471dea7783256b88dcd370ad29a1b48815183c495684c8534e61bfe2689"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"

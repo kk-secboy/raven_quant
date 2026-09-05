@@ -18,9 +18,9 @@ depends_on: str | Sequence[str] | None = None
 SCHEMA = "quantlab"
 CONSTRAINT = "ck_strategy_versions_v38_runtime_identity"
 RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-06-v38"
-RUNNER_SHA256 = "48f241a9d03f63a87a54413f77b37577443a49285a28774716a4567382545c45"
+RUNNER_SHA256 = "59f2552f6c8eb5b13600a4785aa019ef9cfe045798114533b792a2731bb3d43a"
 RUNTIME_BUNDLE_SHA256 = (
-    "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7"
+    "00b2b471dea7783256b88dcd370ad29a1b48815183c495684c8534e61bfe2689"
 )
 
 
