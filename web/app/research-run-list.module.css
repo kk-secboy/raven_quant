@@ -1,0 +1,39 @@
+.section { margin: 18px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--line); }
+.heading h2 { font-size: 18px; margin: 0; }
+.heading p { color: var(--muted); font-size: 12px; margin: 5px 0 0; line-height: 1.6; }
+.toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.freshness { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 22px; color: var(--muted); background: #f6faf7; font-size: 12px; line-height: 1.6; }
+.warning { color: #875718; background: #fff7e7; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; padding: 17px 22px; border-bottom: 1px solid var(--line); }
+.body { min-width: 0; }
+.body h3 { margin: 0; font-size: 13px; line-height: 1.7; font-weight: 650; }
+.metadata { display: flex; gap: 6px 14px; flex-wrap: wrap; font-size: 11px; color: var(--muted); line-height: 1.7; margin-top: 6px; }
+.metadata code { font-size: 11px; color: #526c61; overflow-wrap: anywhere; }
+.phase { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: #254c3c; line-height: 1.6; }
+.phase small { color: var(--muted); font-size: 11px; }
+.reason { margin: 9px 0 0; color: #745326; font-size: 12px; line-height: 1.7; }
+.actions { display: flex; flex-direction: column; gap: 12px; align-items: flex-end; justify-content: center; }
+.badge { border-radius: 6px; padding: 4px 9px; font-size: 12px; line-height: 1.5; font-weight: 600; white-space: nowrap; }
+.active { color: #146644; background: #e4f3ea; }
+.success { color: #276a4f; background: #edf6ef; }
+.danger { color: #9d3f3c; background: #fcefed; }
+.warningBadge { color: #85601f; background: #fbf1dc; }
+.muted { color: #65716b; background: #eff2ef; }
+.empty { padding: 24px 22px; color: var(--muted); font-size: 13px; line-height: 1.8; }
+.historySummary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 22px; cursor: pointer; }
+.historySummary h2 { display: inline; font-size: 18px; }
+.historySummary p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.historySummary::after { content: "展开历史"; color: #397357; font-size: 12px; white-space: nowrap; }
+.history[open] > .historySummary::after { content: "收起历史"; }
+.pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 22px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.pagination div { display: flex; gap: 12px; }
+.auditTime { padding: 10px 22px 0; margin: 0; color: var(--muted); font-size: 11px; }
+@media (max-width: 720px) {
+  .heading { align-items: flex-start; flex-direction: column; }
+  .toolbar { width: 100%; justify-content: space-between; }
+  .row { grid-template-columns: minmax(0, 1fr); }
+  .actions { flex-direction: row; align-items: center; justify-content: space-between; }
+  .freshness, .pagination { flex-wrap: wrap; }
+}

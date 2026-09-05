@@ -66,6 +66,9 @@ export const jobKindText: Record<string, string> = {
   data_snapshot: "构建不可变快照",
   data_qlib: "构建 Qlib 数据集",
   qlib_baseline: "Qlib 基线研究",
+  rdagent_run: "研究提案生成",
+  parameter_experiment: "策略参数回测与验证",
+  strategy_backtest: "策略正式回测",
   margin_eligibility_download: "融券资格历史",
   core_intraday_download: "核心资产 1 分钟线",
   ashare_5m_download: "全 A 股 5 分钟线",
@@ -92,6 +95,11 @@ const bundleText: Record<string, string> = {
 
 export function jobDisplayName(job: Pick<DataJob, "kind" | "payload">) {
   const payload = job.payload ?? {};
+  const bundle = typeof payload.bundle === "string" ? payload.bundle
+    : job.kind.startsWith("supplemental_") ? job.kind.slice("supplemental_".length) : "";
+  // Several market downloads share one snapshot name. Show the actual task first.
+  if (bundleText[bundle]) return bundleText[bundle];
+  if (jobKindText[job.kind]) return jobKindText[job.kind];
   if (typeof payload.output_name === "string" && payload.output_name) return payload.output_name;
   if (typeof payload.snapshot_name === "string" && payload.snapshot_name) return payload.snapshot_name;
   if (typeof payload.bundle === "string" && payload.bundle) {

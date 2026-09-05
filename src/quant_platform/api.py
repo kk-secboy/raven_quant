@@ -167,6 +167,12 @@ from .research_report_backfill import ResearchReportBackfillStore
 from .research_store import ResearchStore
 from .research_tournament import ResearchTournamentStore
 from .retention import DataRetentionManager
+from .run_presentation import (
+    PRESENTATION_PAYLOAD_KEYS,
+    RunPresentationStore,
+    public_linked_execution,
+    run_presentation,
+)
 from .runtime_secret_store import RuntimeSecretStore
 from .safe_mode import SafeModeStore
 from .schedule_store import ScheduleStore, validate_intraday_run_time
@@ -880,10 +886,14 @@ def _sanitize_public_value(value: Any) -> Any:
     return value
 
 
-def _public_rdagent_run(run: dict[str, Any]) -> dict[str, Any]:
+def _public_rdagent_run(
+    run: dict[str, Any], *, linked_job: dict[str, Any] | None = None
+) -> dict[str, Any]:
     result = _sanitize_public_value(dict(run))
     result["error"] = "research run failed" if run.get("error") else None
     result["scenario"] = scenario_from_research_run(result)
+    result["presentation"] = run_presentation(run, linked_job=linked_job, research=True)
+    result["linked_execution"] = public_linked_execution(linked_job)
     return result
 
 
@@ -1083,6 +1093,7 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
             outcome_message = "评估程序已完成，但没有候选通过独立模型门禁。"
     result["outcome_status"] = outcome_status
     result["outcome_message"] = outcome_message
+    result["presentation"] = run_presentation(job)
     if job.get("error"):
         result["error"] = "job execution failed"
     else:
@@ -2117,6 +2128,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     jobs = JobStore(settings.database_url)
     data_tasks = DataTaskStore(settings.database_url)
     research = ResearchStore(settings.database_url)
+    run_presentations = RunPresentationStore(research.engine, settings.data_root)
     factor_library = FactorLibraryStore(research.engine)
     rdagent_candidates = RDAGentCandidateStore(settings.database_url)
     research_assets = ResearchAssetStore(settings.database_url)
@@ -4147,8 +4159,19 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         return _sanitize_public_value(result)
 
     @app.get("/api/rdagent/runs")
-    def list_research_runs(limit: int = Query(50, ge=1, le=200)) -> list[dict]:
-        return [_public_rdagent_run(item) for item in research.list_runs(limit)]
+    def list_research_runs(
+        response: Response,
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=100_000),
+        status_group: Literal["active", "history"] | None = None,
+    ) -> list[dict]:
+        runs, total = run_presentations.list_runs(
+            limit=limit, offset=offset, status_group=status_group
+        )
+        linked = run_presentations.linked_executions(runs)
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+        return [_public_rdagent_run(item, linked_job=linked.get(item["id"])) for item in runs]
 
     @app.get("/api/rdagent/runs/{run_id}")
     def get_research_run(run_id: str) -> dict:
@@ -4167,7 +4190,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             run_artifacts=list(audit.get("run_artifacts") or []),
         )
         run["asset_consumptions"] = research_assets.list_consumptions(research_run_id=run_id)
-        return _public_rdagent_run(run)
+        linked = run_presentations.linked_executions([run])
+        return _public_rdagent_run(run, linked_job=linked.get(run_id))
 
     @app.post("/api/rdagent/runs/{run_id}/model-validation", status_code=202)
     def validate_general_model_implementation(
@@ -6121,21 +6145,19 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         kinds = tuple(item for item in (kind or []) if item.strip())
         response.headers["X-Total-Count"] = str(jobs.count(statuses=statuses, kinds=kinds))
         response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
-        return [
-            _public_job(item)
-            for item in jobs.list(
-                limit,
-                offset=offset,
-                statuses=statuses,
-                kinds=kinds,
-                payload_keys=tuple(sorted(_PUBLIC_JOB_PAYLOAD_KEYS)),
-                progress_keys=tuple(
-                    sorted(_PUBLIC_JOB_PROGRESS_KEYS | {"resource_blocked_count"})
-                ),
-                progress_evaluation_statuses=_MODEL_OUTCOME_EVALUATION_STATUSES,
-                progress_evaluation_kind="model_evaluate",
-            )
-        ]
+        rows = jobs.list(
+            limit,
+            offset=offset,
+            statuses=statuses,
+            kinds=kinds,
+            payload_keys=tuple(sorted(_PUBLIC_JOB_PAYLOAD_KEYS | PRESENTATION_PAYLOAD_KEYS)),
+            progress_keys=tuple(
+                sorted(_PUBLIC_JOB_PROGRESS_KEYS | {"resource_blocked_count"})
+            ),
+            progress_evaluation_statuses=_MODEL_OUTCOME_EVALUATION_STATUSES,
+            progress_evaluation_kind="model_evaluate",
+        )
+        return [_public_job(item) for item in run_presentations.with_progress(rows)]
 
     @app.get("/api/data-tasks")
     def list_data_tasks() -> list[dict]:
@@ -6144,17 +6166,18 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
         try:
-            return _public_job(
-                jobs.get(
-                    job_id,
-                    payload_keys=tuple(sorted(_PUBLIC_JOB_PAYLOAD_KEYS)),
-                    progress_keys=tuple(
-                        sorted(_PUBLIC_JOB_PROGRESS_KEYS | {"resource_blocked_count"})
-                    ),
-                    progress_evaluation_statuses=_MODEL_OUTCOME_EVALUATION_STATUSES,
-                    progress_evaluation_kind="model_evaluate",
-                )
+            row = jobs.get(
+                job_id,
+                payload_keys=tuple(
+                    sorted(_PUBLIC_JOB_PAYLOAD_KEYS | PRESENTATION_PAYLOAD_KEYS)
+                ),
+                progress_keys=tuple(
+                    sorted(_PUBLIC_JOB_PROGRESS_KEYS | {"resource_blocked_count"})
+                ),
+                progress_evaluation_statuses=_MODEL_OUTCOME_EVALUATION_STATUSES,
+                progress_evaluation_kind="model_evaluate",
             )
+            return _public_job(run_presentations.with_progress([row])[0])
         except KeyError as exc:
             raise HTTPException(404, "job not found") from exc
 

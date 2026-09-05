@@ -1,10 +1,11 @@
 "use client";
 
-import { CSSProperties, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { CSSProperties, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch } from "./api-client";
 import { BacktestPanel } from "./backtest-panel";
 import { DataTask, DataTaskCenter } from "./data-task-center";
 import { phaseLabel, targetText } from "./data-progress";
+import { dataReadinessView } from "./data-overview-status.mjs";
 import { AuthPanel, AuthState } from "./auth-panel";
 import { AutopilotPanel } from "./autopilot-panel";
 import { FactorLibraryPanel } from "./factor-library-panel";
@@ -73,11 +74,11 @@ const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8765";
 const navGroups = [
   { label: "日常运行", items: [{ index: 0, label: "策略运行总览" }, { index: 11, label: "行情总览" }, { index: 8, label: "统一模拟盘" }] },
   { label: "研究治理", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究中心" }, { index: 5, label: "因子库与准入" }, { index: 2, label: "模型竞赛与试验" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }] },
-  { label: "审计与系统", items: [{ index: 9, label: "任务、告警与历史" }, { index: 10, label: "系统设置" }] },
+  { label: "审计与系统", items: [{ index: 9, label: "任务与历史" }, { index: 10, label: "系统设置" }] },
 ];
 const simpleNavGroups = [
   { label: "日常使用", items: [{ index: 0, label: "今日建议" }, { index: 11, label: "行情总览" }, { index: 8, label: "模拟账本" }] },
-  { label: "需要处理", items: [{ index: 9, label: "异常" }] },
+  { label: "运行状态", items: [{ index: 9, label: "任务与历史" }] },
 ];
 const headings: Record<number, [string, string]> = {
   0: ["QUANTLAB / AUTOPILOT", "自动驾驶"],
@@ -87,7 +88,7 @@ const headings: Record<number, [string, string]> = {
   5: ["FACTOR GOVERNANCE / REGISTRY", "因子库与准入"],
   6: ["QLIB BACKTEST / RISK APPROVAL", "Qlib 回测与审批"],
   8: ["APPROVED SOURCES / DURABLE LEDGER", "统一模拟盘"],
-  9: ["AUTOMATION / ALERTS / AUDIT", "任务、告警与历史"],
+  9: ["EXECUTION / AUDIT", "任务与历史"],
   10: ["SERVER CONFIGURATION / ENCRYPTED", "系统设置"],
   11: ["MARKET INTELLIGENCE / RESEARCH SNAPSHOT", "行情总览"],
   12: ["CORE SATELLITE / RISK BUDGET", "核心 / 卫星分配"],
@@ -128,6 +129,9 @@ export default function Home() {
   const [downloadStart, setDownloadStart] = useState("2016-01-01");
   const [snapshotStart, setSnapshotStart] = useState("2008-01-01");
   const [message, setMessage] = useState("");
+  const [dataSyncError, setDataSyncError] = useState("");
+  const [dataUpdatedAt, setDataUpdatedAt] = useState<string | null>(null);
+  const dataRequestVersion = useRef(0);
 
   function navigateTo(index: number) {
     setMessage("");
@@ -147,6 +151,7 @@ export default function Home() {
   }, []);
 
   const refresh = useCallback(async (forceRefresh = false) => {
+    const version = ++dataRequestVersion.current;
     const [overviewResult, datasetsResult, dataTasksResult] = await Promise.allSettled([
       apiFetch(`${API}/api/overview`, { cache: "no-store", forceRefresh }).then(async (response) => {
         if (!response.ok) throw new Error("overview unavailable");
@@ -161,11 +166,16 @@ export default function Home() {
         return response.json() as Promise<DataTask[]>;
       }),
     ]);
+    if (version !== dataRequestVersion.current) return;
     let loaded = 0;
-    if (overviewResult.status === "fulfilled") { setOverview(overviewResult.value); loaded += 1; }
+    if (overviewResult.status === "fulfilled") {
+      setOverview(overviewResult.value);
+      setDataUpdatedAt(new Date().toISOString());
+      loaded += 1;
+    }
     if (datasetsResult.status === "fulfilled") { setDatasets(datasetsResult.value); loaded += 1; }
     if (dataTasksResult.status === "fulfilled") { setDataTasks(dataTasksResult.value); loaded += 1; }
-    setMessage(loaded === 0 ? "暂时无法连接数据服务。" : loaded < 3 ? "部分数据正在恢复，已先展示可用内容。" : "");
+    setDataSyncError(loaded === 0 ? "数据刷新失败，当前保留上次状态；任务是否仍在执行需等待重新连接。" : loaded < 3 ? "部分数据刷新失败，相应区域保留上次读取结果。" : "");
     setLoading(false);
   }, []);
 
@@ -305,6 +315,8 @@ export default function Home() {
     await loadRetention();
   }
 
+  const dataReadiness = dataReadinessView(overview, { loading, refreshFailed: Boolean(dataSyncError) });
+
   if (!auth) return <main className="auth-shell"><div className="auth-loading">正在检查安全会话…</div></main>;
   if (!["authenticated", "disabled"].includes(auth.status)) {
     return <AuthPanel api={API} state={auth} onAuthenticated={checkAuth} />;
@@ -335,7 +347,7 @@ export default function Home() {
         </button>
         <div className="sidebar-foot">
           <span className={overview?.credentials_configured ? "pulse ok" : "pulse"} />
-          <div><strong>受控研究模式</strong><small>{overview?.credentials_configured ? "数据源已配置" : "等待 Tushare 凭据"}</small></div>
+          <div><strong>受控研究模式</strong><small>{overview ? overview.credentials_configured ? "数据源已配置" : "数据源尚未配置" : "数据源状态待读取"}</small></div>
         </div>
       </aside>
 
@@ -349,14 +361,16 @@ export default function Home() {
 
         {activeNav === 0 ? <AutopilotPanel api={API} advancedMode={advancedMode} onNavigate={navigateTo} onOpenAdvanced={(index) => { setAdvancedMode(true); navigateTo(index); }} /> : activeNav === 1 ? (
           <div className="data-center-page">
+            <p role="status">{dataUpdatedAt ? `数据概况更新：${new Date(dataUpdatedAt).toLocaleString("zh-CN")}` : "正在读取数据概况…"}</p>
+            {dataSyncError ? <div className="notice" role="alert">{dataSyncError}</div> : null}
             <div className="page-tabs" role="tablist" aria-label="数据中心页面">
               {[['overview', '运行概况'], ['catalog', '数据目录'], ['create', '新建任务'], ['runs', '运行记录'], ['storage', '存储与版本']].map(([value, label]) => <button role="tab" aria-selected={dataView === value} className={dataView === value ? "active" : ""} onClick={() => setDataView(value)} key={value}>{label}{value === "runs" && overview?.active_jobs ? <i>{overview.active_jobs}</i> : null}</button>)}
             </div>
 
             {dataView === "overview" ? <>
               <section className="readiness-hero">
-                <div className="readiness-copy"><span className="status-chip">{loading ? "正在连接" : overview?.active_jobs ? "下载器正在工作" : (overview?.partial_tasks || overview?.waiting_tasks) ? "仍有数据能力待准备" : "数据能力已就绪"}</span><h2>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项数据能力已完全可用</h2><p>圆环是全部目录覆盖率的平均值，部分完成的目录也会计入；分数是完全可用的目录数量。它们都不代表单个下载任务的执行进度，当前阶段与 checkpoint 在下方单独展示。</p></div>
-                <div className="readiness-ring" style={{ "--progress": `${overview?.readiness_percent ?? 0}%` } as CSSProperties}><strong>{overview?.readiness_percent ?? 0}%</strong><span>平均目录覆盖度</span></div>
+                <div className="readiness-copy"><span className="status-chip">{dataReadiness.label}</span><h2>{overview ? `${overview.ready_tasks} / ${overview.actionable_tasks} 项数据能力已完全可用` : "数据能力状态待读取"}</h2><p>圆环是全部目录覆盖率的平均值，部分完成的目录也会计入；分数是完全可用的目录数量。它们都不代表单个下载任务的执行进度，当前阶段与 checkpoint 在下方单独展示。</p></div>
+                <div className="readiness-ring" style={{ "--progress": `${overview?.readiness_percent ?? 0}%` } as CSSProperties}><strong>{overview ? `${overview.readiness_percent}%` : "—"}</strong><span>平均目录覆盖度</span></div>
               </section>
               <section className="status-strip">
                 <article><span>正在运行</span><strong>{overview?.running_tasks ?? 0}</strong></article>

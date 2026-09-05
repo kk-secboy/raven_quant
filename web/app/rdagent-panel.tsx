@@ -2,6 +2,16 @@
 
 import { FormEvent, useMemo, useRef, useState } from "react";
 import { apiFetch } from "./api-client";
+import {
+  failedResearchPage,
+  isActiveResearchRun,
+  readResearchPage,
+  receivedResearchPage,
+  researchRefreshMessage,
+  researchRunView,
+  researchTime,
+} from "./research-run-presentation.mjs";
+import runStyles from "./research-run-list.module.css";
 import { usePolling } from "./use-polling";
 
 type ScenarioId =
@@ -182,6 +192,7 @@ type AssetLink = {
 
 type ResearchRun = {
   id: string;
+  job_id?: string | null;
   kind?: string;
   scenario?: ScenarioId;
   objective: string;
@@ -191,7 +202,24 @@ type ResearchRun = {
   runtime?: { rounds?: number; candidates?: number; model_candidates?: number; quant_bundles?: number; lab_status?: string } | null;
   created_at: string;
   error?: string | null;
+  presentation?: Parameters<typeof researchRunView>[0]["presentation"];
+  linked_execution?: Parameters<typeof researchRunView>[0]["linked_execution"];
+  finished_at?: string | null;
 };
+
+type ResearchRunPage = {
+  rows: ResearchRun[];
+  total: number;
+  page: number;
+  state: string;
+  updatedAt: string | null;
+};
+
+const emptyRunPage = (): ResearchRunPage => ({
+  rows: [], total: 0, page: 0, state: "loading", updatedAt: null,
+});
+const ACTIVE_RUN_PAGE_SIZE = 100;
+const HISTORY_RUN_PAGE_SIZE = 20;
 
 type TraceLoop = {
   loop_id: number;
@@ -251,9 +279,9 @@ type StrategyRecipe = {
 };
 
 const fallbackScenarios: Scenario[] = [
-  { id: "fin_quant", label: "联合研究", description: "把因子集与预测模型作为完整组合迭代", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: true, gpu_required: false },
-  { id: "fin_strategy", label: "策略规则研究", description: "按长中短周期研究入场、退出、持有与风控规则", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: false, gpu_required: false },
-  { id: "fin_factor_report", label: "研报因子", description: "从已验证研报 PDF 中提取因子", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: true, capital_eligible: true, gpu_required: false },
+  { id: "fin_quant", label: "联合研究", description: "把因子集与预测模型作为完整组合迭代", category: "quant", ready: false, blockers: ["运行时状态尚未确认"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: true, gpu_required: false },
+  { id: "fin_strategy", label: "策略规则研究", description: "按长中短周期研究入场、退出、持有与风控规则", category: "quant", ready: false, blockers: ["运行时状态尚未确认"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: false, gpu_required: false },
+  { id: "fin_factor_report", label: "研报因子", description: "从已验证研报 PDF 中提取因子", category: "quant", ready: false, blockers: ["运行时状态尚未确认"], requires_dataset: true, requires_assets: true, capital_eligible: true, gpu_required: false },
 ];
 
 const statusText: Record<string, string> = {
@@ -303,6 +331,12 @@ function RunAudit({
   const generalModelArtifacts = detail.run_artifacts?.filter((artifact) => artifact.artifact_type === "general_model_implementation_code" && artifact.status === "recorded") ?? [];
   return <div className="run-audit">
     <div className="audit-summary">
+      <span>研究 <code>{detail.id}</code></span>
+      <span>原始审计状态 <code>{detail.status}</code></span>
+      <span>输入 {detail.dataset ?? "资料输入"}</span>
+      <span>预算 {detail.budget?.loop_n ?? 0} 轮 · {detail.budget?.duration ?? "外层超时"}</span>
+      {detail.job_id && <span>初始任务 <code>{detail.job_id}</code></span>}
+      {detail.linked_execution && <span>关联执行 <code>{detail.linked_execution.job_id}</code></span>}
       {detail.runtime?.lab_status && <span>实验状态 {detail.runtime.lab_status}</span>}
       <span>资料 {detail.assets?.length ?? 0}</span>
       <span>自动消费 {detail.asset_consumptions?.length ?? 0}</span>
@@ -349,7 +383,13 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [runtime, setRuntime] = useState<Runtime | null>(null);
   const [scenarios, setScenarios] = useState<Scenario[]>(fallbackScenarios);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
-  const [runs, setRuns] = useState<ResearchRun[]>([]);
+  const [activeRuns, setActiveRuns] = useState<ResearchRunPage>(emptyRunPage);
+  const [historicalRuns, setHistoricalRuns] = useState<ResearchRunPage>(emptyRunPage);
+  const [recentRuns, setRecentRuns] = useState<ResearchRunPage>(emptyRunPage);
+  const [activeRunPage, setActiveRunPage] = useState(0);
+  const [historicalRunPage, setHistoricalRunPage] = useState(0);
+  const [runsRefreshing, setRunsRefreshing] = useState(false);
+  const runsRequestInFlight = useRef(false);
   const [schedules, setSchedules] = useState<ResearchSchedule[]>([]);
   const [recipes, setRecipes] = useState<StrategyRecipe[]>([]);
   const [featureSets, setFeatureSets] = useState<FeatureSet[]>([]);
@@ -374,9 +414,39 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [runtimeLoadState, setRuntimeLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [datasetsLoadState, setDatasetsLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [openRunId, setOpenRunId] = useState<string | null>(null);
+  const [openRunLocation, setOpenRunLocation] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<ResearchRunDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailUpdatedAt, setDetailUpdatedAt] = useState<string | null>(null);
+  const openRunRef = useRef<string | null>(null);
   const recipeApplied = useRef(false);
+
+  async function loadRunPages(activePage = activeRunPage, historyPage = historicalRunPage) {
+    if (runsRequestInFlight.current) return;
+    runsRequestInFlight.current = true;
+    setRunsRefreshing(true);
+    async function fetchPage(group: "active" | "history", page: number, limit: number) {
+      const params = new URLSearchParams({ status_group: group, limit: String(limit), offset: String(page * limit) });
+      const response = await apiFetch(`${api}/api/rdagent/runs?${params}`, { cache: "no-store", forceRefresh: true });
+      return readResearchPage(response, group, page);
+    }
+    try {
+      await Promise.allSettled([
+        fetchPage("active", activePage, ACTIVE_RUN_PAGE_SIZE)
+          .then((result) => setActiveRuns((previous) => receivedResearchPage(previous, result, new Date().toISOString())))
+          .catch(() => setActiveRuns(failedResearchPage)),
+        fetchPage("history", historyPage, HISTORY_RUN_PAGE_SIZE)
+          .then((result) => setHistoricalRuns((previous) => receivedResearchPage(previous, result, new Date().toISOString())))
+          .catch(() => setHistoricalRuns(failedResearchPage)),
+        fetchPage("history", 0, 3)
+          .then((result) => setRecentRuns((previous) => receivedResearchPage(previous, result, new Date().toISOString())))
+          .catch(() => setRecentRuns(failedResearchPage)),
+      ]);
+    } finally {
+      runsRequestInFlight.current = false;
+      setRunsRefreshing(false);
+    }
+  }
 
   async function load() {
     const requests = [
@@ -404,7 +474,7 @@ export function RDAgentPanel({ api }: { api: string }) {
             : eligibleDatasets[0]?.name ?? "",
         );
       }),
-      jsonResponse<ResearchRun[]>(apiFetch(`${api}/api/rdagent/runs`, { cache: "no-store" })).then(setRuns),
+      loadRunPages(),
       jsonResponse<{ recipes: StrategyRecipe[] }>(apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" })).then((recipeBody) => {
         setRecipes(recipeBody.recipes);
       if (!recipeApplied.current) {
@@ -458,8 +528,8 @@ export function RDAgentPanel({ api }: { api: string }) {
       ),
   );
   const activeScenario = useMemo(
-    () => runs.some((item) => (item.scenario ?? item.kind) === scenarioId && ["queued", "running", "exporting", "evaluating"].includes(item.status)),
-    [runs, scenarioId],
+    () => activeRuns.rows.some((item) => (item.scenario ?? item.kind) === scenarioId && isActiveResearchRun(item)),
+    [activeRuns.rows, scenarioId],
   );
   const selectedRecipe = recipes.find((item) => item.id === recipeId);
   const parsedAssetIds = assetIds.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
@@ -597,19 +667,27 @@ export function RDAgentPanel({ api }: { api: string }) {
     }
   }
 
-  async function toggleRunDetail(runId: string) {
-    if (openRunId === runId) { setOpenRunId(null); setRunDetail(null); return; }
+  async function toggleRunDetail(runId: string, location: string) {
+    if (openRunId === runId && openRunLocation === location) {
+      openRunRef.current = null; setOpenRunId(null); setOpenRunLocation(null); setRunDetail(null); return;
+    }
+    openRunRef.current = runId;
     setOpenRunId(runId);
+    setOpenRunLocation(location);
     setRunDetail(null);
+    setDetailUpdatedAt(null);
     setDetailLoading(true);
     try {
-      const response = await apiFetch(`${api}/api/rdagent/runs/${runId}`, { cache: "no-store" });
+      const response = await apiFetch(`${api}/api/rdagent/runs/${runId}`, { cache: "no-store", forceRefresh: true });
       if (!response.ok) throw new Error("读取运行详情失败");
-      setRunDetail(await response.json());
+      const detail = await response.json() as ResearchRunDetail;
+      if (openRunRef.current !== runId) return;
+      setRunDetail(detail);
+      setDetailUpdatedAt(new Date().toISOString());
     } catch {
-      setMessage("无法读取该运行的安全审计详情。");
+      if (openRunRef.current === runId) setMessage("无法读取该运行的安全审计详情。");
     } finally {
-      setDetailLoading(false);
+      if (openRunRef.current === runId) setDetailLoading(false);
     }
   }
 
@@ -633,17 +711,112 @@ export function RDAgentPanel({ api }: { api: string }) {
     }
   }
 
+  function changeRunPage(group: "active" | "history", page: number) {
+    if (runsRequestInFlight.current) return;
+    if (group === "active") {
+      setActiveRunPage(page);
+      void loadRunPages(page, historicalRunPage);
+    } else {
+      setHistoricalRunPage(page);
+      void loadRunPages(activeRunPage, page);
+    }
+  }
+
+  function renderRunPagination(page: ResearchRunPage, group: "active" | "history", limit: number) {
+    const pages = Math.max(1, Math.ceil(page.total / limit));
+    if (pages <= 1 && page.page === 0) return null;
+    return <div className={runStyles.pagination}>
+      <span>{page.state === "ready" ? "" : "上次读取："}第 {page.page + 1} 页 · 共 {page.total} 条</span>
+      <div>
+        <button className="inline-action" type="button" disabled={runsRefreshing || page.page === 0} onClick={() => changeRunPage(group, Math.max(0, page.page - 1))}>上一页</button>
+        <button className="inline-action" type="button" disabled={runsRefreshing || page.page + 1 >= pages} onClick={() => changeRunPage(group, page.page + 1)}>下一页</button>
+      </div>
+    </div>;
+  }
+
+  function renderResearchRuns(page: ResearchRunPage, historical: boolean, recent = false) {
+    const location = recent ? "recent" : historical ? "history" : "current";
+    return page.rows.map((item) => {
+      const view = researchRunView(item, { historical, stale: page.state !== "ready" });
+      const tone = view.tone === "warning" ? runStyles.warningBadge : runStyles[view.tone];
+      const candidates = (item.runtime?.candidates ?? 0) + (item.runtime?.model_candidates ?? 0) + (item.runtime?.quant_bundles ?? 0);
+      const auditOpen = openRunId === item.id && openRunLocation === location;
+      return <div key={item.id} data-research-run-id={item.id}>
+        <article className={runStyles.row}>
+          <div className={runStyles.body}>
+            <h3>{item.objective}</h3>
+            <div className={runStyles.metadata}>
+              <span>研究 <code title={item.id}>{item.id.slice(0, 10)}</code></span>
+              <span>{item.scenario ?? item.kind ?? "fin_factor"}</span>
+              <span>创建于 {view.createdAt}</span>
+              {(historical || recent) && <span>结束于 {view.finishedAt}</span>}
+              <span>{candidates} 个候选</span>
+            </div>
+            <div className={runStyles.phase}>
+              <span>{historical || recent ? "结束阶段" : page.state === "ready" ? "当前阶段" : "上次阶段"}：{view.phaseLabel}</span>
+              {view.jobId && <small>执行任务 <code title={view.jobId}>{view.jobId.slice(0, 10)}</code></small>}
+              {item.linked_execution?.updated_at && <small>执行记录更新于 {view.phaseUpdatedAt}</small>}
+            </div>
+            {view.safeReason && <p className={runStyles.reason}>{view.safeReason}</p>}
+          </div>
+          <div className={runStyles.actions}>
+            <span className={`${runStyles.badge} ${tone}`}>{view.label}</span>
+            <button className="inline-action" type="button" onClick={() => toggleRunDetail(item.id, location)}>{auditOpen ? "收起审计" : "查看审计"}</button>
+          </div>
+        </article>
+        {auditOpen && (detailLoading
+          ? <div className={runStyles.empty}>正在读取安全审计证据…</div>
+          : runDetail?.id === item.id ? <>
+            <p className={runStyles.auditTime}>审计读取于 {researchTime(detailUpdatedAt)} · 原始状态与历史证据完整保留</p>
+            <RunAudit detail={runDetail} validationTarget={`${dataset || "未选择数据集"} / ${featureSetId || "未选择特征集"}`} onValidateGeneralModel={queueGeneralModelValidation} />
+          </> : <div className={runStyles.empty}>审计读取失败，可收起后重新读取。</div>)}
+      </div>;
+    });
+  }
+
   const governedResearchPath = selectedScenario.capital_eligible || selectedScenario.id === "fin_strategy";
   const governedNextStage = selectedScenario.id === "fin_strategy" ? "规则竞赛 / 隔离模拟盘" : selectedScenario.capital_eligible ? "受治理候选 / 策略评估" : "实验室归档";
-  const submitBlocked = !runtimeOperational || !selectedScenario.ready || !coverageReady || !featureSetReady || activeScenario || objective.length < 10 || (requiresResearchHorizon && !researchHorizon) || (explicitAssetsRequired && parsedAssetIds.length === 0);
+  const submitBlocked = !runtimeOperational || !selectedScenario.ready || !coverageReady || !featureSetReady || activeScenario || activeRuns.state !== "ready" || objective.length < 10 || (requiresResearchHorizon && !researchHorizon) || (explicitAssetsRequired && parsedAssetIds.length === 0);
 
   return <>
     {message && <div className="notice">{message}</div>}
 
+    <section className={runStyles.section} aria-labelledby="current-research-heading">
+      <div className={runStyles.heading}>
+        <div><h2 id="current-research-heading">当前研究</h2><p>展示当前研究及其实际执行阶段，历史记录保留在页面下方。</p></div>
+        <div className={runStyles.toolbar}>
+          <span className={runStyles.count}>{activeRuns.state === "ready" ? `${activeRuns.total} 项研究` : "当前状态待确认"}</span>
+          <button className="inline-action" type="button" disabled={runsRefreshing} onClick={() => void loadRunPages()}>{runsRefreshing ? "刷新中…" : "刷新研究状态"}</button>
+        </div>
+      </div>
+      <div className={`${runStyles.freshness} ${["error", "stale"].includes(activeRuns.state) ? runStyles.warning : ""}`} role="status">
+        <span>{researchRefreshMessage(activeRuns)}</span><span>页面可见时每 8 秒更新</span>
+      </div>
+      {renderResearchRuns(activeRuns, false)}
+      {!activeRuns.rows.length && <div className={runStyles.empty}>{activeRuns.state === "ready"
+        ? activeRuns.total ? "本页已无当前研究，可返回上一页查看。" : "当前没有排队或运行中的研究。"
+        : activeRuns.state === "loading" ? "正在读取当前研究…" : "当前研究读取失败，请刷新后确认。"}</div>}
+      {renderRunPagination(activeRuns, "active", ACTIVE_RUN_PAGE_SIZE)}
+    </section>
+
+    <section className={runStyles.section} aria-labelledby="recent-research-heading">
+      <div className={runStyles.heading}>
+        <div><h2 id="recent-research-heading">最近研究结果</h2><p>最近结束的研究持续保留在这里，全部记录可在下方历史审计中查看。</p></div>
+        <span className={runStyles.count}>{recentRuns.state === "ready" ? `最近 ${recentRuns.rows.length} 条` : "最近结果待确认"}</span>
+      </div>
+      <div className={`${runStyles.freshness} ${["error", "stale"].includes(recentRuns.state) ? runStyles.warning : ""}`} role="status">
+        <span>{researchRefreshMessage(recentRuns)}</span>
+        <button className="inline-action" type="button" disabled={runsRefreshing} onClick={() => void loadRunPages()}>刷新最近结果</button>
+      </div>
+      {renderResearchRuns(recentRuns, false, true)}
+      {!recentRuns.rows.length && <div className={runStyles.empty}>{recentRuns.state === "ready"
+        ? "尚无已结束的研究。" : recentRuns.state === "loading" ? "正在读取最近结果…" : "最近结果读取失败，请刷新后确认。"}</div>}
+    </section>
+
     <section className="scenario-panel">
       <div className="panel-heading"><div><p className="eyebrow">RD-AGENT RESEARCH CENTER</p><h2>选择研究场景</h2></div><button className="inline-action" type="button" onClick={runHealthCheck}>运行环境诊断</button></div>
       <div className="scenario-grid">{scenarios.map((item) => <button type="button" key={item.id} className={`scenario-card ${scenarioId === item.id ? "selected" : ""}`} onClick={() => { setScenarioId(item.id); setResearchHorizon(""); setAssetIds(""); }}>
-        <span>{item.category === "quant" ? "量化主线" : "研究实验室"}</span><strong>{item.label}</strong><small>{item.description}</small><em className={runtimeLoadState === "loading" || runtimeUnknown ? "checking" : runtimeOperational && item.ready ? "ready" : "blocked"}>{runtimeLoadState === "loading" ? "正在检查" : runtimeUnknown ? "正在恢复" : runtimeOperational && item.ready ? "可运行" : "能力未满足"}</em>
+        <span>{item.category === "quant" ? "量化主线" : "研究实验室"}</span><strong>{item.label}</strong><small>{item.description}</small><em className={runtimeLoadState === "loading" || runtimeUnknown ? "checking" : runtimeOperational && item.ready ? "ready" : "blocked"}>{runtimeLoadState === "loading" ? "正在检查" : runtimeUnknown ? "状态未知" : runtimeOperational && item.ready ? "可运行" : "能力未满足"}</em>
       </button>)}</div>
     </section>
 
@@ -671,11 +844,11 @@ export function RDAgentPanel({ api }: { api: string }) {
 
     <section className="agent-hero">
       <article className="runtime-card">
-        <div className="card-heading"><div><span>{selectedScenario.id}</span><strong>{selectedScenario.label}</strong></div><span className={`status-chip ${runtimeOperational && selectedScenario.ready ? "verified" : ""}`}>{runtimeLoadState === "loading" ? "检查中" : runtimeUnknown ? "正在恢复" : runtimeOperational && selectedScenario.ready ? "可运行" : "已阻断"}</span></div>
+        <div className="card-heading"><div><span>{selectedScenario.id}</span><strong>{selectedScenario.label}</strong></div><span className={`status-chip ${runtimeOperational && selectedScenario.ready ? "verified" : ""}`}>{runtimeLoadState === "loading" ? "检查中" : runtimeUnknown ? "状态未知" : runtimeOperational && selectedScenario.ready ? "可运行" : "已阻断"}</span></div>
         <div className="preflight-list">
-          <div><i className={runtimeLoadState === "loading" ? "pending" : runtimeStatusOk ? "pass" : "block"} /><span>RD-Agent</span><strong>{runtimeLoadState === "loading" ? "检查中" : runtimeStatusOk ? runtime?.version ?? "状态正常" : "状态未知 · 正在恢复"}</strong></div>
-          <div><i className={runtimeLoadState === "loading" || !runtimeStatusOk || typeof runtime?.docker_available !== "boolean" ? "pending" : runtime?.docker_available ? "pass" : "block"} /><span>隔离执行</span><strong>{runtimeLoadState === "loading" ? "检查中" : !runtimeStatusOk || typeof runtime?.docker_available !== "boolean" ? "状态未知 · 正在恢复" : runtime?.docker_available ? "Docker 可用" : "隔离执行未就绪"}</strong></div>
-          <div><i className={runtimeLoadState === "loading" || !runtimeStatusOk || typeof runtime?.llm_credentials_configured !== "boolean" ? "pending" : runtime?.llm_credentials_configured ? "pass" : "block"} /><span>LLM 凭据</span><strong>{runtimeLoadState === "loading" ? "检查中" : !runtimeStatusOk || typeof runtime?.llm_credentials_configured !== "boolean" ? "状态未知 · 正在恢复" : runtime?.llm_credentials_configured ? "已配置" : "凭据尚未就绪"}</strong></div>
+          <div><i className={runtimeLoadState === "loading" ? "pending" : runtimeStatusOk ? "pass" : "block"} /><span>RD-Agent</span><strong>{runtimeLoadState === "loading" ? "检查中" : runtimeStatusOk ? runtime?.version ?? "状态正常" : "状态未知"}</strong></div>
+          <div><i className={runtimeLoadState === "loading" || !runtimeStatusOk || typeof runtime?.docker_available !== "boolean" ? "pending" : runtime?.docker_available ? "pass" : "block"} /><span>隔离执行</span><strong>{runtimeLoadState === "loading" ? "检查中" : !runtimeStatusOk || typeof runtime?.docker_available !== "boolean" ? "状态未知" : runtime?.docker_available ? "Docker 可用" : "隔离执行未就绪"}</strong></div>
+          <div><i className={runtimeLoadState === "loading" || !runtimeStatusOk || typeof runtime?.llm_credentials_configured !== "boolean" ? "pending" : runtime?.llm_credentials_configured ? "pass" : "block"} /><span>LLM 凭据</span><strong>{runtimeLoadState === "loading" ? "检查中" : !runtimeStatusOk || typeof runtime?.llm_credentials_configured !== "boolean" ? "状态未知" : runtime?.llm_credentials_configured ? "已配置" : "凭据尚未就绪"}</strong></div>
           <div><i className={!selectedScenario.requires_dataset ? "pass" : datasetsLoadState === "loading" ? "pending" : datasetsLoadState === "error" ? "block" : coverageReady ? "pass" : "block"} /><span>输入契约</span><strong>{!selectedScenario.requires_dataset ? "无需行情数据" : datasetsLoadState === "loading" ? "正在读取" : datasetsLoadState === "error" ? "读取失败" : coverageReady ? "满足" : "数据覆盖不足"}</strong></div>
         </div>
         {selectedScenario.blockers.length ? <div className="blocker-box"><b>当前阻断</b>{selectedScenario.blockers.map((item) => <span key={item}>{item}</span>)}</div> : null}
@@ -705,16 +878,25 @@ export function RDAgentPanel({ api }: { api: string }) {
     </section>
 
     <details className="research-automation">
-      <summary><span>自动研究计划</span><strong>{schedules.filter((item) => item.status === "active").length} 个运行中</strong></summary>
+      <summary><span>自动研究计划</span><strong>{schedules.filter((item) => item.status === "active").length} 个已启用计划</strong></summary>
       <div className="research-automation-body">
-        <form onSubmit={createResearchSchedule}><p>按当前场景和输入契约定时入队；缺少权限、GPU、PDF 或数据时安全阻断。</p><label>计划名称<input value={scheduleName} minLength={3} maxLength={150} onChange={(event) => setScheduleName(event.target.value)} /></label><label>运行时间<input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} /></label><button className="secondary-action" disabled={submitBlocked}>保存并启用</button></form>
+        <form onSubmit={createResearchSchedule}><p>已启用计划将在预定时间入队，实际运行见上方“当前研究”。按当前场景和输入契约定时入队；缺少权限、GPU、PDF 或数据时安全阻断。</p><label>计划名称<input value={scheduleName} minLength={3} maxLength={150} onChange={(event) => setScheduleName(event.target.value)} /></label><label>运行时间<input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} /></label><button className="secondary-action" disabled={submitBlocked}>保存并启用</button></form>
         <div className="research-schedule-list">{schedules.map((item) => <article key={item.id}><div><strong>{item.name}</strong><small>{String(item.payload.scenario ?? "fin_factor")} · {item.run_time} · 下次 {new Date(item.next_run_at).toLocaleString("zh-CN", { hour12: false })}</small></div><span className={`state ${item.status === "active" ? "ready" : "partial"}`}>{item.status}</span><button className="inline-action" type="button" onClick={() => toggleResearchSchedule(item)}>{item.desired_status === "active" ? "暂停" : "恢复"}</button></article>)}{!schedules.length && <div className="empty compact">尚未启用自动研究。</div>}</div>
       </div>
     </details>
 
-    <section className="jobs-panel">
-      <div className="panel-heading"><div><p className="eyebrow">RESEARCH RUNS / TRACE</p><h2>统一运行与安全审计记录</h2></div><span>{runs.length} 条记录</span></div>
-      <div className="research-run-list">{runs.map((item) => <div className="research-run-entry" key={item.id}><article><span className={`job-state ${item.status}`} /><div><strong>{item.objective}</strong><small>{item.scenario ?? item.kind ?? "fin_factor"} · {item.dataset ?? "资料输入"} · {item.budget.loop_n ?? 0} 轮 · {item.budget.duration ?? "外层超时"}</small>{item.error && <small>{item.error}</small>}</div><div className="run-count"><strong>{(item.runtime?.candidates ?? 0) + (item.runtime?.model_candidates ?? 0) + (item.runtime?.quant_bundles ?? 0)}</strong><small>候选</small></div><code>{item.id.slice(0, 10)}</code><span>{statusText[item.status] ?? item.status}</span><button className="inline-action" type="button" onClick={() => toggleRunDetail(item.id)}>{openRunId === item.id ? "收起审计" : "查看审计"}</button></article>{openRunId === item.id && (detailLoading ? <div className="empty compact">正在读取安全审计证据…</div> : runDetail ? <RunAudit detail={runDetail} validationTarget={`${dataset || "未选择数据集"} / ${featureSetId || "未选择特征集"}`} onValidateGeneralModel={queueGeneralModelValidation} /> : null)}</div>)}{!runs.length && <div className="empty compact">尚无 RD-Agent 研究运行。</div>}</div>
-    </section>
+    <details className={`${runStyles.section} ${runStyles.history}`}>
+      <summary className={runStyles.historySummary}>
+        <div><h2>历史研究与安全审计</h2><p>完成、失败和中止均按原始记录保留。{historicalRuns.state === "ready" ? `共 ${historicalRuns.total} 条历史记录。` : "历史数量待确认。"}</p></div>
+      </summary>
+      <div className={`${runStyles.freshness} ${["error", "stale"].includes(historicalRuns.state) ? runStyles.warning : ""}`} role="status">
+        <span>{researchRefreshMessage(historicalRuns)}</span>
+        <button className="inline-action" type="button" disabled={runsRefreshing} onClick={() => void loadRunPages()}>刷新历史</button>
+      </div>
+      {renderResearchRuns(historicalRuns, true)}
+      {!historicalRuns.rows.length && <div className={runStyles.empty}>{historicalRuns.state === "ready"
+        ? "本页没有历史研究记录。" : historicalRuns.state === "loading" ? "正在读取历史研究…" : "历史记录读取失败，请刷新后重试。"}</div>}
+      {renderRunPagination(historicalRuns, "history", HISTORY_RUN_PAGE_SIZE)}
+    </details>
   </>;
 }

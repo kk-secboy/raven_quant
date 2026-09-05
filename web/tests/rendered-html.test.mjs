@@ -250,7 +250,9 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["rdagent-panel.tsx"], /general_model/);
   assert.match(sourceByName["rdagent-panel.tsx"], /data_science/);
   assert.match(sourceByName["rdagent-panel.tsx"], /llm_finetune/);
-  assert.match(sourceByName["rdagent-panel.tsx"], /状态未知 · 正在恢复/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /runtimeUnknown \? "状态未知"/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /运行时状态尚未确认/);
+  assert.doesNotMatch(sourceByName["rdagent-panel.tsx"], /正在恢复|正在读取运行时状态/);
   assert.match(sourceByName["rdagent-panel.tsx"], /!runtimeOperational \|\| !selectedScenario\.ready/);
   assert.doesNotMatch(sourceByName["rdagent-panel.tsx"], /Docker 不可用|LLM 未配置/);
   const backtest = sourceByName["backtest-panel.tsx"];
@@ -297,10 +299,10 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(globalCss, /market-skeleton-pulse/);
   assert.match(globalCss, /prefers-reduced-motion:reduce/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
-  assert.match(sourceByName["job-run-center.tsx"], /同一流水线的旧失败/);
-  assert.match(sourceByName["job-run-center.tsx"], /后续已成功/);
-  assert.match(sourceByName["job-run-center.tsx"], /已重试，后续运行中/);
-  assert.match(sourceByName["job-run-center.tsx"], /pipeline_id/);
+  assert.match(sourceByName["job-run-center.tsx"], /历史条数不是当前故障数/);
+  assert.match(sourceByName["job-run-center.tsx"], /后续任务已成功/);
+  assert.match(sourceByName["job-run-center.tsx"], /后续任务运行中/);
+  assert.match(sourceByName["job-run-center.tsx"], /retry_successor/);
   assert.match(sourceByName["page.tsx"], /平均目录覆盖度/);
   assert.match(sourceByName["page.tsx"], /成功 checkpoint/);
   assert.match(sourceByName["page.tsx"], /running_work_units/);

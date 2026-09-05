@@ -294,6 +294,40 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         assert obsolete not in specification
 
 
+def test_run_status_presentation_keeps_audit_evidence_and_financial_permissions() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    reliability = specification.partition("### 11.2 任务可靠性")[2].partition(
+        "### 11.3 最小安全"
+    )[0]
+    for contract in (
+        "当前运行与历史记录必须分区展示",
+        "最近结束的研究结果须保持可见并按结束时间排序",
+        "执行中已有试验失败时，页面须同时说明仍在执行和已有失败",
+        "进度文件更新时间不能冒充执行心跳",
+        "刷新失败时保留记录并明确标注“上次状态”",
+        "上次成功读取时间",
+        "公开失败原因只使用固定原因码和固定安全文案",
+        "不能直接展示原始异常、路径、命令、URI 或凭据",
+        "有明确中止请求或所属任务取消证据时",
+        "不得改写数据库的历史 `failed/cancelled` 状态",
+        "研究与执行任务只按持久化的任务 ID 和所属研究 ID 关联",
+        "不能按名称、描述或全局最新任务猜测关联",
+        "子任务成功不等于整条研究完成",
+        "展示投影不得修改金融权限、准入结果、运行时身份或 OOS 消费记录",
+    ):
+        assert contract in reliability
+
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    for contract in (
+        "当前运行与历史记录分开显示",
+        "刷新失败时显示“上次状态”与上次成功读取时间",
+        "维护中止保留原始审计状态",
+        "固定安全原因",
+        "不改变金融权限、运行时身份或 OOS 边界",
+    ):
+        assert contract in readme
+
+
 def test_design_status_and_four_correctness_lines_do_not_overclaim_implementation() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
     header = specification.partition("## 1. 产品目标与边界")[0]

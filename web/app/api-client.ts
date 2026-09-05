@@ -181,7 +181,7 @@ async function requestPayload(
   init: RequestInit,
   timeoutMs: number,
   key: string,
-  policy: CachePolicy,
+  policy: CachePolicy | null,
 ) {
   const generation = cacheGeneration;
   const response = await fetchWithTimeout(input, init, timeoutMs);
@@ -194,7 +194,9 @@ async function requestPayload(
     statusText: response.statusText,
     storedAt: Date.now(),
   };
-  if (response.ok && generation === cacheGeneration) storeCached(key, payload, policy.persist);
+  if (response.ok && policy && generation === cacheGeneration) {
+    storeCached(key, payload, policy.persist);
+  }
   return payload;
 }
 
@@ -203,7 +205,7 @@ function networkGet(
   init: RequestInit,
   timeoutMs: number,
   key: string,
-  policy: CachePolicy,
+  policy: CachePolicy | null,
 ) {
   const existing = inflightGets.get(key);
   if (existing) return existing;
@@ -244,6 +246,13 @@ export function apiFetch(input: RequestInfo | URL, init: ApiRequestInit = {}) {
   }
 
   const key = requestKey(input);
+  const requestCache = requestInit.cache ?? (input instanceof Request ? input.cache : undefined);
+  if (requestCache === "no-store") {
+    // A live-state request must not revive persisted history or hide a failed refresh.
+    // Concurrent callers can share the network request without storing its response.
+    return networkGet(input, requestInit, timeoutMs, `no-store:${key}`, null)
+      .then((payload) => responseFromCache(payload, "network"));
+  }
   const policy = cachePolicy(key);
   if (!policy) return fetchWithTimeout(input, requestInit, timeoutMs);
 
@@ -260,7 +269,9 @@ export function apiFetch(input: RequestInfo | URL, init: ApiRequestInit = {}) {
   return networkGet(input, requestInit, timeoutMs, key, policy)
     .then((payload) => responseFromCache(payload, "network"))
     .catch((error) => {
-      if (cached && age <= policy.staleMs) return responseFromCache(cached, "stale");
+      if (!forceRefresh && cached && age <= policy.staleMs) {
+        return responseFromCache(cached, "stale");
+      }
       throw error;
     });
 }
