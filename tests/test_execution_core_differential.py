@@ -499,10 +499,10 @@ def test_registered_d3_t_plus_one_enforcement_layer() -> None:
     assert order["reject_reason"] == "t_plus_one_unavailable"
 
 
-def test_registered_d4_buy_cash_limit_model_and_rounding_epsilon() -> None:
+def test_d4_cash_clipping_cannot_be_undone_by_lot_rounding() -> None:
     # Cash check on the Qlib adapter uses the flat conservative cost ratio and
-    # qlib's +0.1 rounding epsilon; the sim chain iterates the exact shared
-    # cost model and shrinks to an affordable lot.
+    # the sim chain iterates the exact shared cost model. Their affordability
+    # models still differ, but neither may round above its cash-clipped bound.
     position = make_position(cash=1_004.0)
     qlib = _run_qlib(
         [_raw_row()],
@@ -514,15 +514,8 @@ def test_registered_d4_buy_cash_limit_model_and_rounding_epsilon() -> None:
         cash=1_004.0,
     )
 
-    assert qlib["filled_quantity"] == 100  # 99.9 affordable rounds up to 100
-    expected = _cost_book().as_of(TRADE_DATE).estimate(
-        side="buy",
-        gross_value=100 * 10.0,
-        participation=100 / 2_000_000,
-        asset_type="stock",
-        trade_date=TRADE_DATE,
-    )
-    assert qlib["cost"] == pytest.approx(expected)
+    assert qlib["filled_quantity"] == 0  # 99.9 affordable cannot form a 100-share order.
+    assert qlib["cost"] == 0
     assert _sim_order(sim)["filled_quantity"] == 0  # exact model: 1,005.58 > cash
 
 

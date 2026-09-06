@@ -865,7 +865,12 @@ def run_signal_decay_suite(
     metric: str,
     minimum_retention: float,
 ) -> dict[str, Any]:
-    """Rerun delayed execution and derive the last supported signal delay."""
+    """Rerun delayed execution and derive the last supported signal delay.
+
+    A finite nonpositive zero-delay result is valid rejection evidence. Retention
+    is undefined against that baseline, so no delay can establish a supported
+    frontier. Missing/non-finite metrics remain execution/data errors.
+    """
 
     normalized = sorted({int(item) for item in delays})
     if not normalized or normalized[0] != 0 or any(item < 0 for item in normalized):
@@ -882,15 +887,15 @@ def run_signal_decay_suite(
         value = float(value)
         if base is None:
             base = value
-            if base <= 0:
-                raise ValueError("zero-delay signal metric must be positive")
-        retention = value / base
+        retention = value / base if base > 0 else None
         runs.append(
             {
                 "delay_bars": delay,
                 "metrics": metrics,
                 "retention": retention,
-                "passed": retention >= minimum_retention and value > 0,
+                "passed": (
+                    retention is not None and retention >= minimum_retention and value > 0
+                ),
             }
         )
     contiguous: list[int] = []
@@ -898,7 +903,7 @@ def run_signal_decay_suite(
         if not item["passed"]:
             break
         contiguous.append(int(item["delay_bars"]))
-    return {
+    result = {
         "status": "completed",
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
         "metric": metric,
@@ -910,3 +915,6 @@ def run_signal_decay_suite(
         "maximum_supported_delay_bars": max(contiguous) if contiguous else None,
         "runs": runs,
     }
+    if base is not None and base <= 0:
+        result["reason_code"] = "nonpositive_zero_delay_metric"
+    return result

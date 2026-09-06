@@ -280,13 +280,22 @@ def test_v38_migration_only_adds_and_removes_its_own_constraint(
 @pytest.mark.parametrize(
     "recipe_id", ["short_relative_strength", "swing_trend", "long_quality_value"],
 )
+@pytest.mark.parametrize("candidate_runner,candidate_bundle", [
+    (
+        "48f241a9d03f63a87a54413f77b37577443a49285a28774716a4567382545c45",
+        "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7",
+    ),
+    (
+        "59f2552f6c8eb5b13600a4785aa019ef9cfe045798114533b792a2731bb3d43a",
+        "00b2b471dea7783256b88dcd370ad29a1b48815183c495684c8534e61bfe2689",
+    ),
+], ids=["113ac7e", "c8353aa"])
 def test_resealed_v38_rejects_the_unaccepted_candidate_without_mutating_its_binding(
     monkeypatch: pytest.MonkeyPatch, recipe_id: str,
+    candidate_runner: str, candidate_bundle: str,
 ) -> None:
-    # Candidate 113ac7e was used only in an isolated IS diagnostic; preserve its
-    # identity as evidence and reject it under the corrected pre-release seal.
-    candidate_runner = "48f241a9d03f63a87a54413f77b37577443a49285a28774716a4567382545c45"
-    candidate_bundle = "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7"
+    # Both candidates were private IS diagnostics. Preserve their bindings as
+    # evidence and reject them under the corrected pre-release seal.
     image = "sha256:" + "1" * 64
     monkeypatch.setenv(runtime.WORKER_RUNTIME_IMAGE_DIGEST_ENV, image)
     config = {

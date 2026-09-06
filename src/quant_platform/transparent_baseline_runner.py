@@ -323,7 +323,7 @@ STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
 # Filled after the complete v38 source closure is stable. The source-closure
 # normalizer excludes both v38 seal assignments from their own digest.
 STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "00b2b471dea7783256b88dcd370ad29a1b48815183c495684c8534e61bfe2689"
+    "7114f04a1e6b45188fbd4ba870ec546a3d612aab7b81561b596161adc59ccd23"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"

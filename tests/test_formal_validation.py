@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 import numpy as np
@@ -296,6 +297,9 @@ def test_signal_decay_derives_last_supported_delay() -> None:
     assert result["maximum_supported_delay_bars"] == 1
     assert result["frontier_version"] == "contiguous-zero-delay-frontier-v2"
     assert [item["delay_bars"] for item in result["runs"]] == [0, 1, 2, 3]
+    assert [item["retention"] for item in result["runs"]] == pytest.approx([1.0, .85, .55, -.10])
+    assert [item["passed"] for item in result["runs"]] == [True, True, False, False]
+    assert "reason_code" not in result
 
 
 def test_signal_decay_requires_a_contiguous_supported_frontier() -> None:
@@ -310,6 +314,77 @@ def test_signal_decay_requires_a_contiguous_supported_frontier() -> None:
 
     assert [item["passed"] for item in result["runs"]] == [True, False, True]
     assert result["maximum_supported_delay_bars"] == 0
+
+
+@pytest.mark.parametrize("baseline", [0.0, -0.0, -0.05])
+def test_nonpositive_signal_baseline_completes_as_unsupported_economic_evidence(baseline) -> None:
+    # Later positive results cannot rescue a frontier that already fails at zero.
+    values = {0: baseline, 1: 0.20, 2: -0.10, 3: 0.0}
+    calls = []
+
+    def delayed(delay):
+        calls.append(delay)
+        return {"annualized_excess_return": values[delay], "artifacts": {"delay": delay}}
+
+    result = run_signal_decay_suite(
+        delays=[3, 0, 2, 1], runner=delayed,
+        metric="annualized_excess_return", minimum_retention=0.60,
+    )
+
+    assert calls == [0, 1, 2, 3]
+    assert result["status"] == "completed"
+    assert result["reason_code"] == "nonpositive_zero_delay_metric"
+    assert result["maximum_supported_delay_bars"] is None
+    assert all(item["passed"] is False and item["retention"] is None for item in result["runs"])
+    assert [item["metrics"]["annualized_excess_return"] for item in result["runs"]] == [
+        values[delay] for delay in calls
+    ]
+    assert [item["metrics"]["artifacts"] for item in result["runs"]] == [
+        {"delay": delay} for delay in calls
+    ]
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("invalid", [None, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("invalid_delay", [0, 1])
+def test_signal_decay_missing_or_nonfinite_metrics_remain_errors(invalid, invalid_delay) -> None:
+    # A rejected economic baseline must not suppress invalid later evidence.
+    with pytest.raises(ValueError, match="missing or non-finite"):
+        run_signal_decay_suite(
+            delays=[0, 1],
+            runner=lambda delay: {"annualized_excess_return": invalid
+                                  if delay == invalid_delay else 0.0},
+            metric="annualized_excess_return", minimum_retention=0.60,
+        )
+
+
+def test_signal_decay_does_not_hide_a_delayed_runner_exception() -> None:
+    def delayed(delay):
+        if delay:
+            raise RuntimeError("synthetic execution failure")
+        return {"annualized_excess_return": -0.05}
+
+    with pytest.raises(RuntimeError, match="synthetic execution failure"):
+        run_signal_decay_suite(
+            delays=[0, 1], runner=delayed,
+            metric="annualized_excess_return", minimum_retention=0.60,
+        )
+
+
+@pytest.mark.parametrize("baseline", [0.0, -0.05])
+def test_nonpositive_signal_baseline_still_fails_existing_formal_admission(baseline) -> None:
+    version, metrics = _incomplete_factor_family_fixture()
+    assert _formal_validation_failures(version, metrics) == []
+    metrics["formal_validation"]["signal_decay"] = run_signal_decay_suite(
+        delays=[0, 1],
+        runner=lambda delay: {"annualized_excess_return": baseline if delay == 0 else 0.20},
+        metric="annualized_excess_return", minimum_retention=0.60,
+    )
+    # Even the unchanged fixture's optimistic top-level passed flags cannot
+    # substitute for an actual contiguous supported frontier.
+    assert _formal_validation_failures(version, metrics) == [
+        "signal-decay evidence did not establish a supported response delay"
+    ]
 
 
 def test_holm_adjustment_preserves_original_order() -> None:

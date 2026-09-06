@@ -312,6 +312,9 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
         "原价分钟执行采用 factor=1，即使信号是日线",
         "历史代理切回日线撮合时仍采用日线复权因子",
         "禁止下单器再按另一个价格、默认风险比例或统一 100 股单位二次缩放",
+        "撮合取整不得超过本次请求、成交量和现金裁剪后的即时数量上限",
+        "不能用固定 0.1 股补偿把数量向上跨过申报单位",
+        "返回量仍不得增加",
         "T+1 下限必须进入同一次数量校验",
         "仅显式启用 Qlib 原有完整清仓特例",
         "部分卖出不获得任意小数数量权限",
@@ -327,6 +330,17 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v38`" in readme
     assert "不能沿用旧结果宣称等价" in readme
+
+
+def test_nonpositive_signal_decay_is_rejection_evidence_without_admission() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "有限但非正的零延迟基准属于已完成的经济检验未通过",
+        "保留全部延迟运行的原始指标",
+        "留存比例和最大支持延迟为空，不能获得准入",
+        "缺失或非有限指标仍属于执行或数据错误",
+    ):
+        assert contract in specification
 
 
 def test_run_status_presentation_keeps_audit_evidence_and_financial_permissions() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import date
 from typing import Any
 
@@ -96,6 +97,44 @@ class SquareRootImpactExchange(Exchange):
             )
         return trade_value, trade_cost, trade_price
 
+    def round_amount_by_trade_unit(
+        self,
+        deal_amount: float,
+        factor: float | None = None,
+        stock_id: str | None = None,
+        start_time: Any = None,
+        end_time: Any = None,
+    ) -> float:
+        """Round inside the current request, volume and cash-clipped bound.
+
+        Upstream adds 0.1 physical shares before flooring. That can undo a
+        preceding clip or exceed the submitted amount when adjustment factors
+        change. Only four floating-point ULPs around a whole unit count are
+        treated as representation noise here; the returned adjusted quantity
+        never exceeds this invocation's input. Exact full-position sells use
+        Qlib's separate liquidation branch and do not pass through this method.
+        """
+        if self.trade_w_adj_price or self.trade_unit is None:
+            return deal_amount
+        factor = float(self._get_factor_or_raise_error(
+            factor=factor, stock_id=stock_id, start_time=start_time, end_time=end_time,
+        ))
+        amount, unit = float(deal_amount), float(self.trade_unit)
+        if (
+            not math.isfinite(amount) or amount < 0
+            or not math.isfinite(factor) or factor <= 0
+            or not math.isfinite(unit) or unit <= 0
+        ):
+            raise ValueError("formal Qlib lot rounding requires finite nonnegative quantity")
+        unit_count = amount * factor / unit
+        if not math.isfinite(unit_count):
+            raise ValueError("formal Qlib lot rounding has a non-finite unit count")
+        nearest = round(unit_count)
+        count = nearest if _same_float_boundary(unit_count, nearest) else math.floor(unit_count)
+        # Division back into adjusted units can itself round upward by one ULP.
+        # Keep the exact input representation in that case, never a larger fill.
+        return min(amount, count * unit / factor)
+
     def _calc_trade_info_by_order(
         self,
         order: Order,
@@ -129,6 +168,9 @@ class SquareRootImpactExchange(Exchange):
             and order.direction == Order.BUY
             and trade_value > 1e-5
             and order.deal_amount * (order.factor or 1.0) < rules.min_lot
+            and not _same_float_boundary(
+                order.deal_amount * (order.factor or 1.0), rules.min_lot,
+            )
         ):
             # Below the board minimum declaration (for example fewer than 200
             # shares on STAR): the exchange would reject the order outright.
@@ -232,6 +274,11 @@ class SquareRootImpactExchange(Exchange):
                 "raw_trade_price": price / factor if factor is not None and price > 0 else None,
             }
         )
+
+
+def _same_float_boundary(value: float, boundary: float) -> bool:
+    """Recognize arithmetic representation noise, never a fixed share allowance."""
+    return abs(value - boundary) <= 4 * max(math.ulp(value), math.ulp(boundary))
 
 
 def _as_date(value: Any) -> date:
