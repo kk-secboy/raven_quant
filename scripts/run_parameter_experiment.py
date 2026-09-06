@@ -26,6 +26,7 @@ from quant_platform.qlib_workflow import (
     require_qlib_workflow_identity,
 )
 from quant_platform.statistical_validation import deflated_sharpe_probability
+from quant_platform.strategy_health_reference import STRATEGY_HEALTH_REFERENCE_NAME
 from quant_platform.strategy_research_evaluation import (
     STRATEGY_RESEARCH_EVALUATION_MODES,
 )
@@ -67,6 +68,10 @@ def _read_completed_result(
             provenance.get("evaluation_mode") != evaluation_mode
             or provenance.get("evaluation_scope") != "pre_final_only"
             or provenance.get("final_oos_opened") is not False
+            or "strategy_health_reference" in provenance
+            or "strategy_health_reference" in (result.get("artifacts") or {})
+            or (result_path.parent / STRATEGY_HEALTH_REFERENCE_NAME).exists()
+            or (result_path.parent / STRATEGY_HEALTH_REFERENCE_NAME).is_symlink()
         ):
             return None
         if (
@@ -110,7 +115,9 @@ def _run_segment(
     )
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    log_path = output / "backtest.log"
+    # The child keeps writing after its output manifest is sealed. Keep this
+    # mutable stream outside that sealed tree; existing in-tree logs stay intact.
+    log_path = output.parent / f"{output.name}-backtest.log"
     command = [
         sys.executable,
         str(backtest_script),

@@ -318,6 +318,142 @@ def _write_strategy_health_reference(
     }
 
 
+def _require_health_reference_scope(output: Path, evaluation_mode: str) -> None:
+    """Do not silently seal a formal reference left in a selection-only directory."""
+    reference_path = output / STRATEGY_HEALTH_REFERENCE_NAME
+    if evaluation_mode in PRE_FINAL_EVALUATION_MODES and (
+        reference_path.exists() or reference_path.is_symlink()
+    ):
+        raise ValueError("pre-final output must not contain a formal strategy health reference")
+
+
+def _finalize_backtest_output(
+    output: Path,
+    *,
+    manifest: dict[str, Any],
+    manifest_path: str | Path,
+    provider_provenance: dict[str, Any],
+    periods: dict[str, str],
+    metrics: dict[str, Any],
+    evaluation_mode: str,
+    signal_source: str,
+    execution_method: str,
+    execution_frequency: str,
+    historical_window_opened: bool,
+    tracking_uri: str,
+    health_reference_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish completed output and tracking after calculations and gates settle."""
+    _require_health_reference_scope(output, evaluation_mode)
+    config = manifest["config"]
+    factor_source_mode = str(health_reference_inputs["factor_source_mode"])
+    consumed_historical_replay = evaluation_mode == CONSUMED_HISTORICAL_REPLAY_MODE
+    strategy_health_reference = None
+    if evaluation_mode not in PRE_FINAL_EVALUATION_MODES:
+        # Health references bind a formal backtest identity. Selection-only
+        # parameter segments have no formal identity and must not publish one.
+        strategy_health_reference = _write_strategy_health_reference(
+            output, manifest=manifest, provider_provenance=provider_provenance,
+            periods=periods, signal_source=signal_source, **health_reference_inputs,
+        )
+        metrics["provenance"]["strategy_health_reference"] = strategy_health_reference
+    result = {
+        "status": "ok",
+        "backtest_engine": "qlib",
+        "evaluation_mode": evaluation_mode,
+        "evidence_mode": (
+            EVIDENCE_MODE_REPLAY
+            if consumed_historical_replay
+            else EVIDENCE_MODE_SEALED
+        ),
+        "final_oos_opened": historical_window_opened,
+        **(REPLAY_MARKERS if consumed_historical_replay else {}),
+        "metrics": metrics,
+        "periods": periods,
+        "benchmark": manifest["benchmark"],
+        "artifacts": {
+            "daily_returns": str(output / "daily_returns.parquet"),
+            "score_grid": str(output / "score_grid.parquet"),
+            "governed_signal": str(output / "governed_signal.parquet"),
+            "qlib_portfolio_report": str(output / "qlib_portfolio_report.parquet"),
+            "qlib_positions": str(output / "qlib_positions.pkl"),
+            "execution_fills": str(output / "execution_fills.parquet"),
+            "execution_model": str(output / "execution_model.json"),
+            "robustness": str(output / "robustness.json"),
+            "rolling": str(output / "rolling.json"),
+            "event_stress": str(output / "event_stress.json"),
+            "capacity_curve": str(output / "capacity_curve.json"),
+            "formal_validation": str(output / "formal_validation.json"),
+            **(
+                {"strategy_health_reference": str(output / STRATEGY_HEALTH_REFERENCE_NAME)}
+                if strategy_health_reference is not None else {}
+            ),
+        },
+    }
+    workflow_run_id = str(
+        manifest.get("backtest_id")
+        or (
+            f"{manifest['strategy_version_id']}-"
+            f"{_canonical_sha256({'periods': periods, 'config': config})[:16]}"
+        )
+    )
+    with qlib_workflow_run(
+        run_kind=(
+            "portfolio-experiment-trial"
+            if evaluation_mode in PRE_FINAL_EVALUATION_MODES
+            else "formal-backtest"
+        ),
+        run_id=workflow_run_id,
+        tracking_uri=tracking_uri,
+        dataset_identity_sha256=provider_provenance.get("dataset_identity_sha256"),
+    ) as workflow:
+        workflow.log_params(
+            {
+                "backtest_id": manifest.get("backtest_id") or workflow_run_id,
+                "strategy_version_id": manifest["strategy_version_id"],
+                "dataset": manifest["dataset"],
+                "execution_dataset": manifest.get("execution_dataset"),
+                "benchmark": manifest["benchmark"],
+                "start": periods["start"],
+                "end": periods["end"],
+                "execution_method": execution_method,
+                "execution_frequency": execution_frequency,
+                "strategy_config_sha256": metrics["provenance"]["strategy_config_sha256"],
+                "evaluation_mode": evaluation_mode,
+                "final_oos_opened": historical_window_opened,
+                **(REPLAY_MARKERS if consumed_historical_replay else {}),
+            }
+        )
+        workflow.log_metrics(metrics)
+        recorder_identity = workflow.identity_dict()
+        manifest["qlib_workflow"] = recorder_identity
+        manifest["factor_source_mode"] = factor_source_mode
+        manifest["challenger_weight"] = float(config.get("challenger_weight") or 0.0)
+        manifest["final_oos_opened"] = historical_window_opened
+        if consumed_historical_replay:
+            manifest.update(REPLAY_MARKERS)
+        Path(manifest_path).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        metrics["provenance"]["execution_manifest_sha256"] = _sha256_file(manifest_path)
+        metrics["provenance"]["qlib_workflow"] = recorder_identity
+        result["qlib_workflow"] = recorder_identity
+        artifact_manifest = write_backtest_artifact_manifest(output)
+        metrics["provenance"]["artifact_manifest_version"] = artifact_manifest["version"]
+        metrics["provenance"]["artifact_manifest_sha256"] = artifact_manifest["sha256"]
+        metrics["provenance"]["artifact_manifest_file_count"] = artifact_manifest[
+            "file_count"
+        ]
+        result["artifacts"]["artifact_manifest"] = str(
+            output / artifact_manifest["path"]
+        )
+        (output / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        workflow.save_artifacts(output)
+    return result
+
+
 def _require_promotion_dataset_identity(
     provenance: dict[str, Any], *, label: str
 ) -> None:
@@ -1025,6 +1161,7 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     evaluation_mode = _evaluation_mode(manifest)
+    _require_health_reference_scope(output, evaluation_mode)
     consumed_historical_replay = (
         evaluation_mode == CONSUMED_HISTORICAL_REPLAY_MODE
     )
@@ -2675,119 +2812,24 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    strategy_health_reference = _write_strategy_health_reference(
-        output,
-        manifest=manifest,
-        provider_provenance=provider_provenance,
-        periods=periods,
-        signal_source=signal_source,
-        factor_source_mode=factor_source_mode,
-        baseline_definition=(
-            dict(baseline_definition) if isinstance(baseline_definition, dict) else None
-        ),
-        baseline_raw=baseline_raw,
-        baseline_artifacts=baseline_artifacts,
-        challenger_entries=challenger_entries,
-        formal_factor_items=formal_factor_items,
-        model_feature_set=model_feature_set,
-        model_predictions=model_predictions,
-        model_label_contract=model_label_contract,
-        qlib_data_api=D,
-    )
-    metrics["provenance"]["strategy_health_reference"] = strategy_health_reference
-    result = {
-        "status": "ok",
-        "backtest_engine": "qlib",
-        "evaluation_mode": evaluation_mode,
-        "evidence_mode": (
-            EVIDENCE_MODE_REPLAY
-            if consumed_historical_replay
-            else EVIDENCE_MODE_SEALED
-        ),
-        "final_oos_opened": historical_window_opened,
-        **(REPLAY_MARKERS if consumed_historical_replay else {}),
-        "metrics": metrics,
-        "periods": periods,
-        "benchmark": manifest["benchmark"],
-        "artifacts": {
-            "daily_returns": str(output / "daily_returns.parquet"),
-            "score_grid": str(output / "score_grid.parquet"),
-            "governed_signal": str(output / "governed_signal.parquet"),
-            "qlib_portfolio_report": str(output / "qlib_portfolio_report.parquet"),
-            "qlib_positions": str(output / "qlib_positions.pkl"),
-            "execution_fills": str(output / "execution_fills.parquet"),
-            "execution_model": str(output / "execution_model.json"),
-            "robustness": str(output / "robustness.json"),
-            "rolling": str(output / "rolling.json"),
-            "event_stress": str(output / "event_stress.json"),
-            "capacity_curve": str(output / "capacity_curve.json"),
-            "formal_validation": str(output / "formal_validation.json"),
-            "strategy_health_reference": str(
-                output / STRATEGY_HEALTH_REFERENCE_NAME
+    result = _finalize_backtest_output(
+        output, manifest=manifest, manifest_path=args.manifest,
+        provider_provenance=provider_provenance, periods=periods, metrics=metrics,
+        evaluation_mode=evaluation_mode, signal_source=signal_source,
+        execution_method=execution_method,
+        execution_frequency=args.execution_frequency if minute_execution else "day",
+        historical_window_opened=historical_window_opened, tracking_uri=args.tracking_uri,
+        health_reference_inputs={
+            "factor_source_mode": factor_source_mode,
+            "baseline_definition": (
+                dict(baseline_definition) if isinstance(baseline_definition, dict) else None
             ),
+            "baseline_raw": baseline_raw, "baseline_artifacts": baseline_artifacts,
+            "challenger_entries": challenger_entries, "formal_factor_items": formal_factor_items,
+            "model_feature_set": model_feature_set, "model_predictions": model_predictions,
+            "model_label_contract": model_label_contract, "qlib_data_api": D,
         },
-    }
-    workflow_run_id = str(
-        manifest.get("backtest_id")
-        or (
-            f"{manifest['strategy_version_id']}-"
-            f"{_canonical_sha256({'periods': periods, 'config': config})[:16]}"
-        )
     )
-    with qlib_workflow_run(
-        run_kind=(
-            "portfolio-experiment-trial"
-            if evaluation_mode in PRE_FINAL_EVALUATION_MODES
-            else "formal-backtest"
-        ),
-        run_id=workflow_run_id,
-        tracking_uri=args.tracking_uri,
-        dataset_identity_sha256=provider_provenance.get("dataset_identity_sha256"),
-    ) as workflow:
-        workflow.log_params(
-            {
-                "backtest_id": manifest.get("backtest_id") or workflow_run_id,
-                "strategy_version_id": manifest["strategy_version_id"],
-                "dataset": manifest["dataset"],
-                "execution_dataset": manifest.get("execution_dataset"),
-                "benchmark": manifest["benchmark"],
-                "start": periods["start"],
-                "end": periods["end"],
-                "execution_method": execution_method,
-                "execution_frequency": (args.execution_frequency if minute_execution else "day"),
-                "strategy_config_sha256": metrics["provenance"]["strategy_config_sha256"],
-                "evaluation_mode": evaluation_mode,
-                "final_oos_opened": historical_window_opened,
-                **(REPLAY_MARKERS if consumed_historical_replay else {}),
-            }
-        )
-        workflow.log_metrics(metrics)
-        recorder_identity = workflow.identity_dict()
-        manifest["qlib_workflow"] = recorder_identity
-        manifest["factor_source_mode"] = factor_source_mode
-        manifest["challenger_weight"] = float(config.get("challenger_weight") or 0.0)
-        manifest["final_oos_opened"] = historical_window_opened
-        if consumed_historical_replay:
-            manifest.update(REPLAY_MARKERS)
-        Path(args.manifest).write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        metrics["provenance"]["execution_manifest_sha256"] = _sha256_file(args.manifest)
-        metrics["provenance"]["qlib_workflow"] = recorder_identity
-        result["qlib_workflow"] = recorder_identity
-        artifact_manifest = write_backtest_artifact_manifest(output)
-        metrics["provenance"]["artifact_manifest_version"] = artifact_manifest["version"]
-        metrics["provenance"]["artifact_manifest_sha256"] = artifact_manifest["sha256"]
-        metrics["provenance"]["artifact_manifest_file_count"] = artifact_manifest[
-            "file_count"
-        ]
-        result["artifacts"]["artifact_manifest"] = str(
-            output / artifact_manifest["path"]
-        )
-        (output / "result.json").write_text(
-            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        workflow.save_artifacts(output)
     print(json.dumps(result, ensure_ascii=False))
 
 

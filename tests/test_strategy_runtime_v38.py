@@ -289,12 +289,16 @@ def test_v38_migration_only_adds_and_removes_its_own_constraint(
         "59f2552f6c8eb5b13600a4785aa019ef9cfe045798114533b792a2731bb3d43a",
         "00b2b471dea7783256b88dcd370ad29a1b48815183c495684c8534e61bfe2689",
     ),
-], ids=["113ac7e", "c8353aa"])
+    (
+        "59f2552f6c8eb5b13600a4785aa019ef9cfe045798114533b792a2731bb3d43a",
+        "7114f04a1e6b45188fbd4ba870ec546a3d612aab7b81561b596161adc59ccd23",
+    ),
+], ids=["113ac7e", "c8353aa", "6888293"])
 def test_resealed_v38_rejects_the_unaccepted_candidate_without_mutating_its_binding(
     monkeypatch: pytest.MonkeyPatch, recipe_id: str,
     candidate_runner: str, candidate_bundle: str,
 ) -> None:
-    # Both candidates were private IS diagnostics. Preserve their bindings as
+    # These candidates were private IS diagnostics. Preserve their bindings as
     # evidence and reject them under the corrected pre-release seal.
     image = "sha256:" + "1" * 64
     monkeypatch.setenv(runtime.WORKER_RUNTIME_IMAGE_DIGEST_ENV, image)

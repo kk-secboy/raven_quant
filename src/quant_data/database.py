@@ -1772,10 +1772,10 @@ strategy_versions = Table(
         "AND evidence_mode = 'sealed_final_oos' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runner_sha256' = "
-        "'59f2552f6c8eb5b13600a4785aa019ef9cfe045798114533b792a2731bb3d43a' "
+        "'4a94328bf92b822da69530ffccccf0067cc3d2727d512d8d54f51095ef422717' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runtime_bundle_sha256' = "
-        "'7114f04a1e6b45188fbd4ba870ec546a3d612aab7b81561b596161adc59ccd23' "
+        "'9f78afdd7ee5e5688b595d327091ee541608a7220b7cf75c6600350673dc3e41' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_worker_runtime_image_digest' ~ '^sha256:[0-9a-f]{64}$'"
         ") ELSE true END) IS TRUE",

@@ -343,6 +343,23 @@ def test_nonpositive_signal_decay_is_rejection_evidence_without_admission() -> N
         assert contract in specification
 
 
+def test_pre_final_output_does_not_claim_formal_health_reference() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "策略健康参考属于正式回测证据",
+        "`pre_final_portfolio_trial`",
+        "`strategy_policy_only_pre_final`",
+        "`strategy_full_stack_pre_final`",
+        "不生成正式策略健康参考",
+        "不登记不存在的健康参考制品或 provenance",
+        "不得补造编号或默认摘要",
+        "参数回测的运行日志必须位于段制品目录之外",
+        "制品封存之后的标准输出追加不得改变已封存文件",
+        "不能通过放宽通用制品校验器的日志排除规则掩盖封印失效",
+    ):
+        assert contract in specification
+
+
 def test_run_status_presentation_keeps_audit_evidence_and_financial_permissions() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
     reliability = specification.partition("### 11.2 任务可靠性")[2].partition(
