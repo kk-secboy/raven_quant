@@ -328,8 +328,29 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v38`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v39`" in readme
     assert "不能沿用旧结果宣称等价" in readme
+
+
+def test_v39_audit_metadata_repair_preserves_history_and_requires_normal_new_run() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`qlib-rdagent-single-mainline-2026-09-06-v39`",
+        "`0110_strategy_runtime_v39`",
+        "创建端与阶段结算端按同一冻结计划构造完整 periods 与 competition 摘要",
+        "不得通过忽略字段或放宽比较接受不匹配结果",
+        "runner 字节保持不变，源码闭包单独封存",
+        "不重新封印历史迁移",
+        "修复通过正常新任务验证",
+        "不改写旧任务状态",
+        "不把旧成功段接入新任务",
+        "不新增 OOS 权限",
+        "不改变策略、成本、容量或准入规则",
+    ):
+        assert contract in specification
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "`0110_strategy_runtime_v39`" in readme
+    assert "v38 的数据库迁移 `0109_strategy_runtime_v38` 原样保留" in readme
 
 
 def test_nonpositive_signal_decay_is_rejection_evidence_without_admission() -> None:

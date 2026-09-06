@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,7 +25,7 @@ from quant_platform.strategy_research_evaluation import (
     strategy_score_grid_contract,
 )
 from quant_platform.strategy_rule_compiler import compile_strategy_rule_policy
-from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
+from quant_platform.strategy_rule_ir import canonical_sha256, validate_strategy_rule_ir
 from quant_platform.transparent_baseline_runner import (
     STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
     STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
@@ -453,19 +455,24 @@ def test_policy_evidence_rejects_different_score_artifacts() -> None:
 
 
 @pytest.mark.no_database
+@pytest.mark.parametrize("stage_name", ["policy_only", "full_stack"])
 def test_existing_parameter_experiment_artifacts_become_research_artifact(
-    tmp_path,
+    tmp_path, stage_name,
 ) -> None:
-    plan = _plan()
-    stage = plan["stages"][0]
-    returns = _returns("policy_challenger")
+    call = _materialized_competition(tmp_path, stage=stage_name)
+    frozen_call = deepcopy(call)
+    prepared = ParameterExperimentStore._prepare_strategy_research_competition(**call)
+    plan = call["plan"]
+    stage = next(item for item in plan["stages"] if item["stage"] == stage_name)
+    challenger = stage["trials"][1]["role"]
+    returns = _returns(challenger)
     score = pd.DataFrame(
         {"score": np.linspace(-1.0, 1.0, 320)},
         index=pd.bdate_range("2022-01-03", periods=320),
     )
-    results = _trial_results("policy_challenger")
+    results = _trial_results(challenger)
     for index, item in enumerate(results):
-        role = "public_baseline" if index == 0 else "policy_challenger"
+        role = "public_baseline" if index == 0 else challenger
         trial_root = tmp_path / f"trial-{index:03d}" / "out_of_sample"
         trial_root.mkdir(parents=True)
         pd.DataFrame(
@@ -478,25 +485,122 @@ def test_existing_parameter_experiment_artifacts_become_research_artifact(
         score.to_parquet(trial_root / "score_grid.parquet")
         item["trial_index"] = index
         item["parameters"] = stage["trials"][index]["parameters"]
-    experiment = {
-        "status": "ok",
-        "experiment_id": "experiment-1",
-        "evaluation_mode": STRATEGY_POLICY_ONLY_MODE,
-        "final_oos_opened": False,
-        "periods": stage["periods"],
-        "trials": results,
-    }
-
+    experiment = _prepared_terminal_result(prepared, results)
+    original_result = deepcopy(experiment)
+    prerequisite = (
+        build_strategy_stage_evidence(
+            plan, stage_name="policy_only", trial_results=_trial_results("policy_challenger"),
+            daily_returns=_returns("policy_challenger"),
+            governed_score_sha256={"public_baseline": "1" * 64, "policy_challenger": "1" * 64},
+        ) if stage_name == "full_stack" else None
+    )
     artifact = build_strategy_stage_artifact_from_parameter_experiment(
-        plan,
-        stage_name="policy_only",
-        experiment_result=experiment,
-        artifact_root=tmp_path,
+        plan, stage_name=stage_name, experiment_result=experiment,
+        artifact_root=tmp_path, prerequisite_evidence=prerequisite,
     )
 
-    assert artifact["artifact_type"] == "fin_strategy_policy_only_evaluation"
+    assert artifact["artifact_type"] == f"fin_strategy_{stage_name}_evaluation"
     assert artifact["capital_eligible"] is False
     assert artifact["evidence"]["gate_passed"] is True
+    assert artifact["evidence"]["final_oos_opened"] is False
+    assert call == frozen_call and experiment == original_result
+
+
+def _prepared_terminal_result(prepared, results):
+    """Use the runner's actual terminal projection after the production store preparation."""
+    manifest = {
+        "experiment_id": "experiment-1",
+        "strategy_version_id": prepared["version_id"],
+        "dataset": prepared["dataset_name"],
+        "periods": prepared["periods"],
+    }
+    spec = importlib.util.spec_from_file_location(
+        "parameter_stage_terminal",
+        Path(__file__).parents[1] / "scripts/run_parameter_experiment.py",
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    return runner._build_terminal_result(
+        manifest=manifest, evaluation_mode=prepared["evaluation_mode"],
+        trial_results=results, summary={},
+    )
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize("stage_name", ["policy_only", "full_stack"])
+@pytest.mark.parametrize("field", [
+    "mode", "final_oos_opened", "pre_final_cutoff", "historical_validation_periods",
+    "plan_sha256", "stage", "compiled_artifact_id", "compiled_artifact_sha256",
+    "research_run_id", "dataset_identity_sha256", "score_inputs_sha256",
+    "strategy_version_config_sha256", "competition_spec_sha256", "unknown",
+])
+def test_stage_consumer_rejects_governance_drift_from_actual_preparation(
+    tmp_path, stage_name, field,
+) -> None:
+    call = _materialized_competition(tmp_path, stage=stage_name)
+    prepared = ParameterExperimentStore._prepare_strategy_research_competition(**call)
+    result = _prepared_terminal_result(prepared, [])
+    result["periods"]["governance"][field] = "unreviewed-change"
+    with pytest.raises(ValueError, match="does not match the strategy stage"):
+        build_strategy_stage_artifact_from_parameter_experiment(
+            call["plan"], stage_name=stage_name, experiment_result=result,
+            artifact_root=tmp_path / "artifacts-not-opened-before-binding-check",
+        )
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize("change", [
+    "in_sample_start", "in_sample_end", "out_of_sample_start", "out_of_sample_end",
+    "period_extra", "segment_extra", "missing_governance", "unexpanded_periods",
+    "version", "dataset", "experiment_id", "top_level_final", "evaluation_mode",
+])
+def test_stage_consumer_rejects_dates_identity_or_missing_enrichment(tmp_path, change) -> None:
+    call = _materialized_competition(tmp_path)
+    prepared = ParameterExperimentStore._prepare_strategy_research_competition(**call)
+    result = _prepared_terminal_result(prepared, [])
+    if change.startswith(("in_sample_", "out_of_sample_")):
+        segment, date_field = change.rsplit("_", 1)
+        result["periods"][segment][date_field] = "2099-12-31"
+    elif change == "period_extra":
+        result["periods"]["unreviewed"] = True
+    elif change == "segment_extra":
+        result["periods"]["in_sample"]["unreviewed"] = True
+    elif change == "missing_governance":
+        del result["periods"]["governance"]["plan_sha256"]
+    elif change == "unexpanded_periods":
+        result["periods"] = call["plan"]["stages"][0]["periods"]
+    else:
+        key, value = {
+            "version": ("strategy_version_id", "different-version"),
+            "dataset": ("dataset", "different-dataset"),
+            "experiment_id": ("experiment_id", ""),
+            "top_level_final": ("final_oos_opened", True),
+            "evaluation_mode": ("evaluation_mode", STRATEGY_FULL_STACK_MODE),
+        }[change]
+        result[key] = value
+    with pytest.raises(ValueError, match="does not match the strategy stage"):
+        build_strategy_stage_artifact_from_parameter_experiment(
+            call["plan"], stage_name="policy_only", experiment_result=result,
+            artifact_root=tmp_path / "artifacts-not-opened-before-binding-check",
+        )
+
+
+@pytest.mark.no_database
+def test_preparation_preserves_frozen_governance_extensions_without_mutating_plan(tmp_path) -> None:
+    call = _materialized_competition(tmp_path)
+    plan = call["plan"]
+    for stage in plan["stages"]:
+        stage["periods"]["governance"]["frozen_history_note"] = {"source": "合成历史约束"}
+    plan["plan_sha256"] = canonical_sha256({key: value for key, value in plan.items()
+                                           if key != "plan_sha256"})
+    frozen = deepcopy(plan)
+    first = ParameterExperimentStore._prepare_strategy_research_competition(**call)
+    second = ParameterExperimentStore._prepare_strategy_research_competition(**call)
+    assert plan == frozen
+    assert first["periods"] == second["periods"]
+    assert first["periods"]["governance"]["frozen_history_note"] == {"source": "合成历史约束"}
+    # The source plan is frozen as a whole; only result-added fields are rejected.
+    assert "competition_spec_sha256" not in plan["stages"][0]["periods"]["governance"]
 
 
 @pytest.mark.no_database

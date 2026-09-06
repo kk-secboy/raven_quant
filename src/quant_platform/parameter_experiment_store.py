@@ -35,6 +35,7 @@ from .strategy_research_evaluation import (
     STRATEGY_FULL_STACK_MODE,
     STRATEGY_POLICY_ONLY_MODE,
     STRATEGY_RESEARCH_COMPETITION_VERSION,
+    build_strategy_research_competition_periods,
 )
 from .strategy_rule_compiler import (
     validate_compiled_strategy_artifact,
@@ -607,41 +608,10 @@ class ParameterExperimentStore:
         baseline_config = dict(
             next(item for item in trials if item["role"] == "public_baseline")["config"]
         )
-        stage_periods = {
-            "in_sample": dict(periods["in_sample"]),
-            "out_of_sample": dict(periods["out_of_sample"]),
-        }
-        governed_periods = {
-            **stage_periods,
-            "governance": {
-                **dict(governance),
-                "mode": expected_mode,
-                "final_oos_opened": False,
-                "plan_sha256": plan_sha256,
-                "stage": stage,
-                "compiled_artifact_id": compiled_artifact_id,
-                "compiled_artifact_sha256": compiled_artifact_sha256,
-                "research_run_id": research_run_id,
-                "dataset_identity_sha256": dataset_identity,
-                "score_inputs_sha256": score_inputs_sha256,
-                "strategy_version_config_sha256": _canonical_sha256(config),
-            },
-        }
-        competition_spec = {
-            "contract_version": STRATEGY_RESEARCH_COMPETITION_VERSION,
-            "strategy_version_id": version_id,
-            "dataset": dataset_name,
-            "dataset_identity_sha256": dataset_identity,
-            "periods": governed_periods,
-            "parameter_grid": parameter_grid,
-            "trials": trials,
-            "plan_sha256": plan_sha256,
-            "stage": stage,
-        }
-        competition_spec_sha256 = _canonical_sha256(competition_spec)
-        governed_periods["governance"][
-            "competition_spec_sha256"
-        ] = competition_spec_sha256
+        governed_periods = build_strategy_research_competition_periods(
+            plan, stage_name=stage, strategy_version_id=version_id,
+        )
+        competition_spec_sha256 = governed_periods["governance"]["competition_spec_sha256"]
         return {
             "version_id": version_id,
             "version_config": config,

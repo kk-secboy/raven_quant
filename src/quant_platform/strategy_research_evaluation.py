@@ -661,6 +661,73 @@ def build_strategy_research_competition_plan(
     return plan
 
 
+def build_strategy_research_competition_periods(
+    plan: Mapping[str, Any], *, stage_name: str, strategy_version_id: str,
+) -> dict[str, Any]:
+    """Bind frozen periods identically for experiment creation and stage consumption.
+
+    The store/worker still authorize the materialized version and experiment IDs
+    against their database records. This pure contract preserves the existing
+    competition digest, computed before adding its own receipt to governance.
+    """
+    plan_value = dict(plan)
+    plan_sha256 = plan_value.pop("plan_sha256", None)
+    if (
+        plan.get("contract_version") != STRATEGY_RESEARCH_COMPETITION_VERSION
+        or plan.get("delivery_status") != "research_only"
+        or plan.get("capital_eligible") is not False
+        or plan.get("simulation_eligible") is not False
+        or plan_sha256 != canonical_sha256(plan_value)
+        or not isinstance(strategy_version_id, str)
+        or not strategy_version_id.strip()
+    ):
+        raise ValueError("fin_strategy competition plan or version binding is invalid")
+    modes = {"policy_only": STRATEGY_POLICY_ONLY_MODE, "full_stack": STRATEGY_FULL_STACK_MODE}
+    stages = [item for item in plan.get("stages") or [] if item.get("stage") == stage_name]
+    if stage_name not in modes or len(stages) != 1:
+        raise ValueError("fin_strategy competition stage is not preregistered")
+    stage = stages[0]
+    if (
+        stage.get("evaluation_mode") != modes[stage_name]
+        or stage.get("job_kind") != "parameter_experiment"
+        or stage.get("capital_eligible") is not False
+        or stage.get("final_oos_opened") is not False
+    ):
+        raise ValueError("fin_strategy stage is not pre-final research-only evidence")
+    full_stages = [item for item in plan.get("stages") or [] if item.get("stage") == "full_stack"]
+    if len(full_stages) != 1:
+        raise ValueError("fin_strategy plan has no unique full-stack stage")
+    candidates = [item for item in full_stages[0].get("trials") or []
+                  if item.get("role") == "full_stack_challenger"]
+    if (len(candidates) != 1 or not isinstance(candidates[0].get("config"), Mapping)
+            or candidates[0].get("config_sha256") != canonical_sha256(candidates[0]["config"])):
+        raise ValueError("fin_strategy plan has no unique frozen candidate config")
+    periods = _require_periods(stage["periods"])
+    periods["governance"].update({
+        "mode": modes[stage_name], "final_oos_opened": False,
+        "plan_sha256": plan_sha256, "stage": stage_name,
+        "compiled_artifact_id": plan["compiled_artifact_id"],
+        "compiled_artifact_sha256": plan["compiled_artifact_sha256"],
+        "research_run_id": plan["research_run_id"],
+        "dataset_identity_sha256": stage["dataset_identity_sha256"],
+        "score_inputs_sha256": stage["score_inputs_sha256"],
+        "strategy_version_config_sha256": candidates[0]["config_sha256"],
+    })
+    competition_spec = {
+        "contract_version": STRATEGY_RESEARCH_COMPETITION_VERSION,
+        "strategy_version_id": strategy_version_id,
+        "dataset": stage["dataset"],
+        "dataset_identity_sha256": stage["dataset_identity_sha256"],
+        "periods": periods,
+        "parameter_grid": stage["parameter_grid"],
+        "trials": stage["trials"],
+        "plan_sha256": plan_sha256,
+        "stage": stage_name,
+    }
+    periods["governance"]["competition_spec_sha256"] = canonical_sha256(competition_spec)
+    return periods
+
+
 def _metric_passes(metrics: Mapping[str, Any]) -> bool:
     # The deflated Sharpe probability is computed and archived as report-only
     # evidence; per the wide-entry gate policy it never vetoes a research gate.
@@ -823,11 +890,18 @@ def build_strategy_stage_artifact_from_parameter_experiment(
     if len(stages) != 1:
         raise ValueError("strategy comparison stage is not preregistered")
     stage = stages[0]
+    expected_periods = build_strategy_research_competition_periods(
+        plan, stage_name=stage_name,
+        strategy_version_id=experiment_result.get("strategy_version_id"),
+    )
     if (
         experiment_result.get("status") != "ok"
         or experiment_result.get("evaluation_mode") != stage["evaluation_mode"]
         or experiment_result.get("final_oos_opened") is not False
-        or experiment_result.get("periods") != stage["periods"]
+        or experiment_result.get("periods") != expected_periods
+        or experiment_result.get("dataset") != stage["dataset"]
+        or not isinstance(experiment_result.get("experiment_id"), str)
+        or not experiment_result["experiment_id"].strip()
     ):
         raise ValueError("parameter experiment does not match the strategy stage")
     results = experiment_result.get("trials")
