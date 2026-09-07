@@ -24,7 +24,8 @@ from quant_platform.model_research_governance import (
     build_run_multiple_testing_evidence,
     canonical_sha256,
     file_sha256,
-    require_model_metric_gate,
+    model_metric_report,
+    validate_run_multiple_testing_evidence,
     verify_model_prediction_artifact,
 )
 from quant_platform.qlib_portfolio_calendar import (
@@ -42,9 +43,24 @@ from quant_platform.research_execution_cadence import (
 def _finite(value: Any) -> float:
     try:
         result = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return result if math.isfinite(result) else 0.0
+    except (TypeError, ValueError) as exc:
+        raise ValueError("independent ensemble metric is not numeric") from exc
+    if not math.isfinite(result):
+        raise ValueError("independent ensemble metric is not finite")
+    return result
+
+
+def _finalize_ensemble_evaluation(item: dict[str, Any], multiple: dict[str, Any]) -> None:
+    ensemble_id = str(item["ensemble_id"])
+    validate_run_multiple_testing_evidence(multiple, selected_trial_name=ensemble_id)
+    evidence = item["evidence"]
+    evidence["multiple_testing"] = multiple
+    evidence["multiple_testing_trial_name"] = ensemble_id
+    evidence["all_metric_cells_passed"] = bool(item["all_metric_cells_passed"])
+    evidence["evidence_sha256"] = canonical_sha256(evidence)
+    item["evidence_sha256"] = evidence["evidence_sha256"]
+    item["status"] = "passed"
+    item.pop("all_metric_cells_passed", None)
 
 
 def _calendar_between(provider: Path, start: str, end: str) -> list[str]:
@@ -392,17 +408,8 @@ def main() -> None:
                             report.get("turnover", pd.Series(dtype=float)).mean()
                         ),
                     }
-                    gate_status = "passed"
-                    gate_reason = None
-                    try:
-                        require_model_metric_gate(
-                            metrics,
-                            context=f"ensemble {ensemble_id}/{profile_id}/{seed}",
-                        )
-                    except ValueError as exc:
-                        gate_status = "failed"
-                        gate_reason = str(exc)
-                        all_cells_passed = False
+                    metric_report = model_metric_report(metrics)
+                    all_cells_passed = all_cells_passed and metric_report["gate_passed"]
                     report_path = cell_root / "portfolio_report.parquet"
                     report.to_parquet(report_path)
                     aligned.to_parquet(cell_root / "signals_and_labels.parquet")
@@ -437,8 +444,8 @@ def main() -> None:
                                 }
                             )
                     seed_results[str(seed)] = {
-                        "status": gate_status,
-                        "gate_reason": gate_reason,
+                        "status": "passed",
+                        "metric_report": metric_report,
                         "metrics": metrics,
                         "latest_prediction_date": periods["valid_end"],
                         "predictions_path": str(predictions_path),
@@ -513,26 +520,8 @@ def main() -> None:
                 trial_series=trial_series,
                 output=artifact_root / "multiple-testing",
             )
-            eligible = set(multiple["eligible_trial_names"])
             for item in evaluations:
-                ensemble_id = str(item["ensemble_id"])
-                evidence = item["evidence"]
-                evidence["multiple_testing"] = multiple
-                evidence["multiple_testing_trial_name"] = ensemble_id
-                evidence["all_metric_cells_passed"] = bool(
-                    item["all_metric_cells_passed"]
-                )
-                evidence["evidence_sha256"] = canonical_sha256(evidence)
-                item["evidence_sha256"] = evidence["evidence_sha256"]
-                if not item["all_metric_cells_passed"]:
-                    item["status"] = "rejected"
-                    item["error"] = "one or more governed model metric cells failed"
-                elif ensemble_id not in eligible:
-                    item["status"] = "rejected"
-                    item["error"] = "ensemble failed the shared Holm/PBO gate"
-                else:
-                    item["status"] = "passed"
-                item.pop("all_metric_cells_passed", None)
+                _finalize_ensemble_evaluation(item, multiple)
         except Exception as exc:
             reason = f"ensemble shared Holm/PBO gate failed: {exc}"
             evaluations = [

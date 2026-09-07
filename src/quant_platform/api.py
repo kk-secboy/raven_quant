@@ -2007,6 +2007,7 @@ class AutopilotResearchEventRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
     quant_loop_n: int = Field(default=10, ge=2, le=20)
     quant_duration: str = Field(default="1h", min_length=2, max_length=20)
+    completion_mode: Literal["research_only", "managed_fin_strategy"] = "research_only"
 
 
 class AllocationScheduleRequest(BaseModel):
@@ -3611,6 +3612,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 reason=payload.reason,
                 quant_loop_n=payload.quant_loop_n,
                 quant_duration=payload.quant_duration,
+                completion_mode=payload.completion_mode,
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -3629,6 +3631,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "horizon_profile": payload.horizon_profile,
                 "quant_loop_n": payload.quant_loop_n,
                 "quant_duration": payload.quant_duration,
+                "completion_mode": payload.completion_mode,
                 "reason": payload.reason,
             },
         )

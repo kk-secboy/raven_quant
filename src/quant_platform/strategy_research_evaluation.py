@@ -729,15 +729,14 @@ def build_strategy_research_competition_periods(
 
 
 def _metric_passes(metrics: Mapping[str, Any]) -> bool:
-    # The deflated Sharpe probability is computed and archived as report-only
-    # evidence; per the wide-entry gate policy it never vetoes a research gate.
-    return (
-        metrics.get("robustness_passed") is True
-        and metrics.get("component_cost_stress_passed") is True
-        and metrics.get("rolling_passed") is True
-        and metrics.get("event_stress_passed") is True
-        and metrics.get("capacity_curve_passed") is True
+    """Keep complete stress conclusions as evidence, including negative results."""
+    fields = (
+        "robustness_passed", "component_cost_stress_passed", "rolling_passed",
+        "event_stress_passed", "capacity_curve_passed",
     )
+    if any(type(metrics.get(name)) is not bool for name in fields):
+        raise ValueError("strategy comparison stress evidence is incomplete or malformed")
+    return all(metrics[name] for name in fields)
 
 
 def build_strategy_stage_evidence(
@@ -830,13 +829,15 @@ def build_strategy_stage_evidence(
     challenger_metrics = dict(
         (observed[challenger_role].get("metrics") or {}).get("out_of_sample") or {}
     )
-    # Gate recalibration (wide-in, strict-out): the research stage only
-    # fail-closes on data integrity (paired complete grid, finite returns —
-    # enforced above) and on the challenger's stress metrics.  The bootstrap
-    # mean difference, confidence interval, alpha-spending p-values and PBO
-    # are still computed and sealed below, but they are a report-only health
-    # check: the single life-or-death gate is the forward paper performance.
-    gate_passed = _metric_passes(challenger_metrics)
+    # Stress experiments must finish and supply well-formed evidence. Their
+    # performance conclusions are recorded without vetoing pre-final research.
+    # Execution constraints, paired data, identity and artifact checks remain
+    # mandatory; a later formal OOS still has its sealed decay contract.
+    stress_passed = _metric_passes(challenger_metrics)
+    _metric_passes(dict(
+        (observed[baseline_role].get("metrics") or {}).get("out_of_sample") or {}
+    ))
+    gate_passed = True
     evidence = {
         "contract_version": "fin-strategy-stage-evidence-v1",
         "delivery_status": "research_only",
@@ -859,7 +860,15 @@ def build_strategy_stage_evidence(
         # Bootstrap/alpha-spending/PBO above are archived as a health report,
         # not a verdict: they never flip ``gate_passed``.
         "statistical_evidence_role": "report_only",
-        "challenger_stress_gates_passed": _metric_passes(challenger_metrics),
+        "challenger_stress_gates_passed": stress_passed,
+        "stress_evidence_role": "report_only",
+        "challenger_stress_results": {
+            name: challenger_metrics[name]
+            for name in (
+                "robustness_passed", "component_cost_stress_passed", "rolling_passed",
+                "event_stress_passed", "capacity_curve_passed",
+            )
+        },
         "prerequisite_evidence_sha256": (
             prerequisite.get("evidence_sha256") if prerequisite is not None else None
         ),
@@ -926,10 +935,10 @@ def build_strategy_stage_artifact_from_parameter_experiment(
         if not returns_path.is_file() or not score_path.is_file():
             raise ValueError("parameter experiment trial artifacts are missing")
         frame = pd.read_parquet(returns_path)
-        if "return" not in frame:
+        if not {"return", "cost"} <= set(frame.columns):
             raise ValueError("parameter experiment return artifact is invalid")
         returns = pd.to_numeric(frame["return"], errors="coerce") - pd.to_numeric(
-            frame["cost"] if "cost" in frame else 0.0,
+            frame["cost"],
             errors="coerce",
         )
         if "datetime" in frame:

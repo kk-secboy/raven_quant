@@ -245,7 +245,8 @@ def aggregate_pre_final_grid(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
 
 
 def compare_joint_to_frozen_incumbent(
-    *, challenger_grid: Mapping[str, Any], incumbent_grid: Mapping[str, Any]
+    *, challenger_grid: Mapping[str, Any], incumbent_grid: Mapping[str, Any],
+    report_only: bool = False,
 ) -> dict[str, Any]:
     """Apply the frozen three-window replacement rule.
 
@@ -287,9 +288,8 @@ def compare_joint_to_frozen_incumbent(
 
     recent = metric_evidence(recent_profile, strict=True)
     balanced = metric_evidence(balanced_profile, strict=False)
-    # The robust aggregate can only exist after all nine independent cells
-    # pass their governed metric gate.  Record its values as immutable audit
-    # evidence instead of inventing a second threshold here.
+    # Every cell must have completed structural validation. The recorded
+    # research effect thresholds may fail without invalidating that grid.
     robust = {
         "profile_id": robust_profile,
         "gate_passed": True,
@@ -308,6 +308,8 @@ def compare_joint_to_frozen_incumbent(
         "robust_governed_gate": robust,
         "passed": bool(recent["passed"] and balanced["passed"]),
     }
+    if report_only:
+        result["statistical_evidence_role"] = "report_only"
     result["evidence_sha256"] = canonical_sha256(result)
     return result
 
@@ -990,6 +992,12 @@ class AutopilotCompletionService:
                     if kind == "joint"
                     else None
                 )
+                independent = (selected.get("admission_evidence_json") or {}).get(
+                    "independent_bundle"
+                ) or {}
+                report_only = kind == "joint" and (
+                    independent.get("multiple_testing") or {}
+                ).get("statistical_evidence_role") == "report_only"
             except _DatasetIdentityMismatch:
                 # Another immutable snapshot is outside this tournament. A
                 # corrupt artifact or incomplete admitted grid instead fails
@@ -1030,6 +1038,7 @@ class AutopilotCompletionService:
                     ),
                     "grid": grid,
                     "baseline_reference": baseline_reference,
+                    **({"statistical_evidence_role": "report_only"} if report_only else {}),
                 }
             )
         if not eligible:
@@ -1101,7 +1110,8 @@ class AutopilotCompletionService:
                 )
             capital_pool[baseline_key] = incumbent
             decision = compare_joint_to_frozen_incumbent(
-                challenger_grid=challenger["grid"], incumbent_grid=incumbent["grid"]
+                challenger_grid=challenger["grid"], incumbent_grid=incumbent["grid"],
+                report_only=challenger.get("statistical_evidence_role") == "report_only",
             )
             replacement_decisions.append(
                 {
@@ -1111,7 +1121,9 @@ class AutopilotCompletionService:
                     "evidence": decision,
                 }
             )
-            if decision["passed"] is True:
+            if decision["passed"] is True or (
+                decision.get("statistical_evidence_role") == "report_only"
+            ):
                 capital_pool[
                     (str(challenger["kind"]), str(challenger["candidate_id"]))
                 ] = challenger
@@ -1140,8 +1152,14 @@ class AutopilotCompletionService:
             "horizon_profile": profile,
             "final_oos_opened": False,
             "candidate_preference": (
+                "frozen_incumbent_plus_independently_admitted-joint-challengers"
+                if any(item.get("statistical_evidence_role") == "report_only" for item in joint)
+                else
                 "frozen_incumbent_plus_three_window-qualified-joint-challengers"
             ),
+            **({"statistical_evidence_role": "report_only"}
+               if any(item.get("statistical_evidence_role") == "report_only" for item in joint)
+               else {}),
             "score_order": [
                 "mean_annualized_excess_return_with_cost",
                 "worst_profile_annualized_excess_return_with_cost",

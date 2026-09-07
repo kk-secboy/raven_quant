@@ -86,7 +86,7 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
         module.MODEL_MEMORY_AUDIT_CONTRACT_VERSION
         == MODEL_MEMORY_AUDIT_CONTRACT_VERSION
     )
-    assert MODEL_RECOMPUTE_EXECUTOR_VERSION.endswith("single-kernel-memory-audit")
+    assert MODEL_RECOMPUTE_EXECUTOR_VERSION == "model-recompute-docker-v9-memory-bounded-handler"
     assert (
         module.MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
         == MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
@@ -94,6 +94,19 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
     )
     source = runner_path.read_text(encoding="utf-8")
     assert "model sandbox requires isolated Qlib file tracking compatibility" in source
+
+
+@pytest.mark.parametrize("value", [None, "invalid", float("nan"), float("inf"), -float("inf")])
+def test_model_sandbox_rejects_invalid_metrics_instead_of_fabricating_zero(value) -> None:
+    runner_path = Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
+    spec = importlib.util.spec_from_file_location("model_sandbox_finite_contract", runner_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pytest.raises(ValueError, match="model metric is not"):
+        module.finite(value)
+    assert module.finite(-0.025) == -0.025
+    assert module.finite(0) == 0
 
 
 def test_model_sandbox_explicitly_opts_into_ephemeral_qlib_file_tracking() -> None:
@@ -125,19 +138,19 @@ def test_model_sandbox_seals_d_plus_one_runtime_modules_and_hashes() -> None:
         assert f'"quant_platform/{module_name}.py"' in source
 
 
-def test_model_sandbox_drops_raw_after_append_semantics_are_frozen() -> None:
+def test_model_sandbox_bounds_loading_without_changing_frozen_periods() -> None:
     runner_path = (
         Path(__file__).resolve().parents[1] / "scripts" / "model_sandbox_runner.py"
     )
     source = runner_path.read_text(encoding="utf-8")
-    handler_call = source.split("    handler = DataHandlerLP(", 1)[1].split(
+    handler_call = source.split("    handler = load_memory_bounded_model_handler(", 1)[1].split(
         "    segments = {", 1
     )[0]
-    assert "process_type=DataHandlerLP.PTYPE_A" in handler_call
-    assert "drop_raw=True" in handler_call
-    assert handler_call.index("process_type=DataHandlerLP.PTYPE_A") < handler_call.index(
-        "infer_processors=["
-    )
+    assert 'start_time=periods["train_start"]' in handler_call
+    assert 'fit_end_time=periods["train_end"]' in handler_call
+    assert "end_time=prediction_end" in handler_call
+    assert "features=features" in handler_call
+    assert "additional_factors_path=factor_path" in handler_call
 
 
 def test_model_memory_snapshot_reads_process_and_cgroup_v2_peaks(

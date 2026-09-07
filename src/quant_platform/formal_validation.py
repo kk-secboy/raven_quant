@@ -18,6 +18,7 @@ FORMAL_VALIDATION_CONTRACT_VERSION = (
     "formal-validation-evidence-v4-incomplete-family-bonferroni"
 )
 PRE_FINAL_HISTORY_CONTRACT_VERSION = "pre-final-history-calendar-v1"
+FORMAL_RESEARCH_GATE_POLICY = "research-structure-and-oos-decay-v1"
 SIGNAL_DECAY_FRONTIER_VERSION = "contiguous-zero-delay-frontier-v2"
 FACTOR_SCORE_FAMILYWISE_ALPHA = 0.05
 FACTOR_SCORE_INCOMPLETE_FAMILY_MULTIPLE_TESTING_VERSION = (

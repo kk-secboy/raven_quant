@@ -877,13 +877,17 @@ def test_statistics_are_archived_report_only_and_never_veto_the_gate() -> None:
 
 
 @pytest.mark.no_database
-def test_gate_still_vetoes_failed_stress_metrics() -> None:
-    """研究阶段硬门只防蠢:压力指标失败仍然否决。"""
+@pytest.mark.parametrize("metric", [
+    "robustness_passed", "component_cost_stress_passed", "rolling_passed",
+    "event_stress_passed", "capacity_curve_passed",
+])
+def test_negative_stress_results_are_preserved_without_veto(metric: str) -> None:
+    """Completed negative stress results remain report-only research evidence."""
 
     plan = _plan()
     role = "policy_challenger"
     results = _trial_results(role)
-    results[1]["metrics"]["out_of_sample"]["robustness_passed"] = False
+    results[1]["metrics"]["out_of_sample"][metric] = False
     evidence = build_strategy_stage_evidence(
         plan,
         stage_name="policy_only",
@@ -892,9 +896,25 @@ def test_gate_still_vetoes_failed_stress_metrics() -> None:
         governed_score_sha256={"public_baseline": "1" * 64, role: "1" * 64},
     )
     assert evidence["challenger_stress_gates_passed"] is False
-    assert evidence["gate_passed"] is False
-    assert evidence["next_gate"] == "research_rejected"
+    assert evidence["challenger_stress_results"][metric] is False
+    assert evidence["stress_evidence_role"] == "report_only"
+    assert evidence["gate_passed"] is True
+    assert evidence["next_gate"] == "full_stack_pre_final"
     assert evidence["statistical_evidence_role"] == "report_only"
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize("invalid", [None, "false", 0, float("nan")])
+def test_incomplete_stress_results_still_block_research(invalid) -> None:
+    role = "policy_challenger"
+    results = _trial_results(role)
+    results[1]["metrics"]["out_of_sample"]["robustness_passed"] = invalid
+    with pytest.raises(ValueError, match="stress evidence is incomplete or malformed"):
+        build_strategy_stage_evidence(
+            _plan(), stage_name="policy_only", trial_results=results,
+            daily_returns=_returns(role),
+            governed_score_sha256={"public_baseline": "1" * 64, role: "1" * 64},
+        )
 
 
 @pytest.mark.no_database

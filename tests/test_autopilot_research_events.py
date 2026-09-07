@@ -31,7 +31,7 @@ def _request(**changes):
     return {
         "event_key": "operator-event-1", "horizon_profile": SHORT_1_5D,
         "actor": "operator", "reason": "预算内继续探索新因子", "quant_loop_n": 10,
-        "quant_duration": "1h", **changes,
+        "quant_duration": "1h", "completion_mode": "research_only", **changes,
     }
 
 

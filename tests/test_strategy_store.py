@@ -15,6 +15,7 @@ from quant_data.execution_contract import (
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
+from quant_platform.formal_validation import FORMAL_RESEARCH_GATE_POLICY
 from quant_platform.strategy_store import StrategyStore
 
 
@@ -54,7 +55,10 @@ def test_strategy_versions_share_hypothesis_trial_count_and_cap(
     assert first_evidence["trial_count_audit"]["accepted_pre_result_repair_links"] == []
 
 
-def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_url: str) -> None:
+@pytest.mark.parametrize("report_only", [False, True])
+def test_only_v2_qlib_policy_backtest_can_be_approved(
+    tmp_path: Path, database_url: str, report_only: bool,
+) -> None:
     version_id = create_strategy_version(database_url, tmp_path)
     store = StrategyStore(database_url)
     version = store.get_version(version_id)
@@ -152,6 +156,22 @@ def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_u
             actor="risk-owner",
             reason="Legacy versions retain their original final rolling gate.",
         )
+    if report_only:
+        metrics["formal_validation"].update({
+            "gate_policy_version": FORMAL_RESEARCH_GATE_POLICY,
+            "statistical_evidence_role": "report_only",
+        })
+        metrics.update({
+            "event_stress_pass_rate": 0.0, "event_stress_passed": False,
+            "capacity_curve_passed": False, "information_ratio": -0.5,
+            "sharpe_ratio": -0.4, "sortino_ratio": -0.6,
+        })
+        malformed = deepcopy(metrics)
+        malformed["information_ratio"] = None
+        store.mark_backtest(backtest["id"], "succeeded", metrics=malformed)
+        with pytest.raises(ValueError, match="information_ratio is missing or non-finite"):
+            store.approve(version_id, actor="risk-owner",
+                          reason="Incomplete evidence must never gain paper admission.")
     store.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
     approved = store.approve(
         version_id,

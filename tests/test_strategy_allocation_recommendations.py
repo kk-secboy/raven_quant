@@ -102,7 +102,12 @@ def _approve_version(
         encoding="utf-8",
     )
     pd.DataFrame(
-        {"datetime": returns.index, "return": returns.values, "cost": 0.0}
+        {
+            "datetime": returns.index, "return": returns.values, "cost": 0.0,
+            # The allocation test retains its original portfolio covariance;
+            # a synthetic paired benchmark supplies real approval evidence.
+            "bench": returns.values - 0.001,
+        }
     ).to_parquet(artifact / "daily_returns.parquet", index=False)
     metrics = formal_backtest_metrics(
         version,

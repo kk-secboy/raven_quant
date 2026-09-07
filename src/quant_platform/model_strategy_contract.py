@@ -39,6 +39,36 @@ QUANT_BUNDLE_FACTOR_CONTRACT_VERSION = "quant-bundle-model-features-v1"
 QUANT_BUNDLE_FACTOR_WEIGHT_POLICY = "unit-scale-model-learned-v1"
 
 
+def _multiple_testing_binding(evidence: dict[str, Any]) -> dict[str, Any]:
+    if evidence.get("statistical_evidence_role") == "report_only":
+        # Preserve the complete sealed report so the consumer can verify both
+        # structure and its original digest, even when no statistical trial wins.
+        return dict(evidence)
+    return {key: evidence[key] for key in (
+        "contract_version", "source", "final_oos_opened", "trial_definitions",
+        "trial_names", "trial_count", "holm_adjusted_p_values", "eligible_trial_names",
+        "pbo", "trial_daily_sharpes", "gate_passed",
+    )}
+
+
+def _multiple_testing_binding_valid(
+    evidence: dict[str, Any], *, selected_trial_name: str, evidence_sha256: str
+) -> bool:
+    if evidence.get("statistical_evidence_role") == "report_only":
+        try:
+            validate_run_multiple_testing_evidence(
+                evidence, selected_trial_name=selected_trial_name
+            )
+        except (ValueError, TypeError, KeyError):
+            return False
+        return evidence.get("evidence_sha256") == evidence_sha256
+    return (
+        "statistical_evidence_role" not in evidence
+        and selected_trial_name in (evidence.get("eligible_trial_names") or [])
+        and evidence.get("gate_passed") is True
+    )
+
+
 def normalize_model_signal_config(config: dict[str, Any]) -> dict[str, Any]:
     result = dict(config)
     signal_source = str(result.get("signal_source") or "factor_score")
@@ -299,22 +329,7 @@ def build_model_formal_admission_binding(
                 validated_model.get("multiple_testing_trial_name")
                 or identity["model_candidate_id"]
             ),
-            "multiple_testing": {
-                key: model_multiple_testing[key]
-                for key in (
-                    "contract_version",
-                    "source",
-                    "final_oos_opened",
-                    "trial_definitions",
-                    "trial_names",
-                    "trial_count",
-                    "holm_adjusted_p_values",
-                    "eligible_trial_names",
-                    "pbo",
-                    "trial_daily_sharpes",
-                    "gate_passed",
-                )
-            },
+            "multiple_testing": _multiple_testing_binding(model_multiple_testing),
         },
         "quant_bundle": None,
     }
@@ -378,22 +393,7 @@ def build_model_formal_admission_binding(
             "execution_environment_sha256": validated_bundle[
                 "execution_environment_sha256"
             ],
-            "multiple_testing": {
-                key: multiple_testing[key]
-                for key in (
-                    "contract_version",
-                    "source",
-                    "final_oos_opened",
-                    "trial_definitions",
-                    "trial_names",
-                    "trial_count",
-                    "holm_adjusted_p_values",
-                    "eligible_trial_names",
-                    "pbo",
-                    "trial_daily_sharpes",
-                    "gate_passed",
-                )
-            },
+            "multiple_testing": _multiple_testing_binding(multiple_testing),
         }
 
     payload["binding_sha256"] = canonical_sha256(payload)
@@ -629,9 +629,11 @@ def validate_model_formal_admission_binding(
         or len(model_multiple.get("trial_daily_sharpes") or [])
         != model_multiple.get("trial_count")
         or not str(model_grid.get("selected_trial_name") or "")
-        or model_grid.get("selected_trial_name")
-        not in (model_multiple.get("eligible_trial_names") or [])
-        or model_multiple.get("gate_passed") is not True
+        or not _multiple_testing_binding_valid(
+            model_multiple,
+            selected_trial_name=str(model_grid.get("selected_trial_name") or ""),
+            evidence_sha256=str(model_grid.get("multiple_testing_evidence_sha256") or ""),
+        )
         or binding.get("binding_sha256") != canonical_sha256(payload)
     ):
         raise ValueError("formal model admission binding is invalid or inconsistent")
@@ -665,13 +667,15 @@ def validate_model_formal_admission_binding(
         or bundle["multiple_testing"].get("final_oos_opened") is not False
         or bundle["multiple_testing"].get("trial_count")
         != len(bundle["multiple_testing"].get("trial_names") or [])
-        or f"{bundle_id}:joint"
-        not in (bundle["multiple_testing"].get("eligible_trial_names") or [])
+        or not _multiple_testing_binding_valid(
+            bundle["multiple_testing"],
+            selected_trial_name=f"{bundle_id}:joint",
+            evidence_sha256=str(bundle.get("multiple_testing_evidence_sha256") or ""),
+        )
         or len(bundle["multiple_testing"].get("holm_adjusted_p_values") or [])
         != bundle["multiple_testing"].get("trial_count")
         or len(bundle["multiple_testing"].get("trial_daily_sharpes") or [])
         != bundle["multiple_testing"].get("trial_count")
-        or bundle["multiple_testing"].get("gate_passed") is not True
     ):
         raise ValueError("joint formal admission bundle binding is invalid")
     return dict(binding)

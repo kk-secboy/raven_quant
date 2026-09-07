@@ -156,22 +156,24 @@ def screen(tmp_path, monkeypatch):
     )
 
 
-def test_economic_rejection_keeps_evidence_and_settles_rejected_trial(screen):
+def test_weak_effects_keep_evidence_and_settle_completed_screen(screen):
     screen.state.metrics["information_ratio"] = -0.65128008
     screen.state.metrics["annualized_excess_return_with_cost"] = -0.079300529
     screen.state.metrics["max_drawdown"] = -0.48789213
     result = screen.run()
     item = result["evaluations"][0]
-    assert item["status"] == "rejected"
-    assert item["reason_code"] == "model_metric_gate_rejected"
+    assert item["status"] == "passed"
+    assert item["reason_code"] == "model_metrics_report_only"
     cell = item["evidence"]["cells"][0]
     assert cell["metrics"] == screen.state.metrics
     assert len(cell["gate_reasons"]) == 3
+    assert cell["metric_report"]["gate_passed"] is False
+    assert cell["metric_report"]["statistical_evidence_role"] == "report_only"
     assert cell["coverage"]["coverage_gate_passed"]
     screen.worker._import_model_evaluations(screen.job, result, screen.output_path)
-    assert [status for status, _ in screen.transitions] == ["running", "rejected"]
+    assert [status for status, _ in screen.transitions] == ["running", "passed"]
     assert screen.transitions[-1][1]["evidence"] == item["evidence"]
-    assert screen.candidate_transitions[0]["status"] == "rejected"
+    assert screen.candidate_transitions[0]["status"] == "invalidated"
     assert not any(x["status"] in {"failed", "resource_blocked"} for x in result["evaluations"])
 
 
@@ -194,7 +196,7 @@ def test_malformed_metrics_remain_operational_failure(screen, value):
     assert "evidence" not in result["evaluations"][0]
 
 
-def test_resource_exhaustion_stays_distinct_from_economic_rejection(screen):
+def test_resource_exhaustion_stays_distinct_from_economic_report(screen):
     screen.state.execution_error = ModelResourceLimitError("governed memory limit")
     result = screen.run()
     assert result["evaluations"][0]["status"] == "resource_blocked"
@@ -222,7 +224,7 @@ def test_worker_recomputes_gate_instead_of_trusting_claimed_pass(screen):
     assert not screen.candidate_transitions
 
 
-def test_economic_rejection_still_requires_unchanged_artifacts(screen):
+def test_report_only_still_requires_unchanged_artifacts(screen):
     screen.state.metrics["ic"] = -0.1
     result = screen.run()
     cell = result["evaluations"][0]["evidence"]["cells"][0]

@@ -250,9 +250,12 @@ class ScheduleStore:
         misfire_grace_seconds: int,
         actor: str,
         now: datetime | None = None,
+        status: str = "active",
     ) -> dict[str, Any]:
         if kind not in ACTIVE_SCHEDULE_KINDS:
             raise ValueError("unsupported schedule kind")
+        if status not in {"active", "paused"}:
+            raise ValueError("schedule status must be active or paused")
         if not name.strip() or not actor.strip():
             raise ValueError("schedule name and actor are required")
         _require_nonlegacy_research_schedule(payload=payload, created_by=actor)
@@ -278,8 +281,8 @@ class ScheduleStore:
                         id=schedule_id,
                         name=name.strip(),
                         kind=kind,
-                        status="active",
-                        desired_status="active",
+                        status=status,
+                        desired_status=status,
                         suspension_reason=None,
                         timezone=timezone,
                         run_time=run_time,

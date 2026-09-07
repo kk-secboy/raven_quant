@@ -18,7 +18,20 @@ def _request() -> dict:
         "reason": "Run the existing complete research pipeline with a frozen budget.",
         "quant_loop_n": 10,
         "quant_duration": "1h",
+        "completion_mode": "research_only",
     }
+
+
+@pytest.mark.no_database
+def test_completion_mode_requires_explicit_opt_in():
+    request = _request()
+    request.pop("completion_mode")
+    assert AutopilotResearchEventRequest.model_validate(request).completion_mode == "research_only"
+    assert AutopilotResearchEventRequest.model_validate({
+        **request, "completion_mode": "managed_fin_strategy",
+    }).completion_mode == "managed_fin_strategy"
+    with pytest.raises(ValidationError):
+        AutopilotResearchEventRequest.model_validate({**request, "completion_mode": "paper"})
 
 
 @pytest.mark.no_database

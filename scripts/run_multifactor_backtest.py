@@ -43,6 +43,7 @@ from quant_platform.factor_recompute import (
 )
 from quant_platform.formal_validation import (
     CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
+    FORMAL_RESEARCH_GATE_POLICY,
     FORMAL_VALIDATION_CONTRACT_VERSION,
     FROZEN_STRATEGY_OUTER_SCOPE,
     build_factor_score_incomplete_family_dsr,
@@ -2395,7 +2396,14 @@ def main() -> None:
     if (
         signal_source == "model_prediction"
         and isinstance(governed_multiple_testing, dict)
-        and governed_multiple_testing.get("gate_passed") is True
+        and isinstance(governed_multiple_testing.get("gate_passed"), bool)
+        and (
+            governed_multiple_testing.get("statistical_evidence_role") == "report_only"
+            or (
+                governed_multiple_testing.get("statistical_evidence_role") is None
+                and governed_multiple_testing.get("gate_passed") is True
+            )
+        )
         and int(governed_multiple_testing.get("trial_count") or 0)
         == strategy_trial_count
         and sorted(governed_multiple_testing.get("trial_names") or [])
@@ -2450,8 +2458,8 @@ def main() -> None:
         if signal_source == "model_prediction"
         else (
             outer_walk_forward.get("status") == "completed"
-            and outer_walk_forward.get("passed") is True
-            and ablation["status"] == "passed"
+            and isinstance(outer_walk_forward.get("passed"), bool)
+            and ablation["status"] in {"passed", "failed"}
         )
     )
     multiple_testing_passed = (
@@ -2460,12 +2468,19 @@ def main() -> None:
             incomplete_factor_family
             and multiple_testing.get("status")
             == CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS
-            and multiple_testing.get("gate_passed") is True
+            and isinstance(multiple_testing.get("gate_passed"), bool)
         )
         or (
             signal_source == "model_prediction"
             and multiple_testing.get("status") == "ok"
-            and multiple_testing.get("gate_passed") is True
+            and isinstance(multiple_testing.get("gate_passed"), bool)
+            and (
+                multiple_testing.get("statistical_evidence_role") == "report_only"
+                or (
+                    multiple_testing.get("statistical_evidence_role") is None
+                    and multiple_testing.get("gate_passed") is True
+                )
+            )
             and multiple_testing.get("final_oos_opened") is False
             and multiple_testing.get("independent_admission_binding_sha256")
             == (formal_model_admission or {}).get("binding_sha256")
@@ -2473,12 +2488,14 @@ def main() -> None:
     )
     formal_validation = {
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
+        "gate_policy_version": FORMAL_RESEARCH_GATE_POLICY,
+        "statistical_evidence_role": "report_only",
         "pre_final_history": pre_final_history,
         "status": (
             "passed"
             if factor_validation_passed
             and signal_decay["maximum_supported_delay_bars"] is not None
-            and paired_bootstrap["confidence_interval_95"][0] > 0
+            and paired_bootstrap.get("status") == "ok"
             and multiple_testing_passed
             else "failed"
         ),

@@ -15,6 +15,7 @@ import pandas as pd
 
 sys.path.insert(0, "/work")
 
+from quant_platform.model_data_handler import load_memory_bounded_model_handler  # noqa: E402
 from quant_platform.qlib_portfolio_calendar import (  # noqa: E402
     resolve_qlib_portfolio_calendar_boundary,
 )
@@ -31,7 +32,7 @@ MODEL_LABEL_HORIZON_TRADING_DAYS = 2
 MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS = 5
 LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
 MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v6-cpu-tournament-40gb-single-kernel"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v7-cpu-tournament-40gb-bounded-handler"
 MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_MEMORY_STAGE_PREFIX = "QUANTLAB_MODEL_MEMORY_STAGE="
@@ -61,9 +62,11 @@ MODEL_CHECKPOINT_SUFFIXES = {
 def finite(value: Any) -> float:
     try:
         result = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return result if math.isfinite(result) else 0.0
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model metric is not numeric") from exc
+    if not math.isfinite(result):
+        raise ValueError("model metric is not finite")
+    return result
 
 
 def sha256_file(path: Path) -> str:
@@ -419,7 +422,6 @@ def main() -> None:
     from qlib.contrib.model.linear import LinearModel
     from qlib.contrib.model.pytorch_general_nn import GeneralPTNN
     from qlib.data.dataset import DatasetH, TSDatasetH
-    from qlib.data.dataset.handler import DataHandlerLP
     from qlib.workflow.record_temp import PortAnaRecord
 
     seed = int(manifest["seed"])
@@ -477,38 +479,12 @@ def main() -> None:
             governed_limit_bytes=governed_limit_bytes,
         )
     )
-    names = list(features)
-    expressions = [features[name] for name in names]
-    qlib_loader: dict[str, Any] = {
-        "class": "QlibDataLoader",
-        "kwargs": {
-            "config": {
-                "feature": [expressions, names],
-                "label": [[label_expression], ["LABEL0"]],
-            }
-        },
-    }
     additional_factors = str(manifest.get("additional_factors_path") or "").strip()
-    data_loader: dict[str, Any]
+    factor_path = None
     if additional_factors:
         factor_path = Path(additional_factors)
         if not factor_path.is_file() or not factor_path.is_relative_to(Path("/work")):
             raise ValueError("additional factor values are outside the isolated workspace")
-        data_loader = {
-            "class": "NestedDataLoader",
-            "kwargs": {
-                "join": "left",
-                "dataloader_l": [
-                    qlib_loader,
-                    {
-                        "class": "StaticDataLoader",
-                        "kwargs": {"config": {"feature": str(factor_path)}},
-                    },
-                ],
-            },
-        }
-    else:
-        data_loader = qlib_loader
     memory_stages.append(
         record_model_memory_stage(
             memory_audit_path,
@@ -516,29 +492,20 @@ def main() -> None:
             governed_limit_bytes=governed_limit_bytes,
         )
     )
-    handler = DataHandlerLP(
+    def handler_memory_stage(stage: str) -> None:
+        memory_stages.append(record_model_memory_stage(
+            memory_audit_path, stage, governed_limit_bytes=governed_limit_bytes,
+        ))
+
+    handler = load_memory_bounded_model_handler(
+        features=features,
+        label_expression=label_expression,
         instruments=manifest.get("universe", "cn_all"),
         start_time=periods["train_start"],
         end_time=prediction_end,
-        data_loader=data_loader,
-        process_type=DataHandlerLP.PTYPE_A,
-        drop_raw=True,
-        infer_processors=[
-            {
-                "class": "RobustZScoreNorm",
-                "kwargs": {
-                    "fields_group": "feature",
-                    "clip_outlier": True,
-                    "fit_start_time": periods["train_start"],
-                    "fit_end_time": periods["train_end"],
-                },
-            },
-            {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-        ],
-        learn_processors=[
-            {"class": "DropnaLabel"},
-            {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
-        ],
+        fit_end_time=periods["train_end"],
+        additional_factors_path=factor_path,
+        on_stage=handler_memory_stage,
     )
     memory_stages.append(
         record_model_memory_stage(

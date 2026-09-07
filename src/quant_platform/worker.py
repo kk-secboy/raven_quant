@@ -78,7 +78,7 @@ from .market_overview import MarketOverviewService
 from .market_permission import MarketPermissionStore
 from .model_artifact_store import ModelArtifactStore
 from .model_research_governance import canonical_sha256 as model_canonical_sha256
-from .model_research_governance import model_metric_gate_failures
+from .model_research_governance import model_metric_report
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
 from .news_flash_factors import default_factors_dir as news_flash_factors_dir
 from .ops_calendar import load_calendar_days
@@ -4375,12 +4375,14 @@ class LocalJobWorker:
                         != expected_cadence["evidence_sha256"]
                     ):
                         raise ValueError("feature-screen cell changed decision cadence")
-                    gate_reasons = model_metric_gate_failures(cell.get("metrics") or {})
-                    gate_status = "rejected" if gate_reasons else "passed"
+                    metric_report = model_metric_report(cell.get("metrics") or {})
+                    gate_reasons = metric_report["failure_reasons"]
+                    gate_status = "passed"
                     if (
                         item.get("status") != gate_status
                         or cell.get("gate_status") != gate_status
                         or cell.get("gate_reasons", []) != gate_reasons
+                        or cell.get("metric_report") != metric_report
                     ):
                         raise ValueError("feature-screen result disagrees with its metric gate")
                     for path_key, hash_key in (
@@ -4406,12 +4408,8 @@ class LocalJobWorker:
                     self.rdagent_candidates.transition_candidate(
                         "model",
                         candidate_id,
-                        status="rejected" if gate_reasons else "invalidated",
-                        reason=(
-                            "feature-screen model metric gate rejected: " + "; ".join(gate_reasons)
-                            if gate_reasons
-                            else "screening-only model; full-round candidate required"
-                        ),
+                        status="invalidated",
+                        reason="screening-only model; full-round candidate required",
                         actor="autopilot",
                     )
                 elif item.get("status") == "resource_blocked":

@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 from quant_platform.model_recompute import ModelResourceLimitError
-from quant_platform.model_research_governance import canonical_sha256
+from quant_platform.model_research_governance import REQUIRED_MODEL_METRICS, canonical_sha256
 from quant_platform.research_execution_cadence import (
     build_research_execution_cadence_contract,
 )
@@ -363,7 +363,7 @@ def test_quant_ensemble_factor_only_retrains_every_member_and_equal_ranks(
         return (
             {
                 "status": "passed",
-                "metrics": {"ic": 0.03},
+                "metrics": {name: 0.03 for name in REQUIRED_MODEL_METRICS},
                 "latest_prediction_date": "2023-12-29",
                 "predictions_path": str(predictions_path),
                 "predictions_sha256": module.file_sha256(predictions_path),
@@ -389,7 +389,7 @@ def test_quant_ensemble_factor_only_retrains_every_member_and_equal_ranks(
         report_path = output / "portfolio_report.parquet"
         report_path.write_bytes(b"ensemble-report")
         return (
-            {"ic": 0.03},
+            {name: 0.03 for name in REQUIRED_MODEL_METRICS},
             report_path,
             {
                 "contract_version": "qlib-portfolio-calendar-boundary-v1",
@@ -503,7 +503,7 @@ def test_quant_full_grid_preserves_policy_and_execution_evidence(
         }
         return (
             {
-                "metrics": {"ic": 0.03},
+                "metrics": {name: 0.03 for name in REQUIRED_MODEL_METRICS},
                 "latest_prediction_date": manifest["periods"]["valid_end"],
                 "predictions_sha256": "e" * 64,
                 "checkpoint_sha256": "f" * 64,

@@ -21,7 +21,7 @@ from quant_platform.model_research_governance import (
     build_run_multiple_testing_evidence,
     canonical_sha256,
     file_sha256,
-    model_metric_gate_failures,
+    model_metric_report,
     validate_independent_model_evidence,
     verify_model_prediction_artifact,
 )
@@ -231,15 +231,15 @@ def main() -> None:
                         screen_periods["valid_end"],
                     ),
                 )
-                # A complete executable result that misses an economic threshold
-                # remains research evidence, rather than an executor failure.
-                gate_reasons = model_metric_gate_failures(screen_result["metrics"])
-                gate_status = "rejected" if gate_reasons else "passed"
+                metric_report = model_metric_report(screen_result["metrics"])
+                gate_reasons = metric_report["failure_reasons"]
+                gate_status = "passed"
                 cell = {
                     "profile_id": "recent_3y",
                     "seed": screen_seed,
                     "gate_status": gate_status,
                     "gate_reasons": gate_reasons,
+                    "metric_report": metric_report,
                     "metrics": screen_result["metrics"],
                     "periods": screen_periods,
                     "predictions_path": str(predictions_path),
@@ -302,7 +302,7 @@ def main() -> None:
                     {
                         "candidate_id": candidate_id,
                         "status": gate_status,
-                        "reason_code": "model_metric_gate_rejected" if gate_reasons else None,
+                        "reason_code": "model_metrics_report_only" if gate_reasons else None,
                         "evidence": screen_evidence,
                         "evidence_sha256": screen_evidence["evidence_sha256"],
                     }
@@ -429,6 +429,7 @@ def main() -> None:
                     seed_results[str(seed)] = {
                         "status": "passed",
                         "metrics": result["metrics"],
+                        "metric_report": model_metric_report(result["metrics"]),
                         "latest_prediction_date": result["latest_prediction_date"],
                         "predictions_path": str(predictions_path),
                         "predictions_sha256": result["predictions_sha256"],

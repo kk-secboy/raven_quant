@@ -102,7 +102,8 @@ AUTOPILOT_CONTRACT_VERSION = "autopilot-v1"
 RDAGENT_INTEGRATION_CONTRACT_VERSION = "rdagent-integration-v4"
 AUTOPILOT_RESEARCH_HORIZONS = (SHORT_1_5D, SWING_1_6M, LONG_1_3Y)
 SCHEDULED_RESEARCH_EVENT = "scheduled"
-MANUAL_RESEARCH_EVENT_CONTRACT = "manual-research-event-v1"
+MANUAL_RESEARCH_EVENT_CONTRACT = "manual-research-event-v2"
+LEGACY_MANUAL_RESEARCH_EVENT_CONTRACT = "manual-research-event-v1"
 
 DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "contract_version": AUTOPILOT_CONTRACT_VERSION,
@@ -203,6 +204,7 @@ def _research_event_request(
     reason: str,
     quant_loop_n: int,
     quant_duration: str,
+    completion_mode: str = "research_only",
 ) -> dict[str, Any]:
     if not isinstance(event_key, str) or not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", event_key
@@ -220,6 +222,8 @@ def _research_event_request(
         raise ValueError("research event loop count must be between 2 and 20")
     if not isinstance(quant_duration, str):
         raise ValueError("research event duration is invalid")
+    if completion_mode not in ("research_only", "managed_fin_strategy"):
+        raise ValueError("research event completion mode is invalid")
     return {
         "event_key": event_key,
         "horizon_profile": horizon_profile,
@@ -227,6 +231,7 @@ def _research_event_request(
         "reason": reason.strip(),
         "quant_loop_n": quant_loop_n,
         "quant_duration": validate_duration(quant_duration),
+        "completion_mode": completion_mode,
     }
 
 
@@ -253,12 +258,23 @@ def _manual_research_event(cycle: dict[str, Any]) -> dict[str, Any] | None:
     expected_keys = {
         "contract_version", "request", "config", "config_revision", "dataset", "sha256"
     }
-    if set(event) != expected_keys or event["contract_version"] != MANUAL_RESEARCH_EVENT_CONTRACT:
+    if set(event) != expected_keys or event["contract_version"] not in {
+        MANUAL_RESEARCH_EVENT_CONTRACT, LEGACY_MANUAL_RESEARCH_EVENT_CONTRACT,
+    }:
         raise ValueError("manual research event contract is invalid")
     request = event["request"]
-    if not isinstance(request, dict) or set(request) != {
+    request_keys = {
         "event_key", "horizon_profile", "actor", "reason", "quant_loop_n", "quant_duration"
-    } or _research_event_request(**request) != request:
+    }
+    legacy = event["contract_version"] == LEGACY_MANUAL_RESEARCH_EVENT_CONTRACT
+    if not legacy:
+        request_keys.add("completion_mode")
+    if not isinstance(request, dict) or set(request) != request_keys:
+        raise ValueError("manual research event request changed")
+    normalized_request = _research_event_request(**request)
+    if legacy:
+        normalized_request.pop("completion_mode")
+    if normalized_request != request:
         raise ValueError("manual research event request changed")
     config = event["config"]
     dataset = event["dataset"]
@@ -764,7 +780,9 @@ class AutopilotStore:
             ).first()
             if existing is not None:
                 stored = self._decode_cycle(row_dict(existing))
-                if _manual_research_event(stored)["request"] != request:
+                stored_request = dict(_manual_research_event(stored)["request"])
+                stored_request.setdefault("completion_mode", "research_only")
+                if stored_request != request:
                     raise ValueError("research event key is already bound to another request")
                 cycle_id = str(existing.id)
             else:
@@ -1431,14 +1449,17 @@ class AutopilotController:
         reason: str,
         quant_loop_n: int = 10,
         quant_duration: str = "1h",
+        completion_mode: str = "research_only",
     ) -> dict[str, Any]:
         """Register one audited activity; ordinary ticks perform all research work."""
         request = _research_event_request(
-            event_key, horizon_profile, actor, reason, quant_loop_n, quant_duration
+            event_key, horizon_profile, actor, reason, quant_loop_n, quant_duration, completion_mode
         )
         existing = self.store.get_research_event(event_key)
         if existing is not None:
-            if _manual_research_event(existing)["request"] != request:
+            stored_request = dict(_manual_research_event(existing)["request"])
+            stored_request.setdefault("completion_mode", "research_only")
+            if stored_request != request:
                 raise ValueError("research event key is already bound to another request")
             return existing
         if quant_loop_n > self.settings.rdagent_max_loops:

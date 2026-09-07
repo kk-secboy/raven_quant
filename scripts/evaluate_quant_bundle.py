@@ -39,6 +39,7 @@ from quant_platform.model_research_governance import (
     canonical_sha256,
     file_sha256,
     is_sha256,
+    model_metric_report,
     paired_moving_block_bootstrap,
     validate_quant_bundle_evidence,
     verify_model_prediction_artifact,
@@ -585,6 +586,7 @@ def _finalize_candidate_multiple_testing(
             "holm_adjusted_one_sided_p_value": adjusted_p_value,
             "family_observed_mean_difference": family_mean_difference,
             "maximum_one_sided_p_value": 0.05,
+            "statistical_evidence_role": "report_only",
             "pbo_eligible": pbo_eligible,
             "passed": (
                 family_mean_difference > 0.0
@@ -599,13 +601,6 @@ def _finalize_candidate_multiple_testing(
     evidence["multiple_testing"] = multiple
     evidence["bundle_sha256"] = canonical_sha256(evidence)
     item["evidence_sha256"] = evidence["bundle_sha256"]
-    if comparison["passed"] is not True:
-        item["status"] = "failed"
-        item["error"] = (
-            f"quant joint {candidate_id} did not beat the frozen incumbent "
-            "after the shared Holm/PBO correction"
-        )
-        return
     validate_quant_bundle_evidence(
         evidence,
         dataset_identity_sha256=dataset_identity_sha256,
@@ -903,6 +898,7 @@ def _execute_single_model_cell(
     cell = {
         "status": "passed",
         "metrics": model_result["metrics"],
+        "metric_report": model_metric_report(model_result["metrics"]),
         "latest_prediction_date": model_result["latest_prediction_date"],
         "predictions_path": str(predictions_path),
         "predictions_sha256": model_result["predictions_sha256"],
@@ -934,9 +930,11 @@ def _execute_single_model_cell(
 def _finite(value: Any) -> float:
     try:
         result = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return result if math.isfinite(result) else 0.0
+    except (TypeError, ValueError) as exc:
+        raise ValueError("independent quant metric is not numeric") from exc
+    if not math.isfinite(result):
+        raise ValueError("independent quant metric is not finite")
+    return result
 
 
 def _normalized_labels(value: pd.DataFrame) -> pd.Series:
@@ -1229,6 +1227,7 @@ def _execute_ensemble_factor_only_cell(
             "combiner": "equal_rank",
             "stacking": False,
             "metrics": metrics,
+            "metric_report": model_metric_report(metrics),
             "latest_prediction_date": periods["valid_end"],
             "predictions_path": str(predictions_path),
             "predictions_sha256": predictions_sha256,

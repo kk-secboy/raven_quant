@@ -103,7 +103,16 @@ def test_v39_job_binding_preserves_history_and_rejects_current_code(
         ),
         runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: image,
     }
-    # The runner is unchanged in v40; the imported closure still rejects v39.
+    # Historical v39 evidence cannot authorize the new v41 runner.
+    with pytest.raises(ValueError, match="transparent v39 runner bytes differ"):
+        runtime.require_transparent_baseline_runner(
+            config=config, job_payload=payload,
+            runner_path=ROOT / "scripts/run_multifactor_backtest.py",
+        )
+    monkeypatch.setattr(runtime, "_file_sha256",
+                        lambda _: runtime.STRATEGY_RESEARCH_V39_TARGET_RUNNER_SHA256)
+    monkeypatch.setattr(runtime, "position_risk_bundle_sha256",
+                        lambda _: runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256)
     with pytest.raises(ValueError, match="transparent v39 runtime bundle differs"):
         runtime.require_transparent_baseline_runner(
             config=config, job_payload=payload,
@@ -139,7 +148,7 @@ def test_historical_identity_cannot_execute_current_runner_or_current_closure(
     old_payload = deepcopy(payload)
     assert payload[runtime.TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] == runner
     assert payload[runtime.TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] == bundle
-    failure = "runtime bundle differs" if version == 38 else "runner bytes differ"
+    failure = "runner bytes differ"
     with pytest.raises(ValueError, match=f"transparent v{version} {failure}"):
         runtime.require_transparent_baseline_runner(
             config=config, job_payload=payload,
@@ -148,7 +157,7 @@ def test_historical_identity_cannot_execute_current_runner_or_current_closure(
     # Even supplying old runner bytes cannot authorize the new imported code.
     monkeypatch.setattr(runtime, "_file_sha256", lambda _path: runner)
     monkeypatch.setattr(runtime, "position_risk_bundle_sha256",
-                        lambda _root: runtime.STRATEGY_RESEARCH_V39_TARGET_RUNTIME_BUNDLE_SHA256)
+                        lambda _root: runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256)
     with pytest.raises(ValueError, match=f"transparent v{version} runtime bundle differs"):
         runtime.require_transparent_baseline_runner(
             config=config, job_payload=payload,

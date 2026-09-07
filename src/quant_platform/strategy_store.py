@@ -73,6 +73,7 @@ from quant_platform.factor_recompute import (
 from quant_platform.formal_validation import (
     CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
     FACTOR_SCORE_INCOMPLETE_FAMILY_MULTIPLE_TESTING_VERSION,
+    FORMAL_RESEARCH_GATE_POLICY,
     FORMAL_VALIDATION_CONTRACT_VERSION,
     FROZEN_STRATEGY_OUTER_SCOPE,
     NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
@@ -203,6 +204,7 @@ from quant_platform.transparent_baseline_runner import (
     STRATEGY_RESEARCH_V37_TARGET_RECIPE_VERSION,
     STRATEGY_RESEARCH_V38_TARGET_RECIPE_VERSION,
     STRATEGY_RESEARCH_V39_TARGET_RECIPE_VERSION,
+    STRATEGY_RESEARCH_V40_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
@@ -370,6 +372,7 @@ def _transparent_worker_runtime_failures(
             STRATEGY_RESEARCH_V37_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V38_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V39_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_V40_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
         or target_runner_for_recipe(
@@ -433,7 +436,7 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
             "forward-only rehabilitation entry point"
         )
     if is_current_public_recipe and config.get("evidence_mode") != EVIDENCE_MODE_SEALED:
-        raise ValueError("the v40 strategy-research runtime requires sealed final OOS")
+        raise ValueError("the v41 strategy-research runtime requires sealed final OOS")
     if target_runner_for_recipe(recipe_id, recipe_version) is None:
         raise ValueError("the current transparent runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
@@ -1005,6 +1008,15 @@ def _scenario_artifact_failures(scenarios: dict[str, Any], artifact_root: Path) 
     return failures
 
 
+def _formal_statistics_report_only(metrics: Mapping[str, Any]) -> bool:
+    formal = metrics.get("formal_validation")
+    return (
+        isinstance(formal, Mapping)
+        and formal.get("gate_policy_version") == FORMAL_RESEARCH_GATE_POLICY
+        and formal.get("statistical_evidence_role") == "report_only"
+    )
+
+
 def _pre_final_stability_failures(
     version: Mapping[str, Any], metrics: Mapping[str, Any]
 ) -> list[str]:
@@ -1027,6 +1039,7 @@ def _pre_final_stability_failures(
         return ["pre-final stability evidence is required"]
     minimum_windows = int(config.get("min_rolling_windows") or 3)
     minimum_pass_rate = float(config.get("min_rolling_pass_rate", 0.60))
+    report_only = _formal_statistics_report_only(metrics)
 
     if str(config.get("signal_source") or "factor_score") == "model_prediction":
         admission = evidence.get("model_admission")
@@ -1043,7 +1056,8 @@ def _pre_final_stability_failures(
             or seeds != list(REQUIRED_MODEL_SEEDS)
             or int(grid.get("cell_count") or 0) != expected_cells
             or not isinstance(multiple, Mapping)
-            or multiple.get("gate_passed") is not True
+            or not isinstance(multiple.get("gate_passed"), bool)
+            or (not report_only and multiple.get("gate_passed") is not True)
             or admission.get("final_oos_opened") is not False
         ):
             return [
@@ -1062,9 +1076,12 @@ def _pre_final_stability_failures(
         return ["pre-final factor stability evidence is malformed"]
     if (
         outer.get("status") != "completed"
-        or outer.get("passed") is not True
+        or not isinstance(outer.get("passed"), bool)
+        or (not report_only and outer.get("passed") is not True)
         or fold_count < minimum_windows
-        or pass_rate < minimum_pass_rate
+        or not isfinite(pass_rate)
+        or not 0.0 <= pass_rate <= 1.0
+        or (not report_only and pass_rate < minimum_pass_rate)
     ):
         return [
             "pre-final factor stability violates the configured outer "
@@ -1113,7 +1130,13 @@ def _valid_factor_score_incomplete_family_alternative(
     except (AttributeError, TypeError, ValueError):
         return False
     return (
-        validated_multiple.get("gate_passed") is True
+        (
+            validated_multiple.get("gate_passed") is True
+            or (
+                _formal_statistics_report_only(metrics)
+                and isinstance(validated_multiple.get("gate_passed"), bool)
+            )
+        )
         and validated_multiple.get("pbo", {}).get("status")
         == NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS
         and validated_multiple.get("pbo", {}).get("pbo") is None
@@ -1127,6 +1150,7 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
     if not isinstance(evidence, dict):
         return ["formal validation evidence is required"]
     failures: list[str] = []
+    report_only = _formal_statistics_report_only(metrics)
     if evidence.get("contract_version") != FORMAL_VALIDATION_CONTRACT_VERSION:
         failures.append("formal validation contract version is missing or obsolete")
     if evidence.get("status") != "passed" or metrics.get("formal_validation_passed") is not True:
@@ -1280,11 +1304,14 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
     elif (
         not isinstance(outer, dict)
         or outer.get("status") != "completed"
-        or outer.get("passed") is not True
+        or not isinstance(outer.get("passed"), bool)
+        or (not report_only and outer.get("passed") is not True)
         or int(outer.get("fold_count") or 0) < 3
         or not valid_candidate_coverage
-        or recorded_test_pass_rate < minimum_outer_test_pass_rate
-        or recorded_mean_test_metric <= minimum_outer_test_metric
+        or not isfinite(recorded_test_pass_rate)
+        or not isfinite(recorded_mean_test_metric)
+        or (not report_only and recorded_test_pass_rate < minimum_outer_test_pass_rate)
+        or (not report_only and recorded_mean_test_metric <= minimum_outer_test_metric)
         or not isinstance(outer_folds, list)
         or len(outer_folds) != int(outer.get("fold_count") or 0)
         or not valid_outer_folds
@@ -1321,11 +1348,12 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
             )
     elif (
         not isinstance(ablation, dict)
-        or ablation.get("status") != "passed"
+        or ablation.get("status") not in ({"passed", "failed"} if report_only else {"passed"})
         or len(ablation.get("runs") or []) != expected_components
         or any(
             not isinstance(item, dict)
-            or item.get("passed") is not True
+            or not isinstance(item.get("passed"), bool)
+            or (not report_only and item.get("passed") is not True)
             or not isinstance(item.get("metrics"), dict)
             for item in ablation.get("runs") or []
         )
@@ -1349,7 +1377,9 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
         or bootstrap.get("status") != "ok"
         or not isinstance(interval, list)
         or len(interval) != 2
-        or float(interval[0]) <= 0
+        or not all(isfinite(float(value)) for value in interval)
+        or float(interval[0]) > float(interval[1])
+        or (not report_only and float(interval[0]) <= 0)
     ):
         failures.append("paired moving-block bootstrap did not show positive baseline increment")
 
@@ -1387,6 +1417,16 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
             if isinstance(multiple, dict)
             else None
         )
+        if (
+            report_only and isinstance(multiple, dict)
+            and multiple.get("statistical_evidence_role") == "report_only"
+        ):
+            observed_multiple = {
+                key: value for key, value in multiple.items()
+                if key not in {
+                    "status", "evidence_scope", "independent_admission_binding_sha256",
+                }
+            }
         pbo_valid = (
             isinstance(pbo, dict)
             and (
@@ -1407,7 +1447,8 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
             and multiple.get("status") == "ok"
             and multiple.get("trial_count") == trials
             and len(multiple.get("holm_adjusted_p_values") or []) == trials
-            and multiple.get("gate_passed") is True
+            and isinstance(multiple.get("gate_passed"), bool)
+            and (report_only or multiple.get("gate_passed") is True)
             and pbo_valid
             and isinstance(admission_multiple, dict)
             and observed_multiple == admission_multiple
@@ -1440,7 +1481,8 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
         valid_multiple = (
             bool(validated_multiple)
             and validated_multiple == multiple
-            and multiple.get("gate_passed") is True
+            and isinstance(multiple.get("gate_passed"), bool)
+            and (report_only or multiple.get("gate_passed") is True)
         )
     else:
         pbo = multiple.get("pbo") if isinstance(multiple, dict) else None
@@ -5450,6 +5492,7 @@ class StrategyStore:
         if not backtests or backtests[0]["status"] != "succeeded" or not backtests[0]["metrics"]:
             raise ValueError("strategy version requires a successful backtest before approval")
         metrics = backtests[0]["metrics"]
+        report_only = _formal_statistics_report_only(metrics)
         if backtests[0].get("is_legacy"):
             raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
@@ -5632,6 +5675,22 @@ class StrategyStore:
             "deflated_sharpe_probability": metrics.get("deflated_sharpe_probability"),
             "robustness_pass_rate": metrics.get("robustness_pass_rate"),
         }
+        report_only_thresholds = {
+            "deflated_sharpe_probability": 0.95,
+            "robustness_pass_rate": 1.0,
+        }
+        effect_checks = {}
+        if report_only:
+            for name in (
+                "tracking_error", "max_drawdown", "average_turnover", "information_ratio",
+                "sharpe_ratio", "sortino_ratio", "event_stress_pass_rate", "win_rate",
+                "profit_loss_ratio",
+            ):
+                effect_checks[name] = checks.pop(name)
+                report_only_metrics[name] = effect_checks[name][0]
+                report_only_thresholds[name] = effect_checks[name][1]
+            for name in ("event_stress_passed", "capacity_curve_passed"):
+                report_only_metrics[name] = metrics.get(name)
         if str(config.get("horizon_profile") or LEGACY_AMBIGUOUS) == LEGACY_AMBIGUOUS:
             # Preserve the historical contract for versions whose research
             # horizon is unknown. New horizon strategies prove rolling
@@ -5658,6 +5717,13 @@ class StrategyStore:
                 "min",
             )
         failures = []
+        for name, (value, _threshold, _mode) in effect_checks.items():
+            try:
+                valid = not isinstance(value, bool) and isfinite(float(value))
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                failures.append(f"report-only {name} is missing or non-finite")
         try:
             require_strategy_execution_contract(config)
         except ValueError as exc:
@@ -5726,7 +5792,9 @@ class StrategyStore:
             "strategy_contract_hash"
         ) != config.get("execution_contract_hash"):
             failures.append("strategy execution contract evidence is missing or inconsistent")
-        if metrics.get("event_stress_passed") is not True:
+        if not isinstance(metrics.get("event_stress_passed"), bool) or (
+            not report_only and metrics.get("event_stress_passed") is not True
+        ):
             failures.append("event stress scenarios did not satisfy the configured result gate")
         if (metrics.get("event_stress") or {}).get("state_source") != (
             "full_backtest_carried_positions"
@@ -5784,7 +5852,9 @@ class StrategyStore:
             failures.append("Deflated Sharpe evidence is missing or invalid")
         failures.extend(_formal_validation_failures(version, metrics))
         failures.extend(_pre_final_stability_failures(version, metrics))
-        if metrics.get("capacity_curve_passed") is not True:
+        if not isinstance(metrics.get("capacity_curve_passed"), bool) or (
+            not report_only and metrics.get("capacity_curve_passed") is not True
+        ):
             failures.append("capacity curve did not satisfy the configured result gate")
         eligibility = metrics.get("eligibility")
         if (
@@ -6127,10 +6197,7 @@ class StrategyStore:
                     "report_only_gate_metrics": {
                         "statistical_evidence_role": "report_only",
                         **report_only_metrics,
-                        "reference_thresholds": {
-                            "deflated_sharpe_probability": 0.95,
-                            "robustness_pass_rate": 1.0,
-                        },
+                        "reference_thresholds": report_only_thresholds,
                     },
                     **(
                         {"model_artifact_id": activated_model_artifact_id}

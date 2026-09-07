@@ -527,6 +527,37 @@ def test_recent_gain_cannot_hide_balanced_window_degradation() -> None:
     assert decision["passed"] is False
 
 
+def test_report_only_joint_is_ranked_without_discarding_weak_window() -> None:
+    class ReportOnlyService(_Service):
+        def _grid_rows(self, *, kind: str, candidate_id: str) -> list[dict[str, Any]]:
+            rows = _grid(0.20 if kind == "joint" else 0.10)
+            if kind == "joint":
+                for row in rows:
+                    if row["profile_id"] == "balanced_5y":
+                        row["metrics"]["annualized_excess_return_with_cost"] = 0.09
+                        row["metrics_sha256"] = canonical_sha256(row["metrics"])
+            return rows
+
+    candidates = _Candidates()
+    candidates.bundles["bundle-joint"]["admission_evidence_json"]["independent_bundle"] = {
+        "multiple_testing": {"statistical_evidence_role": "report_only", "gate_passed": False}
+    }
+    events: list[str] = []
+    service = ReportOnlyService(candidates, _Strategies(events), _Promotions(events))
+    result = service.select_champion(
+        dataset="snapshot-v1", dataset_identity_sha256=IDENTITY,
+        allowed_candidate_ids={"bundle-joint"},
+    )
+    evidence = result["champion_selection_evidence"]
+    assert evidence["selected_candidate_id"] == "bundle-joint"
+    assert set(evidence["capital_pool_candidate_ids"]) == {"bundle-joint", "model-strong"}
+    decision = evidence["replacement_decisions"][0]["evidence"]
+    assert decision["passed"] is False
+    assert decision["statistical_evidence_role"] == "report_only"
+    assert evidence["statistical_evidence_role"] == "report_only"
+    assert events == []
+
+
 def test_completion_recognizes_a_strict_equal_rank_ensemble() -> None:
     selected = _EnsembleService().select_champion(
         dataset="snapshot-v1",

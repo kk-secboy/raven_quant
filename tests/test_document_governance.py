@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+from fnmatch import fnmatch
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree
@@ -66,17 +68,15 @@ IGNORED_ARTIFACT_PARTS = {
 
 
 def _project_artifacts(pattern: str) -> list[Path]:
-    return sorted(
-        (
-            path
-            for path in PROJECT_ROOT.rglob(pattern)
-            if not any(
-                part in IGNORED_ARTIFACT_PARTS or part.startswith(".tmp-pytest")
-                for part in path.relative_to(PROJECT_ROOT).parts
-            )
-        ),
-        key=lambda path: path.as_posix(),
-    )
+    paths = []
+    for parent, directories, files in os.walk(PROJECT_ROOT):
+        # Prune generated trees before descending into potentially millions of
+        # test artifacts; the governed file set is unchanged.
+        directories[:] = [name for name in directories
+                          if name not in IGNORED_ARTIFACT_PARTS
+                          and not name.startswith(".tmp-pytest")]
+        paths.extend(Path(parent) / name for name in files if fnmatch(name, pattern))
+    return sorted(paths, key=lambda path: path.as_posix())
 
 
 def _is_legal_or_instruction_document(path: Path) -> bool:
@@ -328,7 +328,7 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-07-v40`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-07-v41`" in readme
     assert "不能沿用旧结果宣称等价" in readme
 
 
@@ -343,6 +343,18 @@ def test_manual_research_activities_preserve_the_single_mainline_and_frozen_budg
         "活动期间新数据与配置不能替换冻结输入或扩大预算",
         "全局暂停仍然生效",
         "自动周/月/季度排程不把手动活动计作自身的周期额度",
+    ):
+        assert contract in specification
+
+
+def test_v41_complete_mainline_requires_explicit_frozen_completion_authority() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`0113_strategy_runtime_v41`", "`manual-research-event-v2`",
+        "`completion_mode=managed_fin_strategy`", "旧 v1 活动永不隐式升级",
+        "`research-structure-and-oos-decay-v1`", "不能把缺失或非有限指标填零来通过",
+        "发布新数据不得替换它", "前向门不改", "不重试旧终态",
+        "保留每个表达式的完整证券、时间上下文、精度及官方 Qlib 处理规则",
     ):
         assert contract in specification
 

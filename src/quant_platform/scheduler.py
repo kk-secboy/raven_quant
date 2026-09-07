@@ -36,6 +36,11 @@ from .alert_store import AlertStore
 from .autopilot import AutopilotController
 from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
 from .feature_set_registry import get_feature_set
+from .fin_strategy_research_completion import (
+    ManagedResearchCompletion,
+    require_completion_payload,
+    select_completion_dataset,
+)
 from .fin_strategy_schedule import (
     canonical_sha256 as fin_strategy_schedule_sha256,
 )
@@ -419,6 +424,7 @@ class SchedulerEngine:
                 message=str(exc),
                 dedupe_key=f"platform:autopilot:{current.date().isoformat()}:failed",
             )
+        self._enqueue_completed_fin_strategy_research(current)
         simulation_order_plans_enqueued = self._enqueue_due_simulation_order_plans(current)
         strategy_health_result = self._enqueue_due_strategy_health(current)
         for failure in strategy_health_result["failures"]:
@@ -1774,12 +1780,20 @@ class SchedulerEngine:
         scheduled_for = datetime.fromisoformat(run["scheduled_for"])
         delay = (now - scheduled_for).total_seconds()
         payload = dict(run.get("payload") or {})
+        try:
+            completion_event = (
+                run["kind"] == "rdagent_research"
+                and require_completion_payload(payload) is not None
+            )
+        except ValueError as exc:
+            self.schedules.finish_run(run["id"], "failed", message=str(exc), now=now)
+            return
         recoverable_full_data_slot = (
             run["kind"] == "data_pipeline"
             and payload.get("profile") == "full"
             and bool(run["trading_days_only"])
         )
-        if delay > int(run["misfire_grace_seconds"]):
+        if not completion_event and delay > int(run["misfire_grace_seconds"]):
             if recoverable_full_data_slot:
                 local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
                 if local_date.weekday() >= 5:
@@ -1892,7 +1906,9 @@ class SchedulerEngine:
                 seconds=int(run["misfire_grace_seconds"])
             )
             retry_delay = max(30, min(300, self.settings.scheduler_poll_seconds * 4))
-            retry_at = min(deadline, now + timedelta(seconds=retry_delay))
+            retry_at = now + timedelta(seconds=retry_delay)
+            if not completion_event:
+                retry_at = min(deadline, retry_at)
             self.schedules.wait_run(
                 run["id"],
                 message=f"waiting for dependency: {exc}",
@@ -2792,12 +2808,50 @@ class SchedulerEngine:
             "status": str(item.status),
         }
 
+    def _enqueue_completed_fin_strategy_research(self, now: datetime) -> None:
+        completion = ManagedResearchCompletion(self.autopilot, self.schedules)
+        config, _ = self.autopilot.config()
+        if not self.settings.rdagent_enabled or not config["enabled"]:
+            return
+        for cycle_id in completion.pending_cycle_ids():
+            try:
+                completion.register(cycle_id, now)
+            except (KeyError, ValueError) as exc:
+                self.alerts.create(
+                    source_type="autopilot_cycle", source_id=cycle_id, severity="warning",
+                    category="fin_strategy_research_completion_blocked",
+                    title="Completed research could not enter managed strategy research",
+                    message=str(exc), dedupe_key=f"fin-strategy-completion:{cycle_id}:blocked",
+                )
+
     def _enqueue_research(
+        self, run: dict[str, Any], scheduled_for: datetime,
+    ) -> dict[str, Any] | None:
+        binding = require_completion_payload(run["payload"])
+        if binding is None:
+            return self._enqueue_research_bound(run, scheduled_for)
+        completion = ManagedResearchCompletion(self.autopilot, self.schedules)
+        # The same horizon lock used by new manual activities prevents an
+        # upstream activity from starting between the idle check and job creation.
+        with completion.engine.begin() as connection:
+            self.autopilot.store._lock_horizon(connection, binding["horizon_profile"])
+            if not completion.dispatch_allowed(
+                str(run["schedule_id"]), connection=connection, expected_payload=run["payload"],
+            ):
+                raise ScheduleRunWaiting("research completion is paused or its horizon is busy")
+            return self._enqueue_research_bound(run, scheduled_for)
+
+    def _enqueue_research_bound(
         self,
         run: dict[str, Any],
         scheduled_for: datetime,
     ) -> dict[str, Any] | None:
         managed = validate_managed_fin_strategy_payload(run["payload"])
+        completion = require_completion_payload(run["payload"])
+        if completion is not None:
+            completion = ManagedResearchCompletion(self.autopilot, self.schedules).verify(
+                run["payload"]
+            )
         payload = normalize_research_schedule_payload(
             run["payload"],
             max_loops=self.settings.rdagent_max_loops,
@@ -2825,7 +2879,9 @@ class SchedulerEngine:
         managed_trigger_events: list[dict[str, Any]] = []
         if scenario.requires_dataset:
             available = list_qlib_datasets(self.settings.data_root)
-            if managed is not None:
+            if completion is not None:
+                dataset = select_completion_dataset(completion, available)
+            elif managed is not None:
                 try:
                     dataset = select_latest_reproducible_daily_dataset(available)
                 except ValueError as exc:
@@ -2888,7 +2944,21 @@ class SchedulerEngine:
                 raise ValueError("scheduled RD-Agent training window starts before the dataset")
             if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
                 raise ValueError("scheduled RD-Agent test window ends after the dataset")
-            if managed is not None:
+            if completion is not None:
+                # Completion is an event, not a backdated exchange session.
+                # Its input calendar is the immutable upstream vintage.
+                cadence_event = {"due": True, "reason": "research_completed", "event": None}
+                trigger = {
+                    "contract_version": "managed-fin-strategy-trigger-id-v1",
+                    "kind": "research_completion",
+                    "schedule_contract_sha256": managed["contract_sha256"],
+                    "source_cycle_id": completion["source_cycle_id"],
+                    "completion_binding_sha256": completion["binding_sha256"],
+                }
+                managed_trigger_events.append({
+                    **trigger, "trigger_id": fin_strategy_schedule_sha256(trigger),
+                })
+            elif managed is not None:
                 try:
                     exchange_days = load_trade_calendar_open_days(
                         self.settings.data_root
@@ -2938,12 +3008,12 @@ class SchedulerEngine:
                     ),
                 )
                 return None
-            if incumbent_strategy is not None:
+            if incumbent_strategy is not None and completion is None:
                 drift_event = self._managed_fin_strategy_drift_event(
                     incumbent_strategy,
                     observed_at=scheduled_for,
                 )
-            if cadence_event["due"]:
+            if cadence_event["due"] and completion is None:
                 calendar_identity = {
                     "contract_version": "managed-fin-strategy-trigger-id-v1",
                     "kind": "calendar",
@@ -2990,7 +3060,7 @@ class SchedulerEngine:
                     message="managed fin_strategy trigger events are already consumed",
                 )
                 return None
-            if local_date.isoformat() not in set(calendar):
+            if completion is None and local_date.isoformat() not in set(calendar):
                 raise ScheduleRunWaiting(
                     "latest reproducible daily Qlib has not published the schedule session"
                 )
@@ -3000,7 +3070,7 @@ class SchedulerEngine:
             if dataset is None or not isinstance(payload.get("feature_set"), dict):
                 raise ValueError("scheduled fin_strategy governed inputs are incomplete")
             try:
-                champion_selection = (
+                champion_selection = completion["champion_selection"] if completion else (
                     self.autopilot.champion_selector.select_champion(
                         dataset=str(dataset["name"]),
                         dataset_identity_sha256=str(

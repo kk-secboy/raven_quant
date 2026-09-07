@@ -21,8 +21,8 @@ from .research_execution_cadence import (
     validate_research_execution_cadence_contract,
 )
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v8-single-kernel-memory-audit"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v6-cpu-tournament-40gb-single-kernel"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v9-memory-bounded-handler"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v7-cpu-tournament-40gb-bounded-handler"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
@@ -568,6 +568,7 @@ def execute_model_candidate(
     )
     workflow_adapter_source = Path(__file__).resolve().with_name("qlib_workflow.py")
     upstream_versions_source = Path(__file__).resolve().with_name("upstream_versions.py")
+    model_data_handler_source = Path(__file__).resolve().with_name("model_data_handler.py")
     if not all(
         path.is_file()
         for path in (
@@ -578,6 +579,7 @@ def execute_model_candidate(
             research_horizon_source,
             workflow_adapter_source,
             upstream_versions_source,
+            model_data_handler_source,
         )
     ):
         raise ValueError("governed model runtime dependencies are unavailable")
@@ -588,6 +590,7 @@ def execute_model_candidate(
     research_horizon_sha256 = file_sha256(research_horizon_source)
     workflow_adapter_sha256 = file_sha256(workflow_adapter_source)
     upstream_versions_sha256 = file_sha256(upstream_versions_source)
+    model_data_handler_sha256 = file_sha256(model_data_handler_source)
     resource_policy = governed_model_resource_policy(
         model_type=str(manifest.get("model_type") or ""),
         model_engine=model_engine,
@@ -611,6 +614,7 @@ def execute_model_candidate(
         "research_horizon_source_sha256": research_horizon_sha256,
         "qlib_workflow_adapter_sha256": workflow_adapter_sha256,
         "upstream_versions_sha256": upstream_versions_sha256,
+        "model_data_handler_sha256": model_data_handler_sha256,
         "sandbox_image": image,
         "sandbox_image_id": image_id,
         "mlflow_allow_file_store": MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE,
@@ -641,6 +645,7 @@ def execute_model_candidate(
     )
     shutil.copy2(workflow_adapter_source, sandbox_package / "qlib_workflow.py")
     shutil.copy2(upstream_versions_source, sandbox_package / "upstream_versions.py")
+    shutil.copy2(model_data_handler_source, sandbox_package / "model_data_handler.py")
     runtime_checkpoint: Path | None = None
     if allow_inference:
         checkpoint_format = str(source_checkpoint_format)
@@ -701,6 +706,7 @@ def execute_model_candidate(
         "quant_platform/research_horizon.py",
         "quant_platform/qlib_workflow.py",
         "quant_platform/upstream_versions.py",
+        "quant_platform/model_data_handler.py",
     ]
     if runtime_checkpoint is not None:
         readonly_names.append(runtime_checkpoint.name)

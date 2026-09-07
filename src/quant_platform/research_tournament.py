@@ -35,7 +35,8 @@ from .model_research_governance import (
     REQUIRED_MODEL_SEEDS,
     REQUIRED_RESEARCH_PROFILES,
     file_sha256,
-    require_model_metric_gate,
+    model_metric_report,
+    require_model_metric_report,
     validate_run_multiple_testing_evidence,
 )
 from .research_execution_cadence import (
@@ -2094,18 +2095,14 @@ class ResearchTournamentStore:
                             raise ValueError(
                                 "ensemble member prediction artifact is missing or changed"
                             )
-                    metric_passed = True
-                    try:
-                        require_model_metric_gate(
-                            cell_value.get("metrics") or {},
-                            context=f"ensemble {ensemble_id}/{profile_id}/{seed}",
-                        )
-                    except ValueError:
-                        metric_passed = False
-                    if (cell_value.get("status") == "passed") != metric_passed:
+                    require_model_metric_report(
+                        cell_value, context=f"ensemble {ensemble_id}/{profile_id}/{seed}"
+                    )
+                    metric_passed = model_metric_report(cell_value["metrics"])["gate_passed"]
+                    if cell_value.get("status") != "passed":
                         raise ValueError("ensemble metric gate status is inconsistent")
                     all_cells_passed = all_cells_passed and metric_passed
-                    cell_rows.append((profile_id, seed, cell_value, metric_passed))
+                    cell_rows.append((profile_id, seed, cell_value, True))
             multiple = evidence_value.get("multiple_testing")
             if not isinstance(multiple, Mapping):
                 raise ValueError("ensemble shared multiple-testing evidence is missing")
@@ -2120,16 +2117,11 @@ class ResearchTournamentStore:
                 != str(multiple.get("evidence_sha256") or "")
             ):
                 raise ValueError("ensemble multiple-testing evidence changed")
-            selected_by_multiple = False
-            try:
-                validate_run_multiple_testing_evidence(
-                    multiple, selected_trial_name=ensemble_id
-                )
-                selected_by_multiple = True
-            except ValueError:
-                selected_by_multiple = False
-            should_pass = all_cells_passed and selected_by_multiple
-            if (reported_status == "passed") != should_pass:
+            validate_run_multiple_testing_evidence(multiple, selected_trial_name=ensemble_id)
+            if evidence_value.get("all_metric_cells_passed") is not all_cells_passed:
+                raise ValueError("ensemble metric report aggregate is inconsistent")
+            selected_by_multiple = ensemble_id in multiple["eligible_trial_names"]
+            if reported_status != "passed":
                 raise ValueError("ensemble terminal gate status is inconsistent")
             existing_cells = connection.execute(
                 select(model_ensemble_evaluations).where(

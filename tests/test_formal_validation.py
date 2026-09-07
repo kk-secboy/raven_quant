@@ -10,6 +10,7 @@ import pytest
 from quant_data.snapshot_lineage import canonical_sha256
 from quant_platform.formal_validation import (
     CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
+    FORMAL_RESEARCH_GATE_POLICY,
     FORMAL_VALIDATION_CONTRACT_VERSION,
     FROZEN_STRATEGY_OUTER_SCOPE,
     NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
@@ -203,6 +204,21 @@ def test_strategy_formal_gate_rejects_completed_but_failing_oos_evidence() -> No
         "outer walk-forward" in failure
         for failure in _formal_validation_failures(version, metrics)
     )
+    formal = metrics["formal_validation"]
+    formal["gate_policy_version"] = FORMAL_RESEARCH_GATE_POLICY
+    formal["statistical_evidence_role"] = "report_only"
+    formal["paired_block_bootstrap"]["confidence_interval_95"] = [-0.02, -0.001]
+    assert _formal_validation_failures(version, metrics) == []
+    assert formal["outer_walk_forward"]["passed"] is False
+    # A policy label does not excuse missing trials or falsified statistics.
+    original_folds = outer["folds"]
+    outer["folds"] = original_folds[:-1]
+    assert any("outer walk-forward" in item for item in _formal_validation_failures(
+        version, metrics,
+    ))
+    outer["folds"] = original_folds
+    formal["paired_block_bootstrap"]["confidence_interval_95"] = [float("nan"), 0.01]
+    assert any("bootstrap" in item for item in _formal_validation_failures(version, metrics))
 
 
 def test_pre_final_history_is_long_and_strictly_before_final_test() -> None:

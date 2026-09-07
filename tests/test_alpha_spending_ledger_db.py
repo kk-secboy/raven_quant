@@ -524,7 +524,7 @@ def test_decay_check_vetoes_an_oos_edge_collapsed_below_half_of_research(
     assert settled["passed"] is False
     decay = settled["settlement_evidence_json"]["decay_check"]
     assert decay["research_mean_daily_after_cost_excess"] == 0.002
-    assert decay["oos_mean_daily_after_cost_excess"] == 0.0005
+    assert decay["oos_mean_daily_after_cost_excess"] == pytest.approx(0.0005)
     assert decay["decay_ratio"] == pytest.approx(0.25)
     assert decay["decay_passed"] is False
 

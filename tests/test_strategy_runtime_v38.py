@@ -102,7 +102,16 @@ def test_v38_job_binding_preserves_history_and_rejects_current_code(
         ),
         runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: image,
     }
-    # The runner is unchanged in v39; the imported closure still rejects v38.
+    # The v41 runner is new; old evidence must fail before it can execute it.
+    with pytest.raises(ValueError, match="transparent v38 runner bytes differ"):
+        runtime.require_transparent_baseline_runner(
+            config=config, job_payload=payload,
+            runner_path=ROOT / "scripts/run_multifactor_backtest.py",
+        )
+    monkeypatch.setattr(runtime, "_file_sha256",
+                        lambda _: runtime.STRATEGY_RESEARCH_V38_TARGET_RUNNER_SHA256)
+    monkeypatch.setattr(runtime, "position_risk_bundle_sha256",
+                        lambda _: runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256)
     with pytest.raises(ValueError, match="transparent v38 runtime bundle differs"):
         runtime.require_transparent_baseline_runner(
             config=config, job_payload=payload,

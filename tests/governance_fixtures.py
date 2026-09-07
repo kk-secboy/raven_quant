@@ -27,6 +27,8 @@ from quant_platform.cost_model import CostModelConfig
 from quant_platform.formal_validation import (
     FORMAL_VALIDATION_CONTRACT_VERSION,
     PRE_FINAL_HISTORY_CONTRACT_VERSION,
+    build_paired_bootstrap_evidence_from_daily_returns,
+    paired_bootstrap_parameters_from_config,
 )
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import (
@@ -459,6 +461,14 @@ def formal_backtest_metrics(
     hypothesis_group_evidence: dict,
 ) -> dict:
     manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    authority = {
+        "evidence_mode": "sealed_final_oos",
+        "evaluation_mode": "formal_final_oos",
+        "final_oos_opened": True,
+    }
+    if version.get("evidence_mode") != authority["evidence_mode"]:
+        raise ValueError("formal backtest fixture requires a sealed final OOS version")
+    manifest_payload.update(authority)
     shared_experiment_count = int(
         hypothesis_group_evidence.get("shared_experiment_count") or 0
     )
@@ -482,6 +492,22 @@ def formal_backtest_metrics(
         },
     )
     final_periods = manifest_payload["periods"]
+    daily_returns_path = manifest.parent / "daily_returns.parquet"
+    if not daily_returns_path.exists():
+        dates = pd.bdate_range(final_periods["start"], final_periods["end"], name="datetime")
+        sequence = pd.Series(range(len(dates)), index=dates, dtype=float)
+        benchmark_returns = ((sequence % 17) - 8) * 0.0001
+        pd.DataFrame({
+            "return": benchmark_returns + 0.0004 + ((sequence % 7) - 3) * 0.00002,
+            "cost": 0.00005,
+            "bench": benchmark_returns,
+        }).to_parquet(daily_returns_path)
+    # Derive the evidence from the bytes readers actually validate, using the
+    # immutable version's bootstrap parameters rather than a claimed interval.
+    paired_bootstrap = build_paired_bootstrap_evidence_from_daily_returns(
+        pd.read_parquet(daily_returns_path),
+        parameters=paired_bootstrap_parameters_from_config(version["config"]),
+    )
     version_factors = {
         str(item["factor_candidate_id"]): item for item in version.get("factors", [])
     }
@@ -611,6 +637,7 @@ def formal_backtest_metrics(
         }
     artifact_manifest = write_backtest_artifact_manifest(manifest.parent)
     return {
+        **authority,
         "backtest_engine": "qlib",
         "backtest_engine_version": QLIB_ENGINE_VERSION,
         "qlib_native_backtest": True,
@@ -728,11 +755,7 @@ def formal_backtest_metrics(
                     {"delay_bars": 1, "passed": True},
                 ],
             },
-            "paired_block_bootstrap": {
-                "status": "ok",
-                "confidence_interval_95": [0.0001, 0.001],
-                "one_sided_p_value": 0.01,
-            },
+            "paired_block_bootstrap": paired_bootstrap,
             "multiple_testing": {
                 "status": "not_applicable_single_trial",
                 "trial_count": 1,
@@ -800,6 +823,7 @@ def formal_backtest_metrics(
             "regulatory_data_available": True,
         },
         "provenance": {
+            **authority,
             "frequency": "day",
             "dataset_identity_sha256": DATASET_IDENTITY,
             "snapshot_manifest_sha256": "b" * 64,

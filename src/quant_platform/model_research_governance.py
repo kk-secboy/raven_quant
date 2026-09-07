@@ -309,6 +309,7 @@ def build_run_multiple_testing_evidence(
         "returns_sha256": file_sha256(returns_path),
         "observations": len(trials),
         "gate_passed": bool(eligible),
+        "statistical_evidence_role": "report_only",
     }
     evidence["evidence_sha256"] = canonical_sha256(evidence)
     return evidence
@@ -352,7 +353,7 @@ def validate_run_multiple_testing_evidence(
                 len(pbo_trial_names) > 1
                 and pbo.get("status") == "ok"
                 and pbo.get("pbo") is not None
-                and 0.0 <= float(pbo["pbo"]) <= float(evidence.get("maximum_pbo", -1.0))
+                and 0.0 <= float(pbo["pbo"]) <= 1.0
             )
         )
     )
@@ -386,14 +387,35 @@ def validate_run_multiple_testing_evidence(
         or not all(math.isfinite(value) for value in means)
         or len(set(eligible)) != len(eligible)
         or any(value not in trial_names for value in eligible)
-        or selected_trial_name not in eligible
-        or evidence.get("gate_passed") is not True
+        or selected_trial_name not in trial_names
+        or selected_trial_name in forced
+        or evidence.get("statistical_evidence_role") not in {None, "report_only"}
         or int(evidence.get("observations") or 0) < 40
         or not pbo_valid
         or not is_sha256(evidence.get("returns_sha256"))
         or not is_sha256(evidence.get("evidence_sha256"))
     ):
         raise ValueError("run-level Holm/PBO gate is invalid or selected trial did not pass")
+    if evidence.get("statistical_evidence_role") == "report_only":
+        pbo_passed = len(pbo_trial_names) == 1 or float(pbo["pbo"]) <= 0.50
+        expected_eligible = [
+            name for name, value in zip(trial_names, adjusted, strict=True)
+            if value <= 0.05 and pbo_passed
+        ]
+        if (
+            evidence.get("maximum_adjusted_p_value") != 0.05
+            or evidence.get("maximum_pbo") != 0.50
+            or adjusted != holm_bonferroni(raw)
+            or eligible != expected_eligible
+            or evidence.get("gate_passed") is not bool(expected_eligible)
+            or len(means) != count
+        ):
+            raise ValueError("run-level statistical report disagrees with its recorded values")
+    elif selected_trial_name not in eligible or evidence.get("gate_passed") is not True or (
+        len(pbo_trial_names) > 1
+        and float(pbo["pbo"]) > float(evidence.get("maximum_pbo", -1.0))
+    ):
+        raise ValueError("legacy run-level Holm/PBO gate did not pass")
     expected = canonical_sha256(
         {key: value for key, value in evidence.items() if key != "evidence_sha256"}
     )
@@ -519,7 +541,7 @@ def _require_finite_metrics(metrics: Mapping[str, Any]) -> None:
 
 
 def model_metric_gate_failures(metrics: Mapping[str, Any]) -> list[str]:
-    """Return economic gate failures; malformed or missing metrics still raise."""
+    """Report threshold misses; malformed or missing metrics still raise."""
     _require_finite_metrics(metrics)
     failures: list[str] = []
     minimums = {
@@ -543,22 +565,35 @@ def model_metric_gate_failures(metrics: Mapping[str, Any]) -> list[str]:
     return failures
 
 
-def _require_model_metric_gate(metrics: Mapping[str, Any], *, context: str) -> None:
-    """Reject executable-but-useless models before they become research-admitted.
-
-    The three seeds are independent robustness replications, not three chances to
-    cherry-pick a winner. Every governed seed/profile cell meets the same policy.
-    Quant ablations remain diagnostic; only their immutable joint bundle is gated.
-    """
+def model_metric_report(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep economic observations separate from structural research admission."""
     failures = model_metric_gate_failures(metrics)
-    if failures:
-        raise ValueError(f"{context} failed {MODEL_METRIC_GATE_VERSION}: " + "; ".join(failures))
+    return {
+        "contract_version": MODEL_METRIC_GATE_VERSION,
+        "statistical_evidence_role": "report_only",
+        "thresholds": dict(MODEL_METRIC_GATE),
+        "gate_passed": not failures,
+        "failure_reasons": failures,
+    }
+
+
+def require_model_metric_report(
+    cell: Mapping[str, Any], *, context: str, report_only: bool = False
+) -> None:
+    expected = model_metric_report(cell.get("metrics") or {})
+    # Historical evidence remains byte-for-byte intact. Newly recorded reports
+    # must agree with the metrics; a report-only label cannot conceal bad data.
+    if "metric_report" in cell and cell["metric_report"] != expected:
+        raise ValueError(f"{context} metric report is inconsistent")
+    if "metric_report" not in cell and not report_only:
+        require_model_metric_gate(cell.get("metrics") or {}, context=context)
 
 
 def require_model_metric_gate(metrics: Mapping[str, Any], *, context: str) -> None:
-    """Public fail-closed gate shared by models and frozen rank ensembles."""
-
-    _require_model_metric_gate(metrics, context=context)
+    """Historical threshold contract for evidence without a report-only marker."""
+    failures = model_metric_gate_failures(metrics)
+    if failures:
+        raise ValueError(f"{context} failed {MODEL_METRIC_GATE_VERSION}: " + "; ".join(failures))
 
 
 def validate_independent_model_evidence(
@@ -642,9 +677,11 @@ def validate_independent_model_evidence(
                 raise ValueError(
                     f"model profile {profile_name} seed {seed} exposed final OOS predictions"
                 )
-            _require_model_metric_gate(
-                result.get("metrics") or {},
+            require_model_metric_report(
+                result,
                 context=f"model profile {profile_name} seed {seed}",
+                report_only=evidence["multiple_testing"].get("statistical_evidence_role")
+                == "report_only",
             )
             if not is_sha256(result.get("predictions_sha256")):
                 raise ValueError(f"model profile {profile_name} seed {seed} has no prediction hash")
@@ -851,13 +888,15 @@ def validate_quant_bundle_evidence(
                     raise ValueError(
                         f"quant ablation {name}/{profile_name}/{seed} exposed final OOS"
                     )
-                if name == "joint":
-                    _require_model_metric_gate(
-                        seed_result.get("metrics") or {},
-                        context=f"quant joint {profile_name} seed {seed}",
-                    )
-                else:
-                    _require_finite_metrics(seed_result.get("metrics") or {})
+                require_model_metric_report(
+                    seed_result,
+                    context=f"quant {name} {profile_name}/{seed}",
+                    report_only=name != "joint" or (
+                        isinstance(bundle.get("multiple_testing"), Mapping)
+                        and bundle["multiple_testing"].get("statistical_evidence_role")
+                        == "report_only"
+                    ),
+                )
                 if not is_sha256(seed_result.get("predictions_sha256")) or not is_sha256(
                     seed_result.get("execution_evidence_sha256")
                 ):
@@ -992,6 +1031,9 @@ def validate_quant_bundle_evidence(
                 if key != "evidence_sha256"
             }
         )
+        pbo_eligible = delta_trial_name in multiple_testing["eligible_trial_names"]
+        expected_passed = delta_mean > 0.0 and adjusted_delta_p <= 0.05 and pbo_eligible
+        report_only = comparison.get("statistical_evidence_role") == "report_only"
         if (
             len(incumbent_trials) != 1
             or len(delta_trials) != 1
@@ -1002,23 +1044,25 @@ def validate_quant_bundle_evidence(
             or comparison.get("profile_id") != PRIMARY_MODEL_PROFILE
             or comparison.get("seed_aggregation") != "equal_mean_fixed_seeds"
             or comparison.get("multiple_testing_trial_name") != delta_trial_name
-            or comparison.get("pbo_eligible") is not True
-            or delta_trial_name not in multiple_testing["eligible_trial_names"]
+            or comparison.get("pbo_eligible") is not pbo_eligible
             or comparison.get("final_oos_opened") is not False
-            or comparison.get("passed") is not True
-            or float(comparison.get("family_observed_mean_difference") or 0.0)
-            <= 0.0
-            or float(comparison.get("family_observed_mean_difference") or 0.0)
+            or comparison.get("statistical_evidence_role") not in {None, "report_only"}
+            or (report_only and multiple_testing.get("statistical_evidence_role") != "report_only")
+            or comparison.get("passed") is not expected_passed
+            or (not report_only and not expected_passed)
+            or not math.isfinite(delta_mean)
+            or float(comparison.get("family_observed_mean_difference", math.nan))
             != delta_mean
-            or float(comparison.get("raw_one_sided_p_value") or 1.0)
+            or float(comparison.get("raw_one_sided_p_value", math.nan))
             != raw_delta_p
-            or float(comparison.get("holm_adjusted_one_sided_p_value") or 1.0)
+            or float(comparison.get("holm_adjusted_one_sided_p_value", math.nan))
             != adjusted_delta_p
-            or adjusted_delta_p
-            > float(comparison.get("maximum_one_sided_p_value") or 0.0)
+            or comparison.get("maximum_one_sided_p_value") != 0.05
+            or not math.isfinite(float(comparison.get("observed_mean_difference", math.nan)))
+            or not 0.0 <= float(comparison.get("one_sided_p_value", math.nan)) <= 1.0
             or comparison.get("evidence_sha256") != comparison_sha256
         ):
-            raise ValueError("quant joint challenger did not beat the frozen incumbent")
+            raise ValueError("quant joint frozen incumbent comparison is invalid")
     payload = {key: value for key, value in bundle.items() if key != "bundle_sha256"}
     expected = canonical_sha256(payload)
     if bundle.get("bundle_sha256") != expected:
