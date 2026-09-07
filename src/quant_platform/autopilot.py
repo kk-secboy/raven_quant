@@ -3361,6 +3361,14 @@ class AutopilotController:
         current_status = str(current["status"])
         if current_status == target:
             return
+        if current_status == "selected" and target in {"passed", "failed", "rejected"}:
+            if candidate_id is not None and current.get("candidate_id") != candidate_id:
+                raise ValueError("tournament trial candidate binding cannot change")
+            # Selection preserves the trial's completed evidence. Feature-screen
+            # candidates are deliberately invalidated when full-model work starts;
+            # observing that later candidate state must not rewrite the selection
+            # or prevent subsequent model branches from progressing.
+            return
         if current_status == "passed" and target in {"failed", "rejected"}:
             # The trial result is immutable historical evidence.  A later
             # candidate invalidation is recorded on the candidate, not by
