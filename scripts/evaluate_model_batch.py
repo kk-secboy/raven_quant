@@ -21,7 +21,7 @@ from quant_platform.model_research_governance import (
     build_run_multiple_testing_evidence,
     canonical_sha256,
     file_sha256,
-    require_model_metric_gate,
+    model_metric_gate_failures,
     validate_independent_model_evidence,
     verify_model_prediction_artifact,
 )
@@ -219,10 +219,6 @@ def main() -> None:
                     runner_path=runner_path,
                     timeout_seconds=int(manifest.get("model_timeout_seconds", 7200)),
                 )
-                require_model_metric_gate(
-                    screen_result["metrics"],
-                    context=f"feature screen {candidate_id}",
-                )
                 predictions_path = workspace / "output" / "predictions.parquet"
                 coverage = verify_model_prediction_artifact(
                     predictions_path,
@@ -235,10 +231,15 @@ def main() -> None:
                         screen_periods["valid_end"],
                     ),
                 )
+                # A complete executable result that misses an economic threshold
+                # remains research evidence, rather than an executor failure.
+                gate_reasons = model_metric_gate_failures(screen_result["metrics"])
+                gate_status = "rejected" if gate_reasons else "passed"
                 cell = {
                     "profile_id": "recent_3y",
                     "seed": screen_seed,
-                    "gate_status": "passed",
+                    "gate_status": gate_status,
+                    "gate_reasons": gate_reasons,
                     "metrics": screen_result["metrics"],
                     "periods": screen_periods,
                     "predictions_path": str(predictions_path),
@@ -300,7 +301,8 @@ def main() -> None:
                 evaluations.append(
                     {
                         "candidate_id": candidate_id,
-                        "status": "passed",
+                        "status": gate_status,
+                        "reason_code": "model_metric_gate_rejected" if gate_reasons else None,
                         "evidence": screen_evidence,
                         "evidence_sha256": screen_evidence["evidence_sha256"],
                     }

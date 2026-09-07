@@ -383,7 +383,8 @@ def test_quant_due_rejects_cross_identity_champion_before_database_access() -> N
 def test_model_research_uses_each_horizons_calendar_cadence() -> None:
     class Store:
         @staticmethod
-        def latest_branch(_scenario, *, horizon_profile):
+        def latest_branch(_scenario, *, horizon_profile, scheduled_only):
+            assert scheduled_only is True
             return {
                 "cycle_id": "previous-cycle",
                 "created_at": datetime(2026, 8, 1, tzinfo=UTC),
@@ -426,7 +427,8 @@ def test_model_research_uses_each_horizons_calendar_cadence() -> None:
 def test_model_cadence_accepts_serialized_database_timestamp() -> None:
     class Store:
         @staticmethod
-        def latest_branch(_scenario, *, horizon_profile):
+        def latest_branch(_scenario, *, horizon_profile, scheduled_only):
+            assert scheduled_only is True
             return {
                 "cycle_id": "prior",
                 "created_at": "2026-08-28T11:00:00+00:00",
@@ -838,7 +840,9 @@ def test_quant_runs_bind_each_horizons_primary_label(
     )
 
     controller = AutopilotController.__new__(AutopilotController)
-    controller.settings = SimpleNamespace(data_root=tmp_path)
+    controller.settings = SimpleNamespace(
+        data_root=tmp_path, rdagent_max_loops=10, rdagent_max_duration="2h"
+    )
     controller.research = Research()
     controller.jobs = Jobs()
     controller.store = Store()

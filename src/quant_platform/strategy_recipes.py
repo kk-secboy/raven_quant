@@ -8,7 +8,7 @@ from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 # v17, the narrowly scoped v18 consumed-history rehabilitation, and v20-v37
 # remain historical identities. v38 seals the physical-order quantity bridge,
 # raw-price capacity and Qlib full liquidation without changing research or OOS gates.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-06-v39"
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-07-v40"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

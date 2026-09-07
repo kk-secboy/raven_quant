@@ -202,7 +202,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
                 "AND NOT tgisinternal"
             )
         ).scalar_one()
-    assert revision == "0110_strategy_runtime_v39"
+    assert revision == "0112_strategy_runtime_v40"
     assert (
         "source_version.config_json -> 'transparent_baseline_bootstrap' ->> "
         "'recipe_sha256'"
@@ -227,14 +227,14 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "BEFORE DELETE OR UPDATE ON quantlab.strategy_versions"
         in recovery_strategy_trigger
     )
-    assert {"horizon_profile", "primary_label_policy_sha256"} <= {
+    assert {"horizon_profile", "primary_label_policy_sha256", "research_event_key"} <= {
         column["name"]
         for column in inspector.get_columns("autopilot_cycles", schema="quantlab")
     }
     assert any(
-        constraint.get("name") == "uq_autopilot_cycle_dataset_horizon"
+        constraint.get("name") == "uq_autopilot_cycle_dataset_horizon_event"
         and constraint.get("column_names")
-        == ["dataset_identity_sha256", "horizon_profile"]
+        == ["dataset_identity_sha256", "horizon_profile", "research_event_key"]
         for constraint in inspector.get_unique_constraints(
             "autopilot_cycles", schema="quantlab"
         )

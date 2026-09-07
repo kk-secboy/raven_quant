@@ -518,15 +518,8 @@ def _require_finite_metrics(metrics: Mapping[str, Any]) -> None:
             raise ValueError(f"independent model metric {name} is not finite")
 
 
-def _require_model_metric_gate(metrics: Mapping[str, Any], *, context: str) -> None:
-    """Reject executable-but-useless models before they become research-admitted.
-
-    The three seeds are independent robustness replications, not three chances to
-    cherry-pick a winner.  Every governed seed/profile cell therefore has to meet
-    the same fixed policy.  Quant ablations remain diagnostic; this gate is applied
-    only to their immutable ``joint`` bundle below.
-    """
-
+def model_metric_gate_failures(metrics: Mapping[str, Any]) -> list[str]:
+    """Return economic gate failures; malformed or missing metrics still raise."""
     _require_finite_metrics(metrics)
     failures: list[str] = []
     minimums = {
@@ -547,6 +540,17 @@ def _require_model_metric_gate(metrics: Mapping[str, Any], *, context: str) -> N
     maximum_drawdown = float(MODEL_METRIC_GATE["maximum_absolute_drawdown"])
     if drawdown > maximum_drawdown:
         failures.append(f"abs(max_drawdown)={drawdown:.8g} > {maximum_drawdown:.8g}")
+    return failures
+
+
+def _require_model_metric_gate(metrics: Mapping[str, Any], *, context: str) -> None:
+    """Reject executable-but-useless models before they become research-admitted.
+
+    The three seeds are independent robustness replications, not three chances to
+    cherry-pick a winner. Every governed seed/profile cell meets the same policy.
+    Quant ablations remain diagnostic; only their immutable joint bundle is gated.
+    """
+    failures = model_metric_gate_failures(metrics)
     if failures:
         raise ValueError(f"{context} failed {MODEL_METRIC_GATE_VERSION}: " + "; ".join(failures))
 

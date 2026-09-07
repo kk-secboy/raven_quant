@@ -78,6 +78,7 @@ from .market_overview import MarketOverviewService
 from .market_permission import MarketPermissionStore
 from .model_artifact_store import ModelArtifactStore
 from .model_research_governance import canonical_sha256 as model_canonical_sha256
+from .model_research_governance import model_metric_gate_failures
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
 from .news_flash_factors import default_factors_dir as news_flash_factors_dir
 from .ops_calendar import load_calendar_days
@@ -460,6 +461,9 @@ def _indexed_independent_evaluations(job: dict, result: dict) -> dict[str, dict]
     evaluations = result.get("evaluations") if isinstance(result, dict) else None
     if result.get("status") != "ok" or not isinstance(evaluations, list):
         raise ValueError("independent evaluation batch did not complete")
+    terminal_states = {"passed", "failed", "resource_blocked"}
+    if payload.get("evaluation_stage") == "feature_screen":
+        terminal_states.add("rejected")
     indexed: dict[str, dict] = {}
     for item in evaluations:
         if not isinstance(item, dict):
@@ -467,7 +471,7 @@ def _indexed_independent_evaluations(job: dict, result: dict) -> dict[str, dict]
         candidate_id = str(item.get("candidate_id") or "")
         if candidate_id in indexed:
             raise ValueError("independent evaluation contains a duplicate candidate")
-        if item.get("status") not in {"passed", "failed", "resource_blocked"}:
+        if item.get("status") not in terminal_states:
             raise ValueError("independent evaluation has an unknown terminal state")
         indexed[candidate_id] = item
     if len(expected_ids) != len(set(expected_ids)) or set(indexed) != set(expected_ids):
@@ -4332,7 +4336,7 @@ class LocalJobWorker:
                     raise ValueError("feature-screen candidate is bound to another trial")
                 if trial["status"] == "queued":
                     self.research_tournaments.transition_trial(trial_id, "running")
-                if item.get("status") == "passed":
+                if item.get("status") in {"passed", "rejected"}:
                     evidence = item.get("evidence")
                     if not isinstance(evidence, dict):
                         raise ValueError("feature-screen evidence is missing")
@@ -4371,6 +4375,14 @@ class LocalJobWorker:
                         != expected_cadence["evidence_sha256"]
                     ):
                         raise ValueError("feature-screen cell changed decision cadence")
+                    gate_reasons = model_metric_gate_failures(cell.get("metrics") or {})
+                    gate_status = "rejected" if gate_reasons else "passed"
+                    if (
+                        item.get("status") != gate_status
+                        or cell.get("gate_status") != gate_status
+                        or cell.get("gate_reasons", []) != gate_reasons
+                    ):
+                        raise ValueError("feature-screen result disagrees with its metric gate")
                     for path_key, hash_key in (
                         ("predictions_path", "predictions_sha256"),
                         ("checkpoint_path", "checkpoint_sha256"),
@@ -4386,7 +4398,7 @@ class LocalJobWorker:
                             )
                     self.research_tournaments.transition_trial(
                         trial_id,
-                        "passed",
+                        gate_status,
                         candidate_id=candidate_id,
                         metrics={"cells": [cell]},
                         evidence=evidence,
@@ -4394,8 +4406,12 @@ class LocalJobWorker:
                     self.rdagent_candidates.transition_candidate(
                         "model",
                         candidate_id,
-                        status="invalidated",
-                        reason="screening-only model; full-round candidate required",
+                        status="rejected" if gate_reasons else "invalidated",
+                        reason=(
+                            "feature-screen model metric gate rejected: " + "; ".join(gate_reasons)
+                            if gate_reasons
+                            else "screening-only model; full-round candidate required"
+                        ),
                         actor="autopilot",
                     )
                 elif item.get("status") == "resource_blocked":

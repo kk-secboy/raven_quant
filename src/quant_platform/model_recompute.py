@@ -21,8 +21,8 @@ from .research_execution_cadence import (
     validate_research_execution_cadence_contract,
 )
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v7-drop-raw-memory-audit"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v8-single-kernel-memory-audit"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v6-cpu-tournament-40gb-single-kernel"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
@@ -39,7 +39,9 @@ QLIB_EVALUATION_CONCURRENCY_CAP = 3
 TRANSFORMER_CONCURRENCY_CAP = 1
 RESERVED_SERVICE_RESOURCE_FRACTION = 0.25
 MODEL_SANDBOX_MEMORY_GB = 40
-MODEL_QLIB_KERNELS = 3
+# Serial expression loading avoids multiplying the full-universe handler's
+# in-flight frames across Qlib processes; dates, features and training stay fixed.
+MODEL_QLIB_KERNELS = 1
 MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
 TOURNAMENT_SCREEN_SEED = 11
 TOURNAMENT_FULL_SEEDS = (11, 29, 47)

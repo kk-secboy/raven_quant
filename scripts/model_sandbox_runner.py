@@ -31,7 +31,7 @@ MODEL_LABEL_HORIZON_TRADING_DAYS = 2
 MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS = 5
 LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
 MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v5-cpu-tournament-40gb"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v6-cpu-tournament-40gb-single-kernel"
 MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_MEMORY_STAGE_PREFIX = "QUANTLAB_MODEL_MEMORY_STAGE="
@@ -316,7 +316,7 @@ def main() -> None:
         raise ValueError("model sandbox requires a CPU-only policy")
     if limits.get("qlib_evaluation_concurrency_cap") != 3:
         raise ValueError("model sandbox Qlib concurrency policy is invalid")
-    if limits.get("qlib_kernels") != 3:
+    if limits.get("qlib_kernels") != 1:
         raise ValueError("model sandbox Qlib kernel policy is invalid")
     if float(limits.get("reserved_service_resource_fraction", -1.0)) != 0.25:
         raise ValueError("model sandbox service reservation policy is invalid")

@@ -328,8 +328,23 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-06-v39`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-07-v40`" in readme
     assert "不能沿用旧结果宣称等价" in readme
+
+
+def test_manual_research_activities_preserve_the_single_mainline_and_frozen_budgets() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`POST /api/autopilot/research-events`",
+        "按全局幂等活动键追加新 cycle",
+        "同周期仅允许一个活跃活动",
+        "不绕过平台模型锦标赛",
+        "由同一个 scheduler 推进",
+        "活动期间新数据与配置不能替换冻结输入或扩大预算",
+        "全局暂停仍然生效",
+        "自动周/月/季度排程不把手动活动计作自身的周期额度",
+    ):
+        assert contract in specification
 
 
 def test_v39_audit_metadata_repair_preserves_history_and_requires_normal_new_run() -> None:

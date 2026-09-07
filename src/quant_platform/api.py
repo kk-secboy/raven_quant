@@ -1999,6 +1999,16 @@ class AutopilotUpdateRequest(BaseModel):
         return self
 
 
+class AutopilotResearchEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_key: str = Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    horizon_profile: Literal["short_1_5d", "swing_1_6m", "long_1_3y"]
+    reason: str = Field(min_length=10, max_length=500)
+    quant_loop_n: int = Field(default=10, ge=2, le=20)
+    quant_duration: str = Field(default="1h", min_length=2, max_length=20)
+
+
 class AllocationScheduleRequest(BaseModel):
     timezone: str = "Asia/Shanghai"
     run_time: time = time(15, 30)
@@ -3587,6 +3597,43 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"result": result, "autopilot": get_autopilot()}
+
+    @app.post("/api/autopilot/research-events", status_code=202)
+    def create_autopilot_research_event(
+        payload: AutopilotResearchEventRequest, request: Request,
+    ) -> dict[str, Any]:
+        actor = authenticated_actor(request, "local-admin")
+        try:
+            cycle = autopilot.start_research_event(
+                event_key=payload.event_key,
+                horizon_profile=payload.horizon_profile,
+                actor=actor,
+                reason=payload.reason,
+                quant_loop_n=payload.quant_loop_n,
+                quant_duration=payload.quant_duration,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        auth.audit(
+            user=getattr(request.state, "user", None),
+            username=actor,
+            action="autopilot.research_event_requested",
+            method="POST",
+            path="/api/autopilot/research-events",
+            status_code=202,
+            ip_hash=client_ip_hash(request),
+            user_agent=request.headers.get("user-agent"),
+            details={
+                "cycle_id": cycle["id"],
+                "event_key": payload.event_key,
+                "horizon_profile": payload.horizon_profile,
+                "quant_loop_n": payload.quant_loop_n,
+                "quant_duration": payload.quant_duration,
+                "reason": payload.reason,
+            },
+        )
+        # The existing scheduler consumes this durable activity on its next tick.
+        return _sanitize_public_value(cycle)
 
     @app.get("/api/autopilot/cycles")
     def list_autopilot_cycles(

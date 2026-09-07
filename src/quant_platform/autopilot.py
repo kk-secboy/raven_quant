@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
@@ -10,7 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import and_, func, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.config import Settings
@@ -52,7 +53,12 @@ from .model_research_governance import (
 )
 from .platform_config_store import PlatformConfigStore
 from .platform_model_tournament import PlatformModelTournamentService
-from .rdagent_runtime import expected_rdagent_runtime_identity, probe_rdagent
+from .rdagent_runtime import (
+    expected_rdagent_runtime_identity,
+    probe_rdagent,
+    validate_duration,
+    validate_duration_limit,
+)
 from .rdagent_scenarios import (
     FROZEN_RDAGENT_SCENARIOS,
     get_rdagent_scenario,
@@ -95,6 +101,8 @@ AUTOPILOT_CONFIG_KEY = "autopilot"
 AUTOPILOT_CONTRACT_VERSION = "autopilot-v1"
 RDAGENT_INTEGRATION_CONTRACT_VERSION = "rdagent-integration-v4"
 AUTOPILOT_RESEARCH_HORIZONS = (SHORT_1_5D, SWING_1_6M, LONG_1_3Y)
+SCHEDULED_RESEARCH_EVENT = "scheduled"
+MANUAL_RESEARCH_EVENT_CONTRACT = "manual-research-event-v1"
 
 DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "contract_version": AUTOPILOT_CONTRACT_VERSION,
@@ -186,6 +194,95 @@ def normalize_autopilot_config(value: Any = None) -> dict[str, Any]:
         raise ValueError("service_resource_reserve must be between 0.25 and 0.75")
     raw["service_resource_reserve"] = float(reserve)
     return raw
+
+
+def _research_event_request(
+    event_key: str,
+    horizon_profile: str,
+    actor: str,
+    reason: str,
+    quant_loop_n: int,
+    quant_duration: str,
+) -> dict[str, Any]:
+    if not isinstance(event_key, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", event_key
+    ):
+        raise ValueError("research event key is invalid")
+    if horizon_profile not in AUTOPILOT_RESEARCH_HORIZONS:
+        raise ValueError("research event requires an active horizon")
+    if not isinstance(actor, str) or not 1 <= len(actor.strip()) <= 100:
+        raise ValueError("research event actor is invalid")
+    if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 2000:
+        raise ValueError("research event reason is required")
+    if isinstance(quant_loop_n, bool) or not isinstance(quant_loop_n, int):
+        raise ValueError("research event loop count must be an integer")
+    if not 2 <= quant_loop_n <= 20:
+        raise ValueError("research event loop count must be between 2 and 20")
+    if not isinstance(quant_duration, str):
+        raise ValueError("research event duration is invalid")
+    return {
+        "event_key": event_key,
+        "horizon_profile": horizon_profile,
+        "actor": actor.strip(),
+        "reason": reason.strip(),
+        "quant_loop_n": quant_loop_n,
+        "quant_duration": validate_duration(quant_duration),
+    }
+
+
+def _event_dataset_binding(dataset: dict[str, Any]) -> dict[str, Any]:
+    provenance = dict(dataset.get("provenance") or {})
+    return {
+        "name": str(dataset["name"]),
+        "path": str(dataset["path"]),
+        "dataset_identity_sha256": str(provenance.get("dataset_identity_sha256") or ""),
+        "dataset_lineage_id": str(dataset.get("lineage_id") or ""),
+        "end_date": str(dataset.get("end_date") or ""),
+    }
+
+
+def _manual_research_event(cycle: dict[str, Any]) -> dict[str, Any] | None:
+    key = str(cycle.get("research_event_key") or SCHEDULED_RESEARCH_EVENT)
+    event = (cycle.get("state") or {}).get("research_event")
+    if key == SCHEDULED_RESEARCH_EVENT:
+        if event is not None:
+            raise ValueError("scheduled cycle cannot claim a manual research event")
+        return None
+    if not key.startswith("manual:") or not isinstance(event, dict):
+        raise ValueError("manual research event evidence is missing")
+    expected_keys = {
+        "contract_version", "request", "config", "config_revision", "dataset", "sha256"
+    }
+    if set(event) != expected_keys or event["contract_version"] != MANUAL_RESEARCH_EVENT_CONTRACT:
+        raise ValueError("manual research event contract is invalid")
+    request = event["request"]
+    if not isinstance(request, dict) or set(request) != {
+        "event_key", "horizon_profile", "actor", "reason", "quant_loop_n", "quant_duration"
+    } or _research_event_request(**request) != request:
+        raise ValueError("manual research event request changed")
+    config = event["config"]
+    dataset = event["dataset"]
+    if (
+        key != "manual:" + request["event_key"]
+        or request["horizon_profile"] != cycle.get("horizon_profile")
+        or normalize_autopilot_config(config) != config
+        or config["quant_loop_n"] != request["quant_loop_n"]
+        or config["quant_duration"] != request["quant_duration"]
+        or event["config_revision"] != cycle.get("config_revision")
+        or not isinstance(dataset, dict)
+        or set(dataset) != {
+            "name", "path", "dataset_identity_sha256", "dataset_lineage_id", "end_date"
+        }
+        or dataset["name"] != cycle.get("dataset")
+        or dataset["dataset_identity_sha256"] != cycle.get("dataset_identity_sha256")
+        or dataset["dataset_lineage_id"] != cycle.get("dataset_lineage_id")
+        or dataset["end_date"] != (cycle.get("state") or {}).get("dataset_end_date")
+        or event["sha256"] != canonical_sha256(
+            {name: value for name, value in event.items() if name != "sha256"}
+        )
+    ):
+        raise ValueError("manual research event frozen inputs changed")
+    return deepcopy(event)
 
 
 def _now() -> datetime:
@@ -515,6 +612,7 @@ class AutopilotStore:
         *,
         config_revision: int,
         horizon_profile: str = SHORT_1_5D,
+        prefer_manual: bool = False,
     ) -> dict[str, Any]:
         provenance = dict(dataset.get("provenance") or {})
         identity = str(provenance.get("dataset_identity_sha256") or "")
@@ -524,15 +622,44 @@ class AutopilotStore:
         primary_label = primary_label_horizon_sessions(horizon_profile)
         policy_sha256 = primary_label_policy_sha256()
         now = _now()
-        try:
-            with self.engine.begin() as connection:
+        with self.engine.begin() as connection:
+            self._lock_horizon(connection, horizon_profile)
+            manual = connection.execute(
+                select(autopilot_cycles).where(
+                    autopilot_cycles.c.horizon_profile == horizon_profile,
+                    autopilot_cycles.c.research_event_key != SCHEDULED_RESEARCH_EVENT,
+                    or_(
+                        autopilot_cycles.c.status == "active",
+                        and_(
+                            autopilot_cycles.c.status == "paused",
+                            autopilot_cycles.c.finished_at.is_(None),
+                        ),
+                    ),
+                )
+            ).first()
+            existing = connection.execute(
+                select(autopilot_cycles).where(
+                    autopilot_cycles.c.dataset_identity_sha256 == identity,
+                    autopilot_cycles.c.horizon_profile == horizon_profile,
+                    autopilot_cycles.c.research_event_key == SCHEDULED_RESEARCH_EVENT,
+                )
+            ).first()
+            if manual is not None and prefer_manual:
+                cycle_id = str(manual.id)
+            elif existing is not None:
+                cycle_id = str(existing.id)
+            else:
+                if manual is not None:
+                    raise ValueError("a manual research event already owns this horizon")
+                cycle_id = uuid.uuid4().hex
                 connection.execute(
                     insert(autopilot_cycles).values(
-                        id=uuid.uuid4().hex,
+                        id=cycle_id,
                         dataset=str(dataset["name"]),
                         dataset_identity_sha256=identity,
                         dataset_lineage_id=lineage,
                         horizon_profile=horizon_profile,
+                        research_event_key=SCHEDULED_RESEARCH_EVENT,
                         primary_label_policy_sha256=policy_sha256,
                         status="active",
                         stage="parallel_research",
@@ -550,9 +677,119 @@ class AutopilotStore:
                         updated_at=now,
                     )
                 )
-        except IntegrityError:
-            pass
-        return self.get_cycle_by_identity(identity, horizon_profile=horizon_profile)
+        return self.get_cycle(cycle_id)
+
+    @staticmethod
+    def _lock_horizon(connection: Any, horizon_profile: str) -> None:
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+            {"scope": f"autopilot-research-horizon:{horizon_profile}"},
+        )
+
+    def get_research_event(self, event_key: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(autopilot_cycles.c.id).where(
+                    autopilot_cycles.c.research_event_key == "manual:" + event_key
+                )
+            ).first()
+        return self.get_cycle(str(row.id)) if row is not None else None
+
+    def create_research_event(
+        self,
+        *,
+        request: dict[str, Any],
+        dataset: dict[str, Any],
+        config: dict[str, Any],
+        config_revision: int,
+    ) -> dict[str, Any]:
+        request = _research_event_request(**request)
+        horizon = request["horizon_profile"]
+        binding = _event_dataset_binding(dataset)
+        if (
+            not all(
+                dataset.get(flag) is True
+                for flag in ("ready", "reproducible", "lineage_verified")
+            )
+            or dataset.get("frequency") != "day"
+            or not all(
+                re.fullmatch(r"[0-9a-f]{64}", binding[field])
+                for field in ("dataset_identity_sha256", "dataset_lineage_id")
+            )
+        ):
+            raise ValueError("manual research event requires a verified daily dataset")
+        event = {
+            "contract_version": MANUAL_RESEARCH_EVENT_CONTRACT,
+            "request": request,
+            "config": deepcopy(config),
+            "config_revision": config_revision,
+            "dataset": binding,
+        }
+        event["sha256"] = canonical_sha256(event)
+        state = {
+            "dataset_end_date": binding["end_date"],
+            "horizon_profile": horizon,
+            "label_horizon_sessions": primary_label_horizon_sessions(horizon),
+            "primary_label_policy": primary_label_policy_contract(),
+            "research_cadence_bucket": horizon_research_cadence_bucket(
+                horizon, binding["end_date"]
+            ),
+            "research_event": event,
+        }
+        values = {
+            "id": uuid.uuid4().hex,
+            "dataset": binding["name"],
+            "dataset_identity_sha256": binding["dataset_identity_sha256"],
+            "dataset_lineage_id": binding["dataset_lineage_id"],
+            "horizon_profile": horizon,
+            "research_event_key": "manual:" + request["event_key"],
+            "primary_label_policy_sha256": primary_label_policy_sha256(),
+            "status": "active",
+            "stage": "parallel_research",
+            "config_revision": config_revision,
+            "state_json": state,
+            "created_at": _now(),
+            "updated_at": _now(),
+        }
+        _manual_research_event({**values, "state": state})
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+                {"scope": "autopilot-research-event:" + request["event_key"]},
+            )
+            existing = connection.execute(
+                select(autopilot_cycles).where(
+                    autopilot_cycles.c.research_event_key == values["research_event_key"]
+                )
+            ).first()
+            if existing is not None:
+                stored = self._decode_cycle(row_dict(existing))
+                if _manual_research_event(stored)["request"] != request:
+                    raise ValueError("research event key is already bound to another request")
+                cycle_id = str(existing.id)
+            else:
+                self._lock_horizon(connection, horizon)
+                owner = connection.execute(
+                    select(autopilot_cycles.c.id).where(
+                        autopilot_cycles.c.horizon_profile == horizon,
+                        autopilot_cycles.c.stage.not_in(("superseded", "legacy_readonly")),
+                        autopilot_cycles.c.state_json["historical_results_only"]
+                        .as_boolean().is_not(True),
+                        or_(
+                            autopilot_cycles.c.status == "active",
+                            and_(
+                                autopilot_cycles.c.status == "paused",
+                                autopilot_cycles.c.research_event_key != SCHEDULED_RESEARCH_EVENT,
+                                autopilot_cycles.c.finished_at.is_(None),
+                            ),
+                        ),
+                    ).limit(1)
+                ).first()
+                if owner is not None:
+                    raise ValueError("another research activity already owns this horizon")
+                connection.execute(insert(autopilot_cycles).values(**values))
+                cycle_id = str(values["id"])
+        return self.get_cycle(cycle_id)
 
     def get_cycle_by_identity(
         self, identity: str, *, horizon_profile: str = SHORT_1_5D
@@ -562,6 +799,7 @@ class AutopilotStore:
                 select(autopilot_cycles).where(
                     autopilot_cycles.c.dataset_identity_sha256 == identity,
                     autopilot_cycles.c.horizon_profile == horizon_profile,
+                    autopilot_cycles.c.research_event_key == SCHEDULED_RESEARCH_EVENT,
                 )
             ).first()
         if row is None:
@@ -663,6 +901,18 @@ class AutopilotStore:
             ).first()
             if row is None:
                 raise KeyError(cycle_id)
+            stored = self._decode_cycle(row_dict(row))
+            event = _manual_research_event(stored)
+            if event is not None:
+                if state.get("research_event") != event:
+                    raise ValueError("manual research event frozen inputs cannot be changed")
+                if row.finished_at is not None:
+                    if (
+                        state != stored["state"] or status != row.status
+                        or stage_value != row.stage or error != row.error or not finished
+                    ):
+                        raise ValueError("terminal manual research events are immutable")
+                    return self.get_cycle(cycle_id)
             connection.execute(
                 update(autopilot_cycles)
                 .where(autopilot_cycles.c.id == cycle_id)
@@ -918,15 +1168,25 @@ class AutopilotStore:
         return True
 
     def latest_branch(
-        self, scenario: str, *, horizon_profile: str | None = None
+        self,
+        scenario: str,
+        *,
+        horizon_profile: str | None = None,
+        scheduled_only: bool = False,
     ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
             statement = select(autopilot_branches)
-            if horizon_profile is not None:
+            if horizon_profile is not None or scheduled_only:
                 statement = statement.join(
                     autopilot_cycles,
                     autopilot_cycles.c.id == autopilot_branches.c.cycle_id,
-                ).where(autopilot_cycles.c.horizon_profile == horizon_profile)
+                )
+            if horizon_profile is not None:
+                statement = statement.where(autopilot_cycles.c.horizon_profile == horizon_profile)
+            if scheduled_only:
+                statement = statement.where(
+                    autopilot_cycles.c.research_event_key == SCHEDULED_RESEARCH_EVENT
+                )
             row = connection.execute(
                 statement.where(autopilot_branches.c.scenario == scenario)
                 .order_by(autopilot_branches.c.created_at.desc())
@@ -1088,10 +1348,20 @@ class AutopilotStore:
         return result
 
     def get_cycle(self, cycle_id: str) -> dict[str, Any]:
-        cycles = [item for item in self.list_cycles(limit=500) if item["id"] == cycle_id]
-        if not cycles:
-            raise KeyError(cycle_id)
-        return cycles[0]
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(autopilot_cycles).where(autopilot_cycles.c.id == cycle_id)
+            ).first()
+            if row is None:
+                raise KeyError(cycle_id)
+            cycle = self._decode_cycle(row_dict(row))
+            cycle["branches"] = [
+                self._decode_branch(row_dict(branch))
+                for branch in connection.execute(
+                    select(autopilot_branches).where(autopilot_branches.c.cycle_id == cycle_id)
+                )
+            ]
+        return cycle
 
     @staticmethod
     def _decode_cycle(row: dict[str, Any]) -> dict[str, Any]:
@@ -1117,6 +1387,7 @@ class AutopilotStore:
             or (row["state"] or {}).get("primary_label_policy") != policy
         ):
             raise ValueError("autopilot cycle horizon or primary-label policy drifted")
+        _manual_research_event(row)
         return row
 
     @staticmethod
@@ -1152,6 +1423,42 @@ class AutopilotController:
             int(record["revision"]) if record else 0,
         )
 
+    def start_research_event(
+        self,
+        event_key: str,
+        horizon_profile: str,
+        actor: str,
+        reason: str,
+        quant_loop_n: int = 10,
+        quant_duration: str = "1h",
+    ) -> dict[str, Any]:
+        """Register one audited activity; ordinary ticks perform all research work."""
+        request = _research_event_request(
+            event_key, horizon_profile, actor, reason, quant_loop_n, quant_duration
+        )
+        existing = self.store.get_research_event(event_key)
+        if existing is not None:
+            if _manual_research_event(existing)["request"] != request:
+                raise ValueError("research event key is already bound to another request")
+            return existing
+        if quant_loop_n > self.settings.rdagent_max_loops:
+            raise ValueError("research event loop count exceeds the configured execution limit")
+        validate_duration_limit(request["quant_duration"], self.settings.rdagent_max_duration)
+        config, revision = self.config()
+        if not config["enabled"]:
+            raise ValueError("automatic research is disabled")
+        config = normalize_autopilot_config({
+            **config,
+            "quant_loop_n": request["quant_loop_n"],
+            "quant_duration": request["quant_duration"],
+        })
+        dataset = self._latest_dataset()
+        if dataset is None:
+            raise ValueError("no verified daily dataset is available for research")
+        return self.store.create_research_event(
+            request=request, dataset=dataset, config=config, config_revision=revision
+        )
+
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or _now()
         # Finish setup-only model runs from cycles terminalized on a previous
@@ -1164,6 +1471,19 @@ class AutopilotController:
             return {"cycles": 0, "branches": 0}
         dataset = self._latest_dataset()
         if dataset is None:
+            # A vanished publication must not leave a registered manual owner
+            # silently active forever. Global disable above remains a pause.
+            failed = 0
+            for cycle in self.store.list_cycles(limit=500):
+                if cycle.get("status") == "active" and _manual_research_event(cycle) is not None:
+                    self.store.set_cycle_state(
+                        str(cycle["id"]), state=dict(cycle["state"]),
+                        stage="dataset_unavailable", status="blocked", finished=True,
+                        error="manual research event bound dataset is unavailable or changed",
+                    )
+                    failed += 1
+            if failed:
+                return {"cycles": failed, "branches": 0, "failed": failed}
             return {"cycles": 0, "branches": 0}
         totals = {"cycles": 0, "branches": 0, "failed": 0}
         for horizon_profile in AUTOPILOT_RESEARCH_HORIZONS:
@@ -1200,6 +1520,19 @@ class AutopilotController:
             for item in list_qlib_datasets(self.settings.data_root)
         }
         listed_cycles = self.store.list_cycles(limit=500)
+        manual_owners = [
+            item for item in listed_cycles
+            if item.get("horizon_profile") == horizon_profile
+            and (
+                item.get("status") == "active"
+                or (item.get("status") == "paused" and item.get("finished_at") is None)
+            )
+            and item.get("research_event_key", SCHEDULED_RESEARCH_EVENT)
+            != SCHEDULED_RESEARCH_EVENT
+        ]
+        if len(manual_owners) > 1:
+            raise ValueError("multiple manual research activities own this horizon")
+        manual_owner = manual_owners[0] if manual_owners else None
         latest_cycle_is_active = any(
             item.get("status") == "active"
             and not _cycle_has_legacy_capital_state(item)
@@ -1222,7 +1555,8 @@ class AutopilotController:
         # this scheduler neither supersedes nor resumes them.
         for stale_cycle in listed_cycles:
             if (
-                stale_cycle.get("status") != "active"
+                manual_owner is not None
+                or stale_cycle.get("status") != "active"
                 or _cycle_has_legacy_capital_state(stale_cycle)
                 or stale_cycle.get("horizon_profile") != horizon_profile
                 or str(stale_cycle.get("dataset_identity_sha256") or "")
@@ -1276,7 +1610,9 @@ class AutopilotController:
                     str(stale_cycle["id"]),
                     replacement_dataset=dataset,
                 )
-        if continuing_cycle is not None and continuing_dataset is not None:
+        if manual_owner is not None:
+            cycle = manual_owner
+        elif continuing_cycle is not None and continuing_dataset is not None:
             cycle = continuing_cycle
             dataset = continuing_dataset
         else:
@@ -1284,12 +1620,37 @@ class AutopilotController:
                 dataset,
                 config_revision=revision,
                 horizon_profile=horizon_profile,
+                prefer_manual=True,
             )
+        manual_event = _manual_research_event(cycle)
+        if manual_event is not None:
+            if cycle.get("status") != "active":
+                return {"cycles": 1, "branches": 0, "failed": 0}
+            bound_dataset = available_by_name.get(manual_event["dataset"]["name"])
+            if (
+                bound_dataset is None
+                or not all(
+                    bound_dataset.get(flag) is True
+                    for flag in ("ready", "reproducible", "lineage_verified")
+                )
+                or bound_dataset.get("frequency") != "day"
+                or _event_dataset_binding(bound_dataset) != manual_event["dataset"]
+            ):
+                self.store.set_cycle_state(
+                    str(cycle["id"]), state=dict(cycle["state"]),
+                    stage="dataset_unavailable", status="blocked", finished=True,
+                    error="manual research event bound dataset is unavailable or changed",
+                )
+                return {"cycles": 1, "branches": 0, "failed": 1}
+            dataset = bound_dataset
+            config = manual_event["config"]
+            revision = manual_event["config_revision"]
         if _cycle_has_legacy_capital_state(cycle):
             # The row is historical evidence only.  Managed fin_strategy owns
             # all new strategy/capital work, including cold-start research.
             return {"cycles": 1, "branches": created, "failed": failed}
-        cycle = self._resume_operationally_blocked_model_cycle(cycle)
+        if manual_event is None:
+            cycle = self._resume_operationally_blocked_model_cycle(cycle)
         if cycle.get("status") != "active":
             return {
                 "cycles": 1,
@@ -1300,7 +1661,7 @@ class AutopilotController:
         # factor branch nor an RD-Agent model challenger starts any more.  The
         # platform model tournament cadence alone decides whether this
         # immutable publication begins a new research event.
-        model_due = research_contract_migration or self._model_due(
+        model_due = manual_event is not None or research_contract_migration or self._model_due(
             dataset, current, config, horizon_profile=horizon_profile
         )
         cycle = self.store.get_cycle(str(cycle["id"]))
@@ -1963,7 +2324,7 @@ class AutopilotController:
         horizon_profile: str,
     ) -> bool:
         latest = self.store.latest_branch(
-            scenario, horizon_profile=horizon_profile
+            scenario, horizon_profile=horizon_profile, scheduled_only=True
         )
         if latest is None:
             return True
@@ -4338,7 +4699,8 @@ class AutopilotController:
                             model_candidates.c.status == "research_admitted",
                             model_candidates.c.dataset_identity_sha256
                             == source_identity,
-                            model_candidates.c.dataset_lineage_id == lineage_id,
+                            model_candidates.c.manifest_json["dataset_lineage_id"].as_string()
+                            == lineage_id,
                         )
                     )
                 elif champion.get("kind") == "ensemble":
@@ -4593,7 +4955,7 @@ class AutopilotController:
                         model_candidates.c.id == str(champion.get("candidate_id") or ""),
                         model_candidates.c.status == "research_admitted",
                         model_candidates.c.dataset_identity_sha256 == source_identity,
-                        model_candidates.c.dataset_lineage_id
+                        model_candidates.c.manifest_json["dataset_lineage_id"].as_string()
                         == str(cycle["dataset_lineage_id"]),
                     )
                 )
@@ -4622,10 +4984,14 @@ class AutopilotController:
             )
         if has_prediction_champion is None or active_parallel is not None:
             return False
+        if _manual_research_event(cycle) is not None:
+            # Explicit activity replaces only the cadence/change trigger. All
+            # identity, admission and prerequisite checks above still apply.
+            return True
         horizon_profile = str(cycle.get("horizon_profile") or "")
         primary_label_horizon_sessions(horizon_profile)
         latest = self.store.latest_branch(
-            "fin_quant", horizon_profile=horizon_profile
+            "fin_quant", horizon_profile=horizon_profile, scheduled_only=True
         )
         if latest is None:
             return True
@@ -4762,6 +5128,9 @@ class AutopilotController:
         }[scenario_id]
         loop_n = int(config[f"{config_prefix}_loop_n"])
         duration = str(config[f"{config_prefix}_duration"])
+        if loop_n > self.settings.rdagent_max_loops:
+            raise ValueError("research loop count exceeds the configured execution limit")
+        validate_duration_limit(duration, self.settings.rdagent_max_duration)
         objective = {
             "fin_factor": (
                 "Discover economically distinct A-share factors under strict PIT "

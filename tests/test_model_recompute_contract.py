@@ -86,7 +86,7 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
         module.MODEL_MEMORY_AUDIT_CONTRACT_VERSION
         == MODEL_MEMORY_AUDIT_CONTRACT_VERSION
     )
-    assert MODEL_RECOMPUTE_EXECUTOR_VERSION.endswith("drop-raw-memory-audit")
+    assert MODEL_RECOMPUTE_EXECUTOR_VERSION.endswith("single-kernel-memory-audit")
     assert (
         module.MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
         == MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
@@ -371,7 +371,7 @@ def test_governed_model_resource_policy_caps_compute_not_research_data() -> None
     assert screening["limits"]["timeout_seconds"] == 1800
     assert MODEL_SANDBOX_MEMORY_GB == 40
     assert screening["limits"]["memory_gb"] == MODEL_SANDBOX_MEMORY_GB
-    assert MODEL_QLIB_KERNELS == 3
+    assert MODEL_QLIB_KERNELS == 1
     assert screening["limits"]["qlib_kernels"] == MODEL_QLIB_KERNELS
     assert screening["limits"]["date_segments_modified"] is False
     assert screening["limits"]["universe_modified"] is False
