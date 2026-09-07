@@ -22,7 +22,6 @@ from quant_platform.qlib_portfolio_calendar import (  # noqa: E402
 from quant_platform.qlib_workflow import (  # noqa: E402
     end_implicit_qlib_recorder,
     qlib_workflow_run,
-    qlib_workflow_tracking_uri,
 )
 from quant_platform.research_execution_cadence import (  # noqa: E402
     validate_research_execution_cadence_contract,
@@ -286,6 +285,39 @@ def _require_inference_checkpoint(
     return checkpoint
 
 
+def initialize_model_qlib(
+    qlib_runtime: Any,
+    *,
+    output: Path,
+    provider_uri: str,
+    kernels: int,
+) -> str:
+    """Keep training and portfolio recorders on one durable sandbox tracker."""
+
+    tracking = output / "qlib-workflow" / "tracking"
+    # MLflow FileStore rejects run paths beneath any directory named artifacts.
+    # Validate before loading/fitting, and leave any older tracker untouched.
+    if not tracking.is_absolute() or "artifacts" in tracking.parts:
+        raise ValueError("model tracking path must be absolute and outside artifacts directories")
+    artifact_root = output / "qlib-workflow" / "artifacts"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tracking.mkdir(parents=True, exist_ok=True)
+    tracking_uri = str(tracking)
+    os.environ["_MLFLOW_SERVER_ARTIFACT_ROOT"] = str(artifact_root)
+    os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    qlib_runtime.init(
+        provider_uri=provider_uri,
+        region="cn",
+        kernels=kernels,
+        exp_manager={
+            "class": "MLflowExpManager",
+            "module_path": "qlib.workflow.expm",
+            "kwargs": {"uri": tracking_uri, "default_exp_name": "Experiment"},
+        },
+    )
+    return tracking_uri
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", default="/work/manifest.json")
@@ -467,9 +499,10 @@ def main() -> None:
         )
     ]
 
-    qlib.init(
+    workflow_tracking_uri = initialize_model_qlib(
+        qlib,
+        output=output,
         provider_uri=manifest["provider_uri"],
-        region="cn",
         kernels=int(limits["qlib_kernels"]),
     )
     memory_stages.append(
@@ -690,11 +723,6 @@ def main() -> None:
         }
     else:  # pragma: no cover - guarded before Qlib initialization
         raise ValueError("model engine is not governed")
-    workflow_root = output / "qlib-workflow"
-    workflow_artifact_root = workflow_root / "artifacts"
-    workflow_artifact_root.mkdir(parents=True, exist_ok=True)
-    os.environ["_MLFLOW_SERVER_ARTIFACT_ROOT"] = str(workflow_artifact_root)
-    os.environ.pop("MLFLOW_TRACKING_URI", None)
     checkpoint_format = MODEL_CHECKPOINT_FORMATS[model_engine]
     if inference_only:
         checkpoint = _require_inference_checkpoint(manifest, model_engine=model_engine)
@@ -832,7 +860,7 @@ def main() -> None:
         with qlib_workflow_run(
             run_kind="independent-model",
             run_id=f"{manifest['candidate_id']}-seed-{seed}",
-            tracking_uri=qlib_workflow_tracking_uri(),
+            tracking_uri=workflow_tracking_uri,
             dataset_identity_sha256=str(manifest["dataset_identity_sha256"]),
         ) as workflow:
             recorder = workflow.get_recorder()
