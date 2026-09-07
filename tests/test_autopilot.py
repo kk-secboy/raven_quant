@@ -115,11 +115,15 @@ def test_autopilot_cycles_do_not_remain_active_after_terminal_failures() -> None
         [("fin_factor", "succeeded"), ("fin_quant", "failed")]
     ) == ("blocked", "joint_optimization_blocked")
     assert _cycle_terminal_resolution(
-        [("fin_factor", "succeeded"), ("fin_quant", "succeeded")]
+        [("fin_factor", "succeeded"), ("fin_quant", "succeeded")],
+        joint_completion_verified=True,
     ) == (
         "succeeded",
         "research_complete",
     )
+    assert _cycle_terminal_resolution(
+        [("fin_factor", "succeeded"), ("fin_quant", "succeeded")]
+    ) == ("blocked", "research_blocked")
 
 
 def test_historical_capital_commitment_classifier_remains_for_audit() -> None:

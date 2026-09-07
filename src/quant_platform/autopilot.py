@@ -25,6 +25,7 @@ from quant_data.database import (
     open_database,
     research_events,
     research_runs,
+    research_tournaments,
     row_dict,
 )
 
@@ -543,6 +544,8 @@ def _derived_branch_status(run_status: str, job_status: str) -> str:
 
 def _cycle_terminal_resolution(
     branches: list[tuple[str, str]],
+    *,
+    joint_completion_verified: bool = False,
 ) -> tuple[str, str] | None:
     """Return the honest terminal cycle state, or None while work can continue."""
 
@@ -556,6 +559,8 @@ def _cycle_terminal_resolution(
     if quant_statuses and all(status in {"failed", "blocked"} for status in quant_statuses):
         return "blocked", "joint_optimization_blocked"
     if any(status == "succeeded" for status in quant_statuses):
+        if not joint_completion_verified:
+            return "blocked", "research_blocked"
         return "succeeded", "research_complete"
     return None
 
@@ -593,6 +598,69 @@ def _prediction_champion_identity_error(
     if str(model_selection.get("dataset_identity_sha256") or "") != dataset_identity:
         return "model-family evidence awaits current dataset identity revalidation"
     return None
+
+
+def _joint_completion_verified(
+    cycle: dict[str, Any], tournament: dict[str, Any] | None,
+) -> bool:
+    """Consume the controller's frozen selection, without reclassifying trials.
+
+    Both terminal paths must observe the same sealed model competition. A
+    resource-infeasible candidate remains failed inside that competition; it
+    does not veto the independently successful joint research branch.
+    """
+    if tournament is None:
+        return False
+    state = dict(cycle.get("state") or {})
+    identity = str(cycle.get("dataset_identity_sha256") or "")
+    if _prediction_champion_identity_error(
+        cycle, {"provenance": {"dataset_identity_sha256": identity}}
+    ) is not None:
+        return False
+    tournament_id = str(state.get("research_tournament_id") or "")
+    if (
+        not tournament_id
+        or str(tournament.get("id") or "") != tournament_id
+        or str(tournament.get("cycle_id") or "") != str(cycle.get("id") or "")
+        or tournament.get("dataset_identity_sha256") != identity
+        or tournament.get("status") != "succeeded"
+        or not tournament.get("finished_at")
+        or str(state.get("active_research_tournament_id") or tournament_id) != tournament_id
+    ):
+        return False
+    champion = state["prediction_champion"]
+    selection = state["prediction_champion_evidence"]
+    for evidence in (selection, state["model_champion_evidence"]):
+        if evidence.get("evidence_sha256") != canonical_sha256({
+            key: value for key, value in evidence.items() if key != "evidence_sha256"
+        }):
+            return False
+    selected_ids = tournament.get("selected_trial_ids")
+    if (
+        not isinstance(selected_ids, list)
+        or not selected_ids
+        or selection.get("selected_trial_ids") != selected_ids
+        or champion.get("trial_id") not in selected_ids
+        or selection.get("selected_candidate_id") != champion.get("candidate_id")
+        or selection.get("selected_kind") != champion.get("kind")
+    ):
+        return False
+    # The ordinary tournament seals the complete selection. The existing
+    # fixed-champion revalidation path seals its nested finalist family.
+    sealed_selection = selection
+    if selection.get("fixed_prior_champion_current_identity_revalidation") is True:
+        revalidation = dict(state.get("current_identity_revalidation") or {})
+        if (
+            revalidation.get("status") != "succeeded"
+            or revalidation.get("tournament_id") != tournament_id
+        ):
+            return False
+        sealed_selection = selection.get("global_multiple_testing")
+    return bool(
+        isinstance(sealed_selection, dict)
+        and tournament.get("multiple_testing") == sealed_selection
+        and tournament.get("multiple_testing_sha256") == canonical_sha256(sealed_selection)
+    )
 
 
 def _cycle_has_capital_commitment(cycle: dict[str, Any]) -> bool:
@@ -1334,7 +1402,29 @@ class AutopilotStore:
                         else "joint_optimization"
                     )
                 values: dict[str, Any] = {"stage": stage, "updated_at": now}
-                resolution = _cycle_terminal_resolution(branch_states)
+                tournament_id = str(
+                    dict(cycle.state_json or {}).get("research_tournament_id") or ""
+                )
+                tournament_row = (
+                    connection.execute(
+                        select(research_tournaments).where(
+                            research_tournaments.c.id == tournament_id
+                        )
+                    ).first()
+                    if has_quant and tournament_id
+                    else None
+                )
+                tournament = (
+                    ResearchTournamentStore._decode_tournament(row_dict(tournament_row))
+                    if tournament_row is not None
+                    else None
+                )
+                resolution = _cycle_terminal_resolution(
+                    branch_states,
+                    joint_completion_verified=_joint_completion_verified(
+                        {**row_dict(cycle), "state": dict(cycle.state_json or {})}, tournament
+                    ),
+                )
                 if resolution is not None:
                     status, terminal_stage = resolution
                     values.update(status=status, stage=terminal_stage, finished_at=now)
@@ -1970,12 +2060,8 @@ class AutopilotController:
             str(item.get("status") or "") in _TERMINAL_BRANCH_STATUSES
             for item in current_branches
         )
-        current_quant = next(
-            (item for item in current_branches if item.get("scenario") == "fin_quant"),
-            None,
-        )
         try:
-            terminal_tournament = self._active_model_tournament(cycle)
+            terminal_tournament = self._active_model_tournament(current_cycle)
         except KeyError:
             revalidation = dict(
                 (current_cycle.get("state") or {}).get(
@@ -1995,10 +2081,17 @@ class AutopilotController:
         tournament_is_terminal = terminal_tournament is None or str(
             terminal_tournament.get("status") or ""
         ) in {"succeeded", "blocked", "failed", "cancelled"}
+        resolution = _cycle_terminal_resolution(
+            [(str(item.get("scenario") or ""), str(item.get("status") or ""))
+             for item in current_branches],
+            joint_completion_verified=_joint_completion_verified(
+                current_cycle, terminal_tournament
+            ),
+        )
         if (
             current_cycle.get("status") == "active"
             and no_active_branch
-            and tournament_is_terminal
+            and (tournament_is_terminal or resolution is not None)
             and created == 0
         ):
             active_tournament_id = str(
@@ -2026,10 +2119,9 @@ class AutopilotController:
                 in {"blocked", "failed", "cancelled"}
             )
             blocked = bool(branch_failures or failed or tournament_blocked)
-            quant_succeeded = bool(
-                current_quant is not None
-                and str(current_quant.get("status") or "") == "succeeded"
-            )
+            quant_succeeded = resolution == ("succeeded", "research_complete")
+            if resolution is not None:
+                blocked = resolution[0] == "blocked"
             state = {
                 **dict(current_cycle.get("state") or {}),
                 "result": (
@@ -2043,14 +2135,14 @@ class AutopilotController:
                 "legacy_autopilot_capital_pipeline": "legacy_readonly",
                 "runner_up_allowed": False,
             }
-            if branch_failures:
+            if blocked and branch_failures:
                 state["blockers"] = sorted(
                     {
                         str(item.get("error") or item.get("scenario") or "research failed")
                         for item in branch_failures
                     }
                 )
-            elif tournament_blocked:
+            elif blocked and tournament_blocked:
                 state["blockers"] = [
                     str(
                         terminal_tournament.get("blocked_reason")
@@ -2062,7 +2154,9 @@ class AutopilotController:
                 str(cycle["id"]),
                 state=state,
                 stage=(
-                    "research_blocked"
+                    resolution[1]
+                    if resolution is not None
+                    else "research_blocked"
                     if blocked
                     else "research_complete"
                     if quant_succeeded
