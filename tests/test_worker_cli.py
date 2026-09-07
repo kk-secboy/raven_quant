@@ -517,6 +517,7 @@ def test_worker_retries_transient_database_claim_failure_without_dying(
 
 
 def test_worker_start_projects_a_terminal_left_by_an_earlier_recovery_process(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     projected: list[tuple[str, str]] = []
@@ -555,7 +556,9 @@ def test_worker_start_projects_a_terminal_left_by_an_earlier_recovery_process(
     worker._initialize_queue = True
     worker.factor_library = FakeFactorLibrary()
     worker.store = FakeStore()
-    worker.settings = SimpleNamespace(worker_job_kinds=("strategy_backtest",))
+    worker.settings = SimpleNamespace(
+        worker_job_kinds=("strategy_backtest",), data_root=tmp_path
+    )
     worker._mark_unhandled_job_failure = lambda job, error: projected.append(
         (str(job["id"]), error)
     )
@@ -736,6 +739,47 @@ def test_outer_failure_finalization_retries_without_killing_consumer(
     assert not thread.is_alive()
     assert claim_attempts == 1
     assert finalize_attempts == 2
+
+
+def test_pending_model_cleanup_never_releases_running_job_to_queue():
+    worker = object.__new__(LocalJobWorker)
+    worker._stop = threading.Event()
+    worker._wake = threading.Event()
+    worker.settings = SimpleNamespace(worker_job_kinds=("model_evaluate",))
+    claims = []
+
+    class Store:
+        def claim_next(self, _):
+            claims.append(1)
+            return {"id": "model-job", "payload": {}}
+
+        def finish_or_retry(self, *_args, **_kwargs):
+            pytest.fail("pending Docker cleanup cannot release its running job")
+
+    worker.store = Store()
+
+    def pending(_):
+        raise worker_module.ModelCellCleanupPending("Docker daemon unavailable")
+
+    worker._run = pending
+    worker._loop()
+    assert claims == [1]
+
+
+def test_model_cleanup_fence_waits_for_docker_before_returning(tmp_path, monkeypatch):
+    worker = object.__new__(LocalJobWorker)
+    attempts = []
+    waits = []
+    worker._stop = SimpleNamespace(wait=lambda **kwargs: waits.append(kwargs) or False)
+
+    def cleanup(_):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise worker_module.ModelCellCleanupPending("Docker daemon unavailable")
+
+    monkeypatch.setattr(worker_module, "cleanup_model_batch", cleanup)
+    worker._fence_model_cleanup(tmp_path / "marker.json")
+    assert len(attempts) == 2 and waits == [{"timeout": 2}]
 
 
 def test_failed_parameter_trial_ledger_is_applied_before_process_failure() -> None:

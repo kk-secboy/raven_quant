@@ -384,7 +384,7 @@ def test_quant_due_rejects_cross_identity_champion_before_database_access() -> N
     ) is False
 
 
-def test_model_research_uses_each_horizons_calendar_cadence() -> None:
+def test_hypothesis_research_keeps_each_horizons_calendar_cadence() -> None:
     class Store:
         @staticmethod
         def latest_branch(_scenario, *, horizon_profile, scheduled_only):
@@ -403,8 +403,6 @@ def test_model_research_uses_each_horizons_calendar_cadence() -> None:
 
     controller = AutopilotController.__new__(AutopilotController)
     controller.store = Store()
-    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
-    config = normalize_autopilot_config()
 
     cases = (
         ("short_1_5d", "2026-08-24", "2026-08-28", "2026-08-31"),
@@ -414,21 +412,19 @@ def test_model_research_uses_each_horizons_calendar_cadence() -> None:
     for horizon, source_end, same_bucket, next_bucket in cases:
         Store.horizon_profile = horizon
         Store.source_end = source_end
-        assert controller._model_due(
+        assert controller._horizon_branch_due(
+            "fin_model",
             {"end_date": same_bucket},
-            now,
-            config,
             horizon_profile=horizon,
         ) is False
-        assert controller._model_due(
+        assert controller._horizon_branch_due(
+            "fin_model",
             {"end_date": next_bucket},
-            now,
-            config,
             horizon_profile=horizon,
         ) is True
 
 
-def test_model_cadence_accepts_serialized_database_timestamp() -> None:
+def test_research_cadence_accepts_serialized_database_timestamp() -> None:
     class Store:
         @staticmethod
         def latest_branch(_scenario, *, horizon_profile, scheduled_only):
@@ -448,10 +444,9 @@ def test_model_cadence_accepts_serialized_database_timestamp() -> None:
     controller = AutopilotController.__new__(AutopilotController)
     controller.store = Store()
 
-    assert controller._model_due(
+    assert controller._horizon_branch_due(
+        "fin_model",
         {"end_date": "2026-08-31"},
-        datetime(2026, 8, 29, 12, tzinfo=UTC),
-        normalize_autopilot_config(),
         horizon_profile="short_1_5d",
     ) is True
 

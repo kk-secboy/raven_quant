@@ -76,7 +76,7 @@ def test_transient_research_job_retries_with_a_bounded_backoff(
     database_url: str, tmp_path: Path
 ) -> None:
     store = JobStore(database_url)
-    created = store.create("rdagent_factor", {}, tmp_path / "rdagent.log")
+    created = store.create("rdagent_quant", {}, tmp_path / "rdagent.log")
     claimed = store.claim_next()
     assert claimed is not None and claimed["id"] == created["id"]
     assert claimed["attempts"] == 1
@@ -203,7 +203,7 @@ def test_retry_progress_jsonb_uses_the_same_non_finite_boundary(
     database_url: str, tmp_path: Path
 ) -> None:
     store = JobStore(database_url)
-    created = store.create("rdagent_factor", {}, tmp_path / "rdagent.log")
+    created = store.create("rdagent_quant", {}, tmp_path / "rdagent.log")
     claimed = store.claim_next()
     assert claimed is not None and claimed["id"] == created["id"]
 

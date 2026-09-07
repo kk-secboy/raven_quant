@@ -28,6 +28,8 @@ CONTROLLED_DOCUMENTS = {
     Path("docs/information-factor-refresh.md"),
     Path("docs/information-pipeline-operations.md"),
     Path("docs/legacy-market-backfill.md"),
+    Path("docs/model-prepared-data.md"),
+    Path("docs/model-execution-performance.md"),
     Path("docs/peripheral-market-data-plan.md"),
     Path("docs/pit-nlp-gap-report.md"),
     Path("docs/financial-correctness-audit-2026-08-25.md"),
@@ -328,7 +330,7 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-07-v41`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-07-v42`" in readme
     assert "不能沿用旧结果宣称等价" in readme
 
 
@@ -1170,3 +1172,28 @@ def test_local_markdown_links_exist(relative: str) -> None:
     assert targets, f"{relative} should link to an authoritative local document"
     missing = [str(path) for path in targets if not path.exists()]
     assert not missing
+
+
+def test_v42_prepared_cache_preserves_independent_experiments_and_frozen_activity() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`qlib-rdagent-single-mainline-2026-09-07-v42`", "`0114_strategy_runtime_v42`",
+        "不跨训练窗口拟合归一化", "不扩大 OOS 可见范围",
+        "每个模型与种子仍独立训练、预测和回测", "全部实验与准入条件保持不变",
+        "可信生产者与模型各自持有存活租约", "容量不足退回原有完整计算",
+        "损坏制品明确报错", "不能删除原始数据或正式结果",
+        "冻结活动不能由新版本热接管", "新代码通过正常新版本活动执行",
+    ):
+        assert contract in specification
+
+
+def test_v42_unified_execution_preserves_trials_and_separates_research_cadence() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "持续研究与完整模型重选使用独立周期", "完整模型重选分别按月、季度、年进行",
+        "完整三窗口、三种子的独立重验", "不能把旧预测或旧评分当作当前数据的重验结果",
+        "全批并发不得超过 8 CPU、40 GiB 与两个单元", "已失败单元保留失败",
+        "不增加统计重试机会", "不能复用半成品或跨种子、跨版本的拟合结果",
+        "最终仍对完整候选集合计算原有 Holm/PBO", "取消时终止对应子进程和沙箱后才释放资源",
+    ):
+        assert contract in specification

@@ -297,6 +297,27 @@ def research_cadence_bucket(horizon_profile: str, dataset_end_date: str) -> str:
     raise ValueError(f"unsupported automatic research horizon: {horizon_profile}")
 
 
+def model_selection_cadence_bucket(horizon_profile: str, dataset_end_date: str) -> str:
+    """Full model selection has its own calendar; research keeps its cadence.
+
+    Between these monthly/quarterly/yearly selections, the immutable champion
+    recipe must still pass the complete current-data evaluation grid before a
+    new research activity may consume it.
+    """
+
+    try:
+        session = date.fromisoformat(str(dataset_end_date))
+    except ValueError as exc:
+        raise ValueError("model selection dataset end date is invalid") from exc
+    if horizon_profile == SHORT_1_5D:
+        return f"month:{session.year:04d}-{session.month:02d}"
+    if horizon_profile == SWING_1_6M:
+        return f"quarter:{session.year:04d}-Q{((session.month - 1) // 3) + 1}"
+    if horizon_profile == LONG_1_3Y:
+        return f"year:{session.year:04d}"
+    raise ValueError(f"unsupported automatic model selection horizon: {horizon_profile}")
+
+
 def normalize_horizon_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Bind a config to one canonical horizon without guessing old semantics.
 

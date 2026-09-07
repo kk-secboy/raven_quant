@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +50,7 @@ def screen(tmp_path, monkeypatch):
     (provider / "metadata" / "provenance.json").write_text(
         json.dumps({"dataset_identity_sha256": "d" * 64}), encoding="utf-8"
     )
+    (provider.parent / "receipt.json").write_text("{}", encoding="utf-8")
     periods = {
         "train_start": "2018-01-02", "train_end": "2022-12-30",
         "valid_start": "2023-01-03", "valid_end": "2023-12-29",
@@ -94,7 +96,7 @@ def screen(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "validate_research_label_binding", lambda _: binding)
     monkeypatch.setattr(worker_module, "validate_research_label_binding", lambda _: binding)
     monkeypatch.setattr(module, "verify_qlib_output_manifest", lambda *_: None)
-    monkeypatch.setattr(module, "prepare_rdagent_dataset_view", lambda *_a, **_k: provider)
+    monkeypatch.setattr(module, "prepare_model_dataset_view", lambda *_a, **_k: provider)
     monkeypatch.setattr(module, "resolve_feature_set", lambda *_: feature_set)
     monkeypatch.setattr(module, "calendar_between", lambda *_: ["2023-01-03", "2023-12-29"])
     monkeypatch.setattr(
@@ -124,7 +126,23 @@ def screen(tmp_path, monkeypatch):
             "research_execution_cadence_sha256": cadence["evidence_sha256"],
         }, {"evidence_sha256": "e" * 64, "execution_environment_sha256": "n" * 64}
 
-    monkeypatch.setattr(module, "execute_model_candidate", execute)
+    class DirectCells:
+        def run_many(self, calls):
+            outcomes = []
+            for call in calls:
+                try:
+                    result, evidence = execute(**call)
+                    outcomes.append({
+                        "status": "completed", "result": result,
+                        "execution_evidence": evidence, "workspace": str(call["workspace"]),
+                        "receipt_sha256": "r" * 64, "reused": False,
+                    })
+                except ModelResourceLimitError as exc:
+                    outcomes.append({"status": "resource_blocked", "error": str(exc)})
+            return outcomes
+
+    monkeypatch.setattr(module, "_new_cell_executor", lambda *_: DirectCells())
+    monkeypatch.setattr(module, "arm_model_batch_owner", lambda *_: nullcontext())
     monkeypatch.setattr(module, "governed_checkpoint_filename", lambda _: "checkpoint.txt")
 
     def run():

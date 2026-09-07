@@ -185,6 +185,9 @@ def _tick_fixture(monkeypatch, dataset, cycle):
         cycle.update(values)
         return cycle
 
+    def patch(_id, *, state_patch, **values):
+        return update(_id, state={**cycle["state"], **state_patch}, **values)
+
     def no_scheduled(*_args, **_kwargs):
         pytest.fail("manual activity must not create or reopen a scheduled cycle")
 
@@ -194,6 +197,7 @@ def _tick_fixture(monkeypatch, dataset, cycle):
         set_cycle_state=update, branch_for_scope=lambda *_: next(
             (b for b in cycle["branches"] if b["scenario"] == "fin_quant"), None
         ),
+        patch_cycle_state=patch,
     )
     controller = _controller(store, dataset)
     tournament = {"id": "current-model-tournament", "status": "running"}

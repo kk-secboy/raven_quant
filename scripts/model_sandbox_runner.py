@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,21 @@ import pandas as pd
 
 sys.path.insert(0, "/work")
 
-from quant_platform.model_data_handler import load_memory_bounded_model_handler  # noqa: E402
+from quant_platform.model_compute_policy import (  # noqa: E402
+    MODEL_RESOURCE_POLICY_VERSION,
+    fixed_model_cell_grid_policy,
+    governed_cell_resource_allocation,
+    require_model_thread_environment,
+)
+from quant_platform.model_data_handler import (  # noqa: E402
+    build_model_handler_from_prepared_data,
+    load_memory_bounded_model_handler,
+)
+from quant_platform.model_data_request import prepared_data_request  # noqa: E402
+from quant_platform.model_prepared_data import (  # noqa: E402
+    canonical_key,
+    load_prepared_data,
+)
 from quant_platform.qlib_portfolio_calendar import (  # noqa: E402
     resolve_qlib_portfolio_calendar_boundary,
 )
@@ -31,10 +47,11 @@ MODEL_LABEL_HORIZON_TRADING_DAYS = 2
 MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS = 5
 LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
 MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v7-cpu-tournament-40gb-bounded-handler"
 MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE = "true"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_MEMORY_STAGE_PREFIX = "QUANTLAB_MODEL_MEMORY_STAGE="
+MODEL_PERFORMANCE_AUDIT_VERSION = "model-performance-audit-v1-stage-counters"
+_MODEL_STAGE_CLOCKS: dict[str, tuple[float, float, float, float]] = {}
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 GOVERNED_MODEL_ENGINES = {
@@ -168,7 +185,58 @@ def model_memory_snapshot(
         "cgroup_peak_bytes": cgroup_peak_bytes,
         "cgroup_limit_bytes": cgroup_limit_bytes,
         "governed_limit_bytes": governed_limit_bytes,
+        "performance": model_performance_snapshot(cgroup_root=cgroup_root),
     }
+
+
+def model_performance_snapshot(*, cgroup_root: Path = Path("/sys/fs/cgroup")) -> dict[str, Any]:
+    """Read bounded numeric counters only, never environment or process arguments."""
+    performance: dict[str, Any] = {
+        "contract_version": MODEL_PERFORMANCE_AUDIT_VERSION,
+        "monotonic_seconds": time.monotonic(),
+        "process_cpu_seconds": time.process_time(),
+    }
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        children = resource.getrusage(resource.RUSAGE_CHILDREN)
+        performance.update({
+            "process_user_cpu_seconds": usage.ru_utime,
+            "process_system_cpu_seconds": usage.ru_stime,
+            "reaped_children_cpu_seconds": children.ru_utime + children.ru_stime,
+            "minor_page_faults": usage.ru_minflt,
+            "major_page_faults": usage.ru_majflt,
+            "voluntary_context_switches": usage.ru_nvcsw,
+            "involuntary_context_switches": usage.ru_nivcsw,
+        })
+    except (ImportError, OSError):
+        pass
+    try:
+        cpu_lines = (cgroup_root / "cpu.stat").read_text(encoding="ascii").splitlines()
+    except OSError:
+        cpu_lines = []
+    cpu = {}
+    for line in cpu_lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in {
+            "usage_usec", "user_usec", "system_usec", "nr_periods", "nr_throttled",
+            "throttled_usec", "nr_bursts", "burst_usec",
+        } and parts[1].isdigit():
+            cpu[parts[0]] = int(parts[1])
+    performance["cgroup_cpu"] = cpu
+    try:
+        io_lines = (cgroup_root / "io.stat").read_text(encoding="ascii").splitlines()
+    except OSError:
+        io_lines = []
+    io_totals: dict[str, int] = {}
+    for line in io_lines:
+        for field in line.split()[1:]:
+            name, separator, value = field.partition("=")
+            if separator and name in {"rbytes", "wbytes", "rios", "wios"} and value.isdigit():
+                io_totals[name] = io_totals.get(name, 0) + int(value)
+    performance["cgroup_io"] = io_totals
+    return performance
 
 
 def record_model_memory_stage(
@@ -181,9 +249,22 @@ def record_model_memory_stage(
         stage,
         governed_limit_bytes=governed_limit_bytes,
     )
+    performance = snapshot["performance"]
+    now, cpu = performance["monotonic_seconds"], performance["process_cpu_seconds"]
+    key = str(audit_path.resolve())
+    first, previous, first_cpu, previous_cpu = _MODEL_STAGE_CLOCKS.get(key, (now, now, cpu, cpu))
+    performance.update({
+        "elapsed_seconds": now - first,
+        "stage_elapsed_seconds": now - previous,
+        "elapsed_process_cpu_seconds": cpu - first_cpu,
+        "stage_process_cpu_seconds": cpu - previous_cpu,
+    })
+    _MODEL_STAGE_CLOCKS[key] = first, now, first_cpu, cpu
     encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
     with audit_path.open("a", encoding="utf-8") as stream:
         stream.write(encoded + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
     print(MODEL_MEMORY_STAGE_PREFIX + encoded, flush=True)
     return snapshot
 
@@ -343,6 +424,18 @@ def main() -> None:
     if resource_policy.get("model_engine") != model_engine:
         raise ValueError("model sandbox resource policy changed the model engine")
     limits = resource_policy.get("limits") or {}
+    cell_allocation = governed_cell_resource_allocation(manifest)
+    if manifest.get("model_cell_grid_policy") != fixed_model_cell_grid_policy():
+        raise ValueError("model sandbox requires the complete frozen cell grid policy")
+    if manifest.get("model_cell_allocation") != cell_allocation:
+        raise ValueError("model sandbox requires its frozen cell allocation")
+    for name in (
+        "cpu_count", "memory_gb", "compute_threads", "blas_threads",
+        "torch_interop_threads", "dataloader_workers",
+    ):
+        if limits.get(name) != cell_allocation[name]:
+            raise ValueError("model resource limits differ from the governed cell allocation")
+    require_model_thread_environment(cell_allocation, os.environ)
     if limits.get("date_segments_modified") is not False:
         raise ValueError("model resource policy may not modify governed date segments")
     if limits.get("universe_modified") is not False:
@@ -456,6 +549,13 @@ def main() -> None:
     from qlib.data.dataset import DatasetH, TSDatasetH
     from qlib.workflow.record_temp import PortAnaRecord
 
+    torch.set_num_threads(cell_allocation["compute_threads"])
+    torch.set_num_interop_threads(cell_allocation["torch_interop_threads"])
+    if (
+        torch.get_num_threads() != cell_allocation["compute_threads"]
+        or torch.get_num_interop_threads() != cell_allocation["torch_interop_threads"]
+    ):
+        raise ValueError("PyTorch did not apply its governed compute thread counts")
     seed = int(manifest["seed"])
     seed_policy = resource_policy.get("seed_policy") or {}
     if (
@@ -530,16 +630,38 @@ def main() -> None:
             memory_audit_path, stage, governed_limit_bytes=governed_limit_bytes,
         ))
 
-    handler = load_memory_bounded_model_handler(
-        features=features,
-        label_expression=label_expression,
-        instruments=manifest.get("universe", "cn_all"),
-        start_time=periods["train_start"],
-        end_time=prediction_end,
-        fit_end_time=periods["train_end"],
-        additional_factors_path=factor_path,
-        on_stage=handler_memory_stage,
+    prepared_binding = manifest.get("prepared_data") or {}
+    if prepared_binding.get("contract_version") != "model-prepared-execution-v1":
+        raise ValueError("model sandbox prepared data binding is unavailable")
+    request = prepared_data_request(
+        manifest, provider=Path(manifest["provider_uri"]), label_contract=label_contract,
+        producer_identity=manifest["execution_environment"]["prepared_data_producer"],
+        additional_factors=factor_path,
     )
+    if canonical_key(request) != prepared_binding.get("request_sha256"):
+        raise ValueError("model sandbox prepared data inputs changed")
+    if prepared_binding.get("mode") == "prepared_readonly":
+        import fcntl
+
+        # The child keeps its own shared lease if the controller exits early.
+        lease = Path("/prepared.lease").open("rb")
+        fcntl.flock(lease.fileno(), fcntl.LOCK_SH)
+        atexit.register(lease.close)
+        handler = build_model_handler_from_prepared_data(load_prepared_data(
+            Path("/prepared"), expected_contract=request,
+            expected_manifest_sha256=prepared_binding["manifest_sha256"],
+        ))
+        handler_memory_stage("handler_prepared_data_verified")
+    elif prepared_binding.get("mode") == "uncached_capacity":
+        handler = load_memory_bounded_model_handler(
+            features=features, label_expression=label_expression,
+            instruments=manifest.get("universe", "cn_all"),
+            start_time=periods["train_start"], end_time=prediction_end,
+            fit_end_time=periods["train_end"], additional_factors_path=factor_path,
+            on_stage=handler_memory_stage,
+        )
+    else:
+        raise ValueError("model sandbox prepared data mode is invalid")
     memory_stages.append(
         record_model_memory_stage(
             memory_audit_path,
@@ -625,7 +747,7 @@ def main() -> None:
             subsample_freq=1,
             lambda_l1=1.0,
             lambda_l2=1.0,
-            num_threads=min(max(int(os.getenv("MODEL_SANDBOX_N_JOBS", "2")), 1), 4),
+            num_threads=cell_allocation["compute_threads"],
             num_boost_round=300,
             early_stopping_rounds=30,
             seed=seed,
@@ -689,7 +811,7 @@ def main() -> None:
             ),
             metric="loss",
             loss="mse",
-            n_jobs=min(max(int(os.getenv("MODEL_SANDBOX_N_JOBS", "2")), 1), 4),
+            n_jobs=cell_allocation["dataloader_workers"],
             GPU=-1,
             seed=seed,
             pt_model_uri=model_uri,
@@ -710,7 +832,7 @@ def main() -> None:
             weight_decay=min(max(float(hyperparameters.get("weight_decay", 1e-4)), 0.0), 10.0),
             metric="loss",
             loss="mse",
-            n_jobs=min(max(int(os.getenv("MODEL_SANDBOX_N_JOBS", "2")), 1), 4),
+            n_jobs=cell_allocation["dataloader_workers"],
             GPU=-1,
             seed=seed,
             pt_model_uri="model.model_cls",
@@ -724,6 +846,7 @@ def main() -> None:
     else:  # pragma: no cover - guarded before Qlib initialization
         raise ValueError("model engine is not governed")
     checkpoint_format = MODEL_CHECKPOINT_FORMATS[model_engine]
+    handler_memory_stage("checkpoint_loading" if inference_only else "model_fit_started")
     if inference_only:
         checkpoint = _require_inference_checkpoint(manifest, model_engine=model_engine)
         if checkpoint_format == "ridge_numeric_json":
@@ -939,6 +1062,8 @@ def main() -> None:
         "model_spec": model_spec,
         "model_spec_sha256": canonical_sha256(model_spec),
         "resource_policy": resource_policy,
+        "model_cell_allocation": cell_allocation,
+        "prepared_data": prepared_binding,
         "model_data_contract": model_data_contract,
         "model_data_contract_sha256": model_data_contract_sha256,
         "model_label_contract": label_contract,

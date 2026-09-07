@@ -148,7 +148,8 @@ def test_worker_persists_and_passes_minute_execution_dataset(
     assert command[command.index("--tracking-uri") + 1] == "postgresql://tracking"
     assert result_path == tmp_path / "artifacts" / "backtests" / "backtest-1" / "result.json"
     assert environment == {
-        "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow")
+        "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow"),
+        "MODEL_PREPARED_DATA_ROOT": str(tmp_path / "artifacts" / "model-prepared-data"),
     }
     manifest = json.loads(
         (tmp_path / "artifacts" / "backtests" / "backtest-1" / "manifest.json").read_text(
@@ -470,7 +471,8 @@ def test_worker_builds_production_qlib_order_plan_job(
     assert manifest["holding_age_sessions"] == {"SH600000": 1}
     assert "--signal-provider-uri" in command
     assert environment == {
-        "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow")
+        "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow"),
+        "MODEL_PREPARED_DATA_ROOT": str(tmp_path / "artifacts" / "model-prepared-data"),
     }
 
 

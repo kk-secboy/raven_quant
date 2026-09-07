@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .model_prepared_data import PreparedModelData
+
 FEATURE_LOAD_BATCH_SIZE = 8
 
 
@@ -18,7 +20,7 @@ def _column_frame(columns: Mapping[tuple[str, str], np.ndarray], index: pd.Index
     return frame
 
 
-def build_model_handler_from_columns(
+def prepare_model_data_from_columns(
     columns: dict[tuple[str, str], np.ndarray],
     index: pd.MultiIndex,
     *,
@@ -32,11 +34,7 @@ def build_model_handler_from_columns(
     applied separately, with the same complete date cross sections. No dates,
     instruments, expressions, precision, normalization or training rules change.
     """
-    from qlib.data.dataset.handler import DataHandler, DataHandlerLP
-    from qlib.data.dataset.loader import StaticDataLoader
     from qlib.data.dataset.processor import CSZScoreNorm, DropnaLabel, Fillna, RobustZScoreNorm
-    from qlib.data.dataset.storage import BaseHandlerStorage
-    from qlib.data.dataset.utils import fetch_df_by_col, fetch_df_by_index
 
     if not index.is_unique or not index.is_monotonic_increasing:
         raise ValueError("model handler requires the original unique sorted Qlib index")
@@ -69,6 +67,21 @@ def build_model_handler_from_columns(
     learn_labels = CSZScoreNorm(fields_group="label")(DropnaLabel()(raw_labels.copy()))
     if on_stage:
         on_stage("handler_labels_ready")
+
+    return PreparedModelData(
+        index=index, features=features, infer_labels=raw_labels, learn_labels=learn_labels,
+    )
+
+
+def build_model_handler_from_prepared_data(data: PreparedModelData):
+    """Attach the same Qlib fetch implementation to fresh or verified mmap arrays."""
+    from qlib.data.dataset.handler import DataHandler, DataHandlerLP
+    from qlib.data.dataset.loader import StaticDataLoader
+    from qlib.data.dataset.storage import BaseHandlerStorage
+    from qlib.data.dataset.utils import fetch_df_by_col, fetch_df_by_index
+
+    features, index = data.features, data.index
+    feature_dtype = np.result_type(*(values.dtype for values in features.values()))
 
     class SharedFeatureStorage(BaseHandlerStorage):
         """Materialize only the requested segment; infer/learn share features."""
@@ -122,12 +135,26 @@ def build_model_handler_from_columns(
     handler = DataHandlerLP(
         data_loader=StaticDataLoader(pd.DataFrame()), init_data=False, drop_raw=True,
     )
-    handler._infer = SharedFeatureStorage(raw_labels)
-    handler._learn = SharedFeatureStorage(learn_labels)
+    handler._infer = SharedFeatureStorage(data.infer_labels)
+    handler._learn = SharedFeatureStorage(data.learn_labels)
     return handler
 
 
-def load_memory_bounded_model_handler(
+def build_model_handler_from_columns(
+    columns: dict[tuple[str, str], np.ndarray],
+    index: pd.MultiIndex,
+    *,
+    fit_start_time: str,
+    fit_end_time: str,
+    on_stage: Callable[[str], None] | None = None,
+):
+    return build_model_handler_from_prepared_data(prepare_model_data_from_columns(
+        columns, index, fit_start_time=fit_start_time, fit_end_time=fit_end_time,
+        on_stage=on_stage,
+    ))
+
+
+def prepare_memory_bounded_model_data(
     *,
     features: Mapping[str, str],
     label_expression: str,
@@ -179,6 +206,24 @@ def load_memory_bounded_model_handler(
         # NestedDataLoader replaces duplicate columns and sorts its final columns.
         columns = dict(sorted(columns.items()))
         del additional, loader
-    return build_model_handler_from_columns(
+    return prepare_model_data_from_columns(
         columns, index, fit_start_time=start_time, fit_end_time=fit_end_time, on_stage=on_stage,
     )
+
+
+def load_memory_bounded_model_handler(
+    *,
+    features: Mapping[str, str],
+    label_expression: str,
+    instruments: Any,
+    start_time: str,
+    end_time: str,
+    fit_end_time: str,
+    additional_factors_path: Path | None = None,
+    on_stage: Callable[[str], None] | None = None,
+):
+    return build_model_handler_from_prepared_data(prepare_memory_bounded_model_data(
+        features=features, label_expression=label_expression, instruments=instruments,
+        start_time=start_time, end_time=end_time, fit_end_time=fit_end_time,
+        additional_factors_path=additional_factors_path, on_stage=on_stage,
+    ))

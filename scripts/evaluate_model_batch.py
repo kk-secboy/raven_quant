@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +9,19 @@ import pandas as pd
 
 from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.feature_set_registry import resolve_feature_set
+from quant_platform.model_cell_execution import (
+    ModelCellBatchExecutor,
+    cell_batch_identity,
+    model_cell_store_root,
+)
+from quant_platform.model_cell_recovery import arm_model_batch_owner
+from quant_platform.model_compute_policy import (
+    fixed_model_cell_grid_policy,
+    governed_cell_resource_allocation,
+)
+from quant_platform.model_dataset_view_store import prepare_model_dataset_view
 from quant_platform.model_recompute import (
     ModelResourceLimitError,
-    execute_model_candidate,
     governed_checkpoint_filename,
 )
 from quant_platform.model_research_governance import (
@@ -25,7 +34,6 @@ from quant_platform.model_research_governance import (
     validate_independent_model_evidence,
     verify_model_prediction_artifact,
 )
-from quant_platform.rdagent_dataset_view import prepare_rdagent_dataset_view
 from quant_platform.research_execution_cadence import (
     validate_research_execution_cadence_contract,
 )
@@ -44,12 +52,47 @@ def calendar_between(provider: Path, start: str, end: str) -> list[str]:
     return selected
 
 
+
+def _new_cell_executor(manifest: dict, runner_path: Path, output: Path):
+    return ModelCellBatchExecutor(
+        store_root=model_cell_store_root(output),
+        batch_identity=cell_batch_identity(manifest, runner_path),
+        control_root=output.parent / "cell-processes",
+    )
+
+
+def _cell_result(outcome: dict) -> tuple[dict, dict, Path]:
+    if outcome["status"] == "resource_blocked":
+        raise ModelResourceLimitError(outcome["error"])
+    if outcome["status"] != "completed":
+        raise ValueError(outcome["error"])
+    workspace = Path(outcome["workspace"])
+    result = {
+        **outcome["result"],
+        "cell_execution": {
+            "receipt_sha256": outcome["receipt_sha256"],
+            "receipt_path": str(workspace.parents[2] / "receipt.json"),
+            "reused": outcome["reused"],
+        },
+    }
+    return result, outcome["execution_evidence"], workspace
+
+
+def _execute_cell(executor, **kwargs) -> tuple[dict, dict, Path]:
+    return _cell_result(executor.run_many([kwargs])[0])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    with arm_model_batch_owner(Path(args.output).absolute()):
+        _evaluate_batch(args)
+
+
+def _evaluate_batch(args: argparse.Namespace) -> None:
     provider = Path(args.provider_uri).resolve()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     label_binding = validate_research_label_binding(
@@ -86,7 +129,9 @@ def main() -> None:
         if evaluation_stage == "feature_screen"
         else {"recent_3y", "balanced_5y", "robust_10y"}
     )
-    if evaluation_stage not in {"feature_screen", "model_full"} or {
+    if len(profiles) != len(expected_profiles) or evaluation_stage not in {
+        "feature_screen", "model_full"
+    } or {
         str(item.get("id")) for item in profiles
     } != expected_profiles:
         raise ValueError("model evaluation profiles do not match its tournament stage")
@@ -133,17 +178,16 @@ def main() -> None:
     pre_final_end = next(iter(valid_ends))
     output = Path(args.output).resolve()
     artifact_root = output.parent / "independent-model-evaluations"
-    if artifact_root.exists():
-        shutil.rmtree(artifact_root)
-    artifact_root.mkdir(parents=True)
-    view = prepare_rdagent_dataset_view(
+    artifact_root.mkdir(parents=True, exist_ok=False)
+    view = prepare_model_dataset_view(
         provider,
-        output.parent / "model-dataset-view",
-        cutoff=pre_final_end,
+        model_cell_store_root(output).parent / "model-dataset-views",
+        cutoff=pre_final_end, provenance=provenance,
     )
     feature_set_id = str(manifest.get("feature_set_id") or "governed-baseline")
     feature_set = resolve_feature_set(feature_set_id, manifest.get("feature_set"))
     runner_path = Path(__file__).resolve().with_name("model_sandbox_runner.py")
+    cell_executor = _new_cell_executor(manifest, runner_path, output)
     evaluations: list[dict[str, Any]] = []
     for candidate in manifest.get("candidates") or []:
         candidate_id = str(candidate["id"])
@@ -153,10 +197,11 @@ def main() -> None:
             seed: int,
             *,
             resource_stage: str,
+            profile_id: str,
             _candidate: dict[str, Any] = candidate,
             _candidate_id: str = candidate_id,
         ) -> dict[str, Any]:
-            return {
+            cell_manifest = {
                 "candidate_id": _candidate_id,
                 "code_sha256": _candidate["code_sha256"],
                 "model_type": _candidate["model_type"],
@@ -165,10 +210,13 @@ def main() -> None:
                 ),
                 "training_hyperparameters": _candidate.get("training_hyperparameters") or {},
                 "resource_stage": resource_stage,
+                "evaluation_profile_id": profile_id,
+                "model_cell_grid_policy": fixed_model_cell_grid_policy(),
                 "feature_set": feature_set,
                 "periods": periods,
                 "seed": seed,
                 "dataset_identity_sha256": dataset_identity,
+                "model_dataset_view_receipt_sha256": file_sha256(view.parent / "receipt.json"),
                 "research_window_contract": manifest.get("research_window_contract"),
                 "research_window_contract_sha256": manifest.get(
                     "research_window_contract_sha256"
@@ -186,6 +234,10 @@ def main() -> None:
                 "min_cost": manifest.get("min_cost", 5.0),
                 "final_oos_opened": False,
             }
+            cell_manifest["model_cell_allocation"] = governed_cell_resource_allocation(
+                cell_manifest
+            )
+            return cell_manifest
 
         evidence: dict[str, Any] = {
             "contract_version": MODEL_RESEARCH_CONTRACT_VERSION,
@@ -207,13 +259,15 @@ def main() -> None:
             screen_seed = int(REQUIRED_MODEL_SEEDS[0])
             workspace = artifact_root / candidate_id / "feature-screen"
             try:
-                screen_result, screen_execution = execute_model_candidate(
+                screen_result, screen_execution, workspace = _execute_cell(
+                    cell_executor,
                     code_path=Path(candidate["code_path"]),
                     provider_path=view,
                     manifest=execution_manifest(
                         screen_periods,
                         screen_seed,
                         resource_stage="screening",
+                        profile_id="recent_3y",
                     ),
                     workspace=workspace,
                     runner_path=runner_path,
@@ -264,6 +318,7 @@ def main() -> None:
                     ],
                     "coverage": coverage,
                     "resource_policy": screen_result["resource_policy"],
+                    "cell_execution": screen_result["cell_execution"],
                     "model_label_contract": screen_result["model_label_contract"],
                     "model_label_contract_sha256": screen_result[
                         "model_label_contract_sha256"
@@ -332,13 +387,15 @@ def main() -> None:
         screening_seed = int(REQUIRED_MODEL_SEEDS[0])
         screening_workspace = artifact_root / candidate_id / "resource-screen"
         try:
-            screening_result, screening_execution = execute_model_candidate(
+            screening_result, screening_execution, screening_workspace = _execute_cell(
+                cell_executor,
                 code_path=Path(candidate["code_path"]),
                 provider_path=view,
                 manifest=execution_manifest(
                     screening_periods,
                     screening_seed,
                     resource_stage="screening",
+                    profile_id="balanced_5y",
                 ),
                 workspace=screening_workspace,
                 runner_path=runner_path,
@@ -381,6 +438,7 @@ def main() -> None:
             "periods": screening_periods,
             "metrics": screening_result["metrics"],
             "resource_policy": screening_result["resource_policy"],
+            "cell_execution": screening_result["cell_execution"],
             "model_label_contract": screening_result["model_label_contract"],
             "model_label_contract_sha256": screening_result[
                 "model_label_contract_sha256"
@@ -395,12 +453,24 @@ def main() -> None:
             "date_segments_modified": False,
             "universe_modified": False,
         }
+        grid_calls = [
+            {
+                "code_path": Path(candidate["code_path"]),
+                "provider_path": view,
+                "manifest": execution_manifest(
+                    dict(profile["periods"]), seed, resource_stage="full_validation",
+                    profile_id=str(profile["id"]),
+                ),
+                "runner_path": runner_path,
+                "timeout_seconds": int(manifest.get("model_timeout_seconds", 7200)),
+            }
+            for profile in profiles for seed in REQUIRED_MODEL_SEEDS
+        ]
+        grid_outcomes = iter(cell_executor.run_many(grid_calls))
         execution_environments: set[str] = set()
         failure: str | None = None
         resource_block: str | None = None
         for profile in profiles:
-            if resource_block is not None:
-                break
             profile_id = str(profile["id"])
             periods = dict(profile["periods"])
             seed_results: dict[str, Any] = {}
@@ -408,16 +478,7 @@ def main() -> None:
             for seed in REQUIRED_MODEL_SEEDS:
                 workspace = artifact_root / candidate_id / profile_id / f"seed-{seed}"
                 try:
-                    result, execution_evidence = execute_model_candidate(
-                        code_path=Path(candidate["code_path"]),
-                        provider_path=view,
-                        manifest=execution_manifest(
-                            periods, seed, resource_stage="full_validation"
-                        ),
-                        workspace=workspace,
-                        runner_path=runner_path,
-                        timeout_seconds=int(manifest.get("model_timeout_seconds", 7200)),
-                    )
+                    result, execution_evidence, workspace = _cell_result(next(grid_outcomes))
                     predictions_path = workspace / "output" / "predictions.parquet"
                     coverage = verify_model_prediction_artifact(
                         predictions_path,
@@ -458,6 +519,7 @@ def main() -> None:
                         ],
                         "coverage": coverage,
                         "resource_policy": result["resource_policy"],
+                        "cell_execution": result["cell_execution"],
                         "model_label_contract": result["model_label_contract"],
                         "model_label_contract_sha256": result[
                             "model_label_contract_sha256"
@@ -474,8 +536,7 @@ def main() -> None:
                         "status": "resource_blocked",
                         "error": str(exc),
                     }
-                    resource_block = f"{profile_id}/seed-{seed}: {exc}"
-                    break
+                    resource_block = resource_block or f"{profile_id}/seed-{seed}: {exc}"
                 except Exception as exc:
                     seed_results[str(seed)] = {"status": "failed", "error": str(exc)}
                     failure = failure or f"{profile_id}/seed-{seed}: {exc}"

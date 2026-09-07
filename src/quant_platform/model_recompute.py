@@ -11,6 +11,17 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .model_compute_policy import (
+    MODEL_RESOURCE_POLICY_VERSION,
+    fixed_model_cell_grid_policy,
+    governed_cell_resource_allocation,
+    model_thread_environment,
+)
+from .model_prepared_execution import (
+    PreparedDataBuildError,
+    prepared_runtime_identity,
+    run_with_prepared_data,
+)
 from .model_research_governance import (
     canonical_sha256,
     file_sha256,
@@ -21,8 +32,7 @@ from .research_execution_cadence import (
     validate_research_execution_cadence_contract,
 )
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v9-memory-bounded-handler"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v7-cpu-tournament-40gb-bounded-handler"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v11-profile-thread-audit"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
@@ -120,7 +130,9 @@ def _read_model_memory_audit(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _model_memory_peak_bytes(records: list[dict[str, Any]]) -> int | None:
+def _model_memory_peak_bytes(
+    records: list[dict[str, Any]], *, prepared_binding: dict[str, Any] | None = None,
+) -> int | None:
     peaks = [
         value
         for record in records
@@ -130,6 +142,12 @@ def _model_memory_peak_bytes(records: list[dict[str, Any]]) -> int | None:
         )
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0
     ]
+    producer = (prepared_binding or {}).get("producer") or {}
+    if producer.get("summary_validated") is True:
+        memory = (producer.get("summary") or {}).get("memory") or {}
+        peak = memory.get("observed_memory_peak_bytes")
+        if isinstance(peak, int) and not isinstance(peak, bool) and peak > 0:
+            peaks.append(peak)
     return max(peaks, default=None)
 
 
@@ -239,6 +257,7 @@ def governed_model_resource_policy(
     requested_timeout_seconds: int,
     seed: int | None = None,
     data_contract_version: str = MODEL_DATA_CONTRACT_VERSION,
+    evaluation_profile_id: str | None = None,
 ) -> dict[str, Any]:
     """Freeze a reproducible compute budget without changing date segments.
 
@@ -351,6 +370,11 @@ def governed_model_resource_policy(
         seed_policy = "fixed-deep-model-seeds"
     else:
         seed_policy = "fixed-rdagent-model-seeds"
+    allocation = governed_cell_resource_allocation({
+        "model_engine": model_engine,
+        "resource_stage": stage,
+        "evaluation_profile_id": evaluation_profile_id,
+    })
     return {
         "contract_version": MODEL_RESOURCE_POLICY_VERSION,
         "stage": stage,
@@ -366,8 +390,12 @@ def governed_model_resource_policy(
         "data_contract_version": data_contract_version,
         "limits": {
             "timeout_seconds": timeout_seconds,
-            "cpu_count": 4,
-            "memory_gb": MODEL_SANDBOX_MEMORY_GB,
+            "cpu_count": allocation["cpu_count"],
+            "memory_gb": allocation["memory_gb"],
+            "compute_threads": allocation["compute_threads"],
+            "blas_threads": allocation["blas_threads"],
+            "torch_interop_threads": allocation["torch_interop_threads"],
+            "dataloader_workers": allocation["dataloader_workers"],
             "qlib_kernels": MODEL_QLIB_KERNELS,
             "network": "none",
             "date_segments_modified": False,
@@ -569,6 +597,10 @@ def execute_model_candidate(
     workflow_adapter_source = Path(__file__).resolve().with_name("qlib_workflow.py")
     upstream_versions_source = Path(__file__).resolve().with_name("upstream_versions.py")
     model_data_handler_source = Path(__file__).resolve().with_name("model_data_handler.py")
+    prepared_sources = {
+        name: Path(__file__).resolve().with_name(name)
+        for name in ("model_prepared_data.py", "model_data_request.py")
+    }
     if not all(
         path.is_file()
         for path in (
@@ -599,12 +631,18 @@ def execute_model_candidate(
         requested_timeout_seconds=timeout_seconds,
         seed=manifest.get("seed"),
         data_contract_version=data_contract_version,
+        evaluation_profile_id=manifest.get("evaluation_profile_id"),
     )
+    cell_allocation = governed_cell_resource_allocation(manifest)
+    grid_policy = fixed_model_cell_grid_policy()
+    compute_policy_source = Path(__file__).resolve().with_name("model_compute_policy.py")
     effective_timeout_seconds = int(resource_policy["limits"]["timeout_seconds"])
     execution_environment = {
         "contract_version": "model-execution-environment-v1",
         "executor_version": MODEL_RECOMPUTE_EXECUTOR_VERSION,
         "resource_policy_version": MODEL_RESOURCE_POLICY_VERSION,
+        "model_cell_grid_policy": grid_policy,
+        "model_compute_policy_sha256": file_sha256(compute_policy_source),
         "executor_source_sha256": executor_source_sha256,
         "runner_sha256": runner_sha256,
         "model_template_sha256": template_sha256,
@@ -615,6 +653,15 @@ def execute_model_candidate(
         "qlib_workflow_adapter_sha256": workflow_adapter_sha256,
         "upstream_versions_sha256": upstream_versions_sha256,
         "model_data_handler_sha256": model_data_handler_sha256,
+        "prepared_data_producer": prepared_runtime_identity(
+            runner_path, image=image, image_id=image_id,
+        ),
+        "prepared_data_controller_sha256": file_sha256(
+            Path(__file__).resolve().with_name("model_prepared_execution.py")
+        ),
+        "prepared_data_cache_sha256": file_sha256(
+            Path(__file__).resolve().with_name("model_prepared_cache.py")
+        ),
         "sandbox_image": image,
         "sandbox_image_id": image_id,
         "mlflow_allow_file_store": MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE,
@@ -646,6 +693,9 @@ def execute_model_candidate(
     shutil.copy2(workflow_adapter_source, sandbox_package / "qlib_workflow.py")
     shutil.copy2(upstream_versions_source, sandbox_package / "upstream_versions.py")
     shutil.copy2(model_data_handler_source, sandbox_package / "model_data_handler.py")
+    shutil.copy2(compute_policy_source, sandbox_package / "model_compute_policy.py")
+    for name, source in prepared_sources.items():
+        shutil.copy2(source, sandbox_package / name)
     runtime_checkpoint: Path | None = None
     if allow_inference:
         checkpoint_format = str(source_checkpoint_format)
@@ -678,6 +728,8 @@ def execute_model_candidate(
         "contract_version": "model-sandbox-input-v1",
         "provider_uri": "/qlib",
         "resource_policy": resource_policy,
+        "model_cell_grid_policy": grid_policy,
+        "model_cell_allocation": cell_allocation,
         "model_label_contract": label_contract,
         "model_label_contract_sha256": label_contract_sha256,
         **(
@@ -690,15 +742,11 @@ def execute_model_candidate(
     }
     if execution_cadence is None:
         runtime_manifest.pop("research_execution_cadence", None)
-    (workspace / "manifest.json").write_text(
-        json.dumps(runtime_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
     workspace.chmod(0o777)
     readonly_names = [
         "model.py",
         "runner.py",
         MODEL_TEMPLATE_FILENAME,
-        "manifest.json",
         "quant_platform/__init__.py",
         "quant_platform/qlib_portfolio_calendar.py",
         "quant_platform/qlib_research_strategy.py",
@@ -707,6 +755,8 @@ def execute_model_candidate(
         "quant_platform/qlib_workflow.py",
         "quant_platform/upstream_versions.py",
         "quant_platform/model_data_handler.py",
+        "quant_platform/model_compute_policy.py",
+        *[f"quant_platform/{name}" for name in prepared_sources],
     ]
     if runtime_checkpoint is not None:
         readonly_names.append(runtime_checkpoint.name)
@@ -729,9 +779,11 @@ def execute_model_candidate(
         "--pids-limit",
         "512",
         "--memory",
-        f"{MODEL_SANDBOX_MEMORY_GB}g",
+        f"{cell_allocation['memory_gb']}g",
+        "--memory-swap",
+        f"{cell_allocation['memory_gb']}g",
         "--cpus",
-        "4",
+        str(cell_allocation["cpu_count"]),
         "--user",
         "65534:65534",
         "--env",
@@ -740,6 +792,11 @@ def execute_model_candidate(
         "PYTHONPATH=/work",
         "--env",
         f"MLFLOW_ALLOW_FILE_STORE={MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE}",
+        *[
+            argument
+            for name, value in model_thread_environment(cell_allocation).items()
+            for argument in ("--env", f"{name}={value}")
+        ],
         "--tmpfs",
         "/tmp:rw,nosuid,nodev,size=2g",
         "--mount",
@@ -754,14 +811,16 @@ def execute_model_candidate(
         "runner.py",
     ]
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout_seconds,
-            check=False,
+        completed = run_with_prepared_data(
+            command=command, workspace=workspace, provider=provider_path,
+            runner_path=runner_path, manifest=runtime_manifest,
+            timeout_seconds=effective_timeout_seconds,
         )
-    except subprocess.TimeoutExpired as exc:
+    except PreparedDataBuildError as exc:
+        if exc.returncode in {137, 143, -9, -15} or "out of memory" in str(exc).lower():
+            raise ModelResourceLimitError(str(exc)) from exc
+        raise
+    except (subprocess.TimeoutExpired, TimeoutError) as exc:
         if cidfile.is_file():
             container_id = cidfile.read_text(encoding="utf-8").strip()
             if container_id:
@@ -777,7 +836,9 @@ def execute_model_candidate(
         ) from exc
     memory_audit_path = workspace / "output" / "memory_stages.jsonl"
     memory_audit_records = _read_model_memory_audit(memory_audit_path)
-    observed_memory_peak_bytes = _model_memory_peak_bytes(memory_audit_records)
+    observed_memory_peak_bytes = _model_memory_peak_bytes(
+        memory_audit_records, prepared_binding=runtime_manifest.get("prepared_data"),
+    )
     if completed.returncode != 0:
         message = (completed.stderr or completed.stdout or "model execution failed").strip()
         if completed.returncode in {137, 143, -9, -15} or "out of memory" in message.lower():
@@ -802,6 +863,10 @@ def execute_model_candidate(
         raise ValueError("independent model recomputation result is invalid")
     if result.get("resource_policy") != resource_policy:
         raise ValueError("independent model recomputation changed its resource policy")
+    if result.get("model_cell_allocation") != cell_allocation:
+        raise ValueError("independent model recomputation changed its cell allocation")
+    if result.get("prepared_data") != runtime_manifest.get("prepared_data"):
+        raise ValueError("independent model recomputation changed its prepared data binding")
     result_memory_audit = result.get("memory_audit") or {}
     if (
         result_memory_audit.get("contract_version")
@@ -918,6 +983,8 @@ def execute_model_candidate(
         "no_new_privileges": True,
         "timeout_seconds": effective_timeout_seconds,
         "resource_policy": resource_policy,
+        "model_cell_allocation": cell_allocation,
+        "prepared_data": runtime_manifest["prepared_data"],
         "final_oos_opened": bool(allow_final_oos),
         "inference_only": bool(allow_inference),
         "live_retrain": bool(allow_live_retrain),

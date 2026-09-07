@@ -25,6 +25,21 @@ from quant_platform.model_recompute import (
 
 pytestmark = pytest.mark.no_database
 
+def test_resource_peak_covers_preparation_and_training_without_inventing_warm_usage():
+    stages = [{"cgroup_peak_bytes": 1024, "process_peak_rss_bytes": 512}]
+    binding = {"producer": {
+        "summary_validated": True,
+        "summary": {"memory": {"observed_memory_peak_bytes": 2048}},
+    }}
+    assert _model_memory_peak_bytes(stages, prepared_binding=binding) == 2048
+    assert _model_memory_peak_bytes(
+        [{"cgroup_peak_bytes": 4096}], prepared_binding=binding,
+    ) == 4096
+    binding["producer"]["summary_validated"] = False
+    assert _model_memory_peak_bytes(stages, prepared_binding=binding) == 1024
+    assert _model_memory_peak_bytes([], prepared_binding={"producer": None}) is None
+
+
 VALID_MODEL = """
 import torch
 from torch import nn
@@ -86,7 +101,7 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
         module.MODEL_MEMORY_AUDIT_CONTRACT_VERSION
         == MODEL_MEMORY_AUDIT_CONTRACT_VERSION
     )
-    assert MODEL_RECOMPUTE_EXECUTOR_VERSION == "model-recompute-docker-v9-memory-bounded-handler"
+    assert MODEL_RECOMPUTE_EXECUTOR_VERSION == "model-recompute-docker-v11-profile-thread-audit"
     assert (
         module.MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
         == MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
@@ -179,6 +194,10 @@ def test_model_memory_snapshot_reads_process_and_cgroup_v2_peaks(
         governed_limit_bytes=40 * 1024**3,
     )
 
+    performance = snapshot.pop("performance")
+    assert performance["contract_version"] == "model-performance-audit-v1-stage-counters"
+    assert performance["monotonic_seconds"] > 0
+    assert performance["process_cpu_seconds"] >= 0
     assert snapshot == {
         "contract_version": "model-memory-audit-v1-cgroup-peak",
         "stage": "handler_ready",

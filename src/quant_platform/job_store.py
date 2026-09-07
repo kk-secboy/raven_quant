@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import case, cast, func, literal, select, text, update
+from sqlalchemy import case, cast, false, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
@@ -224,8 +224,36 @@ class JobStore:
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
 
-    def recover_interrupted(self, allowed_kinds: tuple[str, ...] = ()) -> int:
-        return self._recover_interrupted(allowed_kinds)
+    def recover_interrupted(
+        self, allowed_kinds: tuple[str, ...] = (), *, protected_job_ids: tuple[str, ...] = (),
+        recoverable_model_claims: tuple[dict[str, Any], ...] | None = None,
+    ) -> int:
+        return self._recover_interrupted(
+            allowed_kinds, protected_job_ids=protected_job_ids,
+            recoverable_model_claims=recoverable_model_claims,
+        )
+
+    def active_model_claim_identity(
+        self, job_id: str, *, expected_attempts: int,
+    ) -> dict[str, Any]:
+        """Capture the exact PostgreSQL claim without presentation timestamp truncation."""
+        if type(expected_attempts) is not int or expected_attempts < 1:
+            raise ValueError("model cleanup requires a positive claimed attempt")
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(jobs.c.id, jobs.c.kind, jobs.c.status, jobs.c.attempts, jobs.c.started_at)
+                .where(jobs.c.id == job_id)
+            ).one_or_none()
+        if (
+            row is None or row.kind != "model_evaluate" or row.status != "running"
+            or row.attempts != expected_attempts or not isinstance(row.started_at, datetime)
+            or row.started_at.tzinfo is None
+        ):
+            raise ValueError("model cleanup claim no longer matches the running job attempt")
+        return {
+            "job_id": str(row.id), "attempts": int(row.attempts),
+            "started_at": row.started_at.isoformat(timespec="microseconds"),
+        }
 
     def interrupted_dependency_failures(
         self, allowed_kinds: tuple[str, ...] = ()
@@ -258,11 +286,24 @@ class JobStore:
         return [self._decode(row_dict(row)) for row in rows]
 
     def _recover_interrupted(
-        self, allowed_kinds: tuple[str, ...]
+        self, allowed_kinds: tuple[str, ...], *, protected_job_ids: tuple[str, ...] = (),
+        recoverable_model_claims: tuple[dict[str, Any], ...] | None = None,
     ) -> int:
         predicate = [jobs.c.status == "running"]
         if allowed_kinds:
             predicate.append(jobs.c.kind.in_(allowed_kinds))
+        if protected_job_ids:
+            predicate.append(jobs.c.id.not_in(protected_job_ids))
+        if recoverable_model_claims is not None:
+            predicate.append(
+                (jobs.c.kind != "model_evaluate")
+                | or_(false(), *(
+                    (jobs.c.id == str(claim["job_id"]))
+                    & (jobs.c.attempts == int(claim["attempts"]))
+                    & (jobs.c.started_at == datetime.fromisoformat(str(claim["started_at"])))
+                    for claim in recoverable_model_claims
+                ))
+            )
         now = _now()
         with self.engine.begin() as connection:
             # A formal backtest is one-shot after its first claim.  Requeueing

@@ -77,6 +77,7 @@ from .research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
     SWING_1_6M,
+    model_selection_cadence_bucket,
     primary_label_horizon_sessions,
     primary_label_policy_contract,
     primary_label_policy_sha256,
@@ -337,6 +338,47 @@ def _same_research_data_contract(
     return all(value not in {"", None} for value in source_contract) and (
         source_contract == target_contract
     )
+
+
+def _research_data_contract(dataset: dict[str, Any]) -> dict[str, Any]:
+    """Persist semantics separately from a daily publication's changing hash."""
+
+    provenance = dict(dataset.get("provenance") or {})
+    return {
+        "frequency": provenance.get("frequency") or dataset.get("frequency"),
+        "field_contract_version": provenance.get("field_contract_version"),
+        "eligibility_contract_version": provenance.get("eligibility_contract_version"),
+        "research_features_version": (provenance.get("research_features") or {}).get("version"),
+    }
+
+
+def _full_model_selection_origin(cycle: dict[str, Any]) -> dict[str, str] | None:
+    """A revalidation cannot reset the independent full-selection clock."""
+
+    state = dict(cycle.get("state") or {})
+    selection = dict(state.get("prediction_champion_evidence") or {})
+    model_selection = dict(state.get("model_champion_evidence") or {})
+    if selection.get("fixed_prior_champion_current_identity_revalidation") is True:
+        rollover = dict(state.get("prediction_champion_roll_forward") or {})
+        origin = rollover.get("full_model_selection_origin")
+        if not isinstance(origin, dict):
+            return None
+        return {str(key): str(value) for key, value in origin.items()}
+    if (
+        not (state.get("prediction_champion") or {}).get("candidate_id")
+        or not selection.get("evidence_sha256")
+        or model_selection.get("family_selection") == "fixed_prior_champion_components"
+    ):
+        return None
+    end = str(state.get("dataset_end_date") or "")
+    if not end:
+        return None
+    return {
+        "cycle_id": str(cycle["id"]),
+        "dataset_end_date": end,
+        "dataset_identity_sha256": str(cycle.get("dataset_identity_sha256") or ""),
+        "selection_evidence_sha256": str(selection["evidence_sha256"]),
+    }
 
 
 def _branch_created_at(branch: dict[str, Any]) -> datetime:
@@ -750,6 +792,7 @@ class AutopilotStore:
                         config_revision=config_revision,
                         state_json={
                             "dataset_end_date": dataset.get("end_date"),
+                            "research_data_contract": _research_data_contract(dataset),
                             "horizon_profile": horizon_profile,
                             "label_horizon_sessions": primary_label,
                             "primary_label_policy": primary_label_policy_contract(),
@@ -812,6 +855,7 @@ class AutopilotStore:
         event["sha256"] = canonical_sha256(event)
         state = {
             "dataset_end_date": binding["end_date"],
+            "research_data_contract": _research_data_contract(dataset),
             "horizon_profile": horizon,
             "label_horizon_sessions": primary_label_horizon_sessions(horizon),
             "primary_label_policy": primary_label_policy_contract(),
@@ -1768,18 +1812,23 @@ class AutopilotController:
                 "branches": created,
                 "failed": failed + int(cycle.get("status") == "blocked"),
             }
-        # The fin_factor/fin_model scenarios are frozen, so neither an RD-Agent
-        # factor branch nor an RD-Agent model challenger starts any more.  The
-        # platform model tournament cadence alone decides whether this
-        # immutable publication begins a new research event.
-        model_due = manual_event is not None or research_contract_migration or self._model_due(
-            dataset, current, config, horizon_profile=horizon_profile
-        )
         cycle = self.store.get_cycle(str(cycle["id"]))
         research_already_started = bool(cycle.get("branches")) or bool(
             (cycle.get("state") or {}).get("research_tournament_id")
+        ) or bool((cycle.get("state") or {}).get("model_selection_schedule"))
+        # Starting a hypothesis activity and reselecting every model family
+        # are independent decisions.  In particular a new research week may
+        # need the incumbent revalidated even when the monthly contest is not due.
+        research_due = (
+            manual_event is not None
+            or research_contract_migration
+            or research_already_started
+            or self._horizon_branch_due(
+                "fin_model", dataset, horizon_profile=horizon_profile,
+                available_datasets=available_by_name,
+            )
         )
-        if not model_due and not research_already_started:
+        if not research_due:
             self.store.set_cycle_state(
                 str(cycle["id"]),
                 state={
@@ -1814,6 +1863,12 @@ class AutopilotController:
             )
         except KeyError:
             existing_model_tournament = None
+        cycle = self._ensure_model_selection_schedule(
+            cycle, dataset, now=current, config=config,
+            force_full=manual_event is not None or research_contract_migration,
+            existing_model_tournament=existing_model_tournament,
+        )
+        model_due = cycle["state"]["model_selection_schedule"]["mode"] == "full_selection"
         if (
             revalidation_pending
             and not model_due
@@ -2427,8 +2482,89 @@ class AutopilotController:
         horizon_profile: str = SHORT_1_5D,
     ) -> bool:
         del now, config
-        return self._horizon_branch_due(
-            "fin_model", dataset, horizon_profile=horizon_profile
+        current_bucket = model_selection_cadence_bucket(
+            horizon_profile, str(dataset.get("end_date") or "")
+        )
+        lineage_id = str(dataset.get("lineage_id") or "")
+        for previous in self.store.list_cycles(limit=500):
+            if (
+                previous.get("horizon_profile") != horizon_profile
+                or _cycle_has_legacy_capital_state(previous)
+                or str(previous.get("dataset_lineage_id") or "") != lineage_id
+            ):
+                continue
+            origin = _full_model_selection_origin(previous)
+            if origin is None:
+                continue
+            source_end = origin.get("dataset_end_date", "")
+            if source_end > str(dataset.get("end_date") or ""):
+                continue
+            if model_selection_cadence_bucket(horizon_profile, source_end) == current_bucket:
+                return False
+        return True
+
+    def _ensure_model_selection_schedule(
+        self,
+        cycle: dict[str, Any],
+        dataset: dict[str, Any],
+        *,
+        now: datetime,
+        config: dict[str, Any],
+        force_full: bool,
+        existing_model_tournament: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Freeze one activity's selection choice before any work is enqueued."""
+
+        state = dict(cycle.get("state") or {})
+        horizon = str(cycle["horizon_profile"])
+        binding = {
+            "contract_version": "independent-model-selection-cadence-v1",
+            "cycle_id": str(cycle["id"]),
+            "dataset_identity_sha256": str(dataset["provenance"]["dataset_identity_sha256"]),
+            "horizon_profile": horizon,
+            "research_bucket": horizon_research_cadence_bucket(horizon, str(dataset["end_date"])),
+            "model_selection_bucket": model_selection_cadence_bucket(
+                horizon, str(dataset["end_date"])
+            ),
+        }
+        existing = state.get("model_selection_schedule")
+        if existing is not None:
+            if (
+                not isinstance(existing, dict)
+                or any(existing.get(key) != value for key, value in binding.items())
+                or existing.get("mode") not in {"full_selection", "champion_revalidation"}
+                or canonical_sha256({k: v for k, v in existing.items() if k != "sha256"})
+                != existing.get("sha256")
+                or force_full and existing["mode"] != "full_selection"
+            ):
+                raise ValueError("frozen model selection schedule changed")
+            return cycle
+        mode = "full_selection"
+        reason = "manual_or_contract_migration" if force_full else "full_selection_due"
+        if existing_model_tournament is not None:
+            reason = "continue_existing_full_selection"
+        elif not force_full and state.get("current_identity_revalidation"):
+            mode, reason = "champion_revalidation", "continue_existing_revalidation"
+        elif not force_full and not self._model_due(
+            dataset, now, config, horizon_profile=horizon
+        ):
+            rollover = dict(state.get("prediction_champion_roll_forward") or {})
+            if (
+                self._current_identity_revalidation_pending(cycle, dataset)
+                and rollover.get("research_data_contract_compatible") is True
+            ):
+                try:
+                    self._champion_revalidation_source(cycle)
+                except (KeyError, OSError, ValueError):
+                    reason = "incumbent_unavailable_or_incompatible"
+                else:
+                    mode, reason = "champion_revalidation", "compatible_frozen_incumbent"
+            else:
+                reason = "no_compatible_frozen_incumbent"
+        schedule = {**binding, "mode": mode, "reason": reason, "final_oos_opened": False}
+        schedule["sha256"] = canonical_sha256(schedule)
+        return self.store.patch_cycle_state(
+            str(cycle["id"]), state_patch={"model_selection_schedule": schedule}
         )
 
     def _horizon_branch_due(
@@ -2437,6 +2573,7 @@ class AutopilotController:
         dataset: dict[str, Any],
         *,
         horizon_profile: str,
+        available_datasets: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
         latest = self.store.latest_branch(
             scenario, horizon_profile=horizon_profile, scheduled_only=True
@@ -2450,6 +2587,19 @@ class AutopilotController:
             return True
         if source_cycle.get("horizon_profile") != horizon_profile:
             raise ValueError("automatic research branch belongs to another horizon")
+        source_contract = (source_cycle.get("state") or {}).get("research_data_contract")
+        if not isinstance(source_contract, dict) and available_datasets is not None:
+            source_dataset = available_datasets.get(str(source_cycle.get("dataset") or ""))
+            if source_dataset is not None:
+                source_contract = _research_data_contract(source_dataset)
+        if (
+            isinstance(source_contract, dict)
+            and all(value not in {None, ""} for value in source_contract.values())
+            and source_contract != _research_data_contract(dataset)
+        ):
+            # A completed old event must not hide a repaired PIT contract just
+            # because both publications happen to be in the same research week.
+            return True
         return horizon_research_cadence_bucket(
             horizon_profile, source_end
         ) != horizon_research_cadence_bucket(
@@ -2663,6 +2813,14 @@ class AutopilotController:
         if (
             champion.get("kind") not in {"model", "ensemble"}
             or not champion.get("candidate_id")
+            or selection.get("contract_version") != "prediction-champion-selection-v1"
+            or model_selection.get("contract_version") != "model-family-champions-v2"
+            or selection.get("dataset_identity_sha256")
+            != model_selection.get("dataset_identity_sha256")
+            or selection.get("selected_candidate_id") != champion.get("candidate_id")
+            or selection.get("selected_kind") != champion.get("kind")
+            or selection.get("final_oos_opened") is not False
+            or model_selection.get("final_oos_opened") is not False
             or canonical_sha256(
                 {key: value for key, value in selection.items() if key != "evidence_sha256"}
             )
@@ -2725,6 +2883,7 @@ class AutopilotController:
             base_features = dict(candidate.get("base_features_manifest_json") or {})
             feature_set_id = str(base_features.get("feature_set_id") or "")
             feature_set = get_feature_set(feature_set_id)
+            label_binding = dict(manifest.get("research_label_binding") or {})
             if (
                 str(candidate.get("status") or "") != "research_admitted"
                 or str(candidate.get("manifest_sha256") or "")
@@ -2732,6 +2891,14 @@ class AutopilotController:
                 or str(candidate.get("admission_evidence_sha256") or "")
                 != str(raw.get("model_admission_evidence_sha256") or "")
                 or not str(manifest.get("recipe_sha256") or "")
+                or str(manifest.get("dataset_identity_sha256") or "")
+                != str(selection.get("dataset_identity_sha256") or "")
+                or str(manifest.get("dataset_lineage_id") or "")
+                != str(cycle.get("dataset_lineage_id") or "")
+                or str(candidate.get("feature_set_definition_sha256") or "")
+                != str(feature_set["definition_sha256"])
+                or label_binding.get("horizon_profile") != cycle.get("horizon_profile")
+                or manifest.get("primary_label_policy_sha256") != primary_label_policy_sha256()
             ):
                 raise ValueError("prior champion component is no longer immutable")
             family = str(raw.get("model_family") or champion.get("model_family") or "")
@@ -3156,6 +3323,9 @@ class AutopilotController:
                 "revalidated_tournament_id": str(tournament["id"]),
                 "revalidated_selection_evidence_sha256": selection["evidence_sha256"],
             }
+        )
+        old["evidence_sha256"] = canonical_sha256(
+            {key: value for key, value in old.items() if key != "evidence_sha256"}
         )
         self.store.patch_cycle_state(
             str(cycle["id"]),
@@ -4685,7 +4855,7 @@ class AutopilotController:
     ) -> dict[str, Any]:
         """Retain predecessor lineage without promoting it on a new vintage.
 
-        Model research is monthly while market data is published daily.  The
+        Full model selection has a slower cadence than hypothesis research. The
         previous recipe is useful as an incumbent reference, but its old
         selection/evaluation is never copied into the current champion fields.
         Until exact current-identity revalidation exists, fin_quant remains
@@ -4711,6 +4881,14 @@ class AutopilotController:
             rollover = {
                 "contract_version": "prediction-champion-roll-forward-v2",
                 "source_cycle_id": None,
+                "research_data_contract_compatible": (
+                    state.get("research_data_contract") == _research_data_contract(dataset)
+                    and all(
+                        value not in {None, ""}
+                        for value in _research_data_contract(dataset).values()
+                    )
+                ),
+                "full_model_selection_origin": _full_model_selection_origin(cycle),
                 "source_dataset_identity_sha256": source_identity,
                 "target_dataset_identity_sha256": current_identity,
                 "dataset_lineage_id": str(cycle.get("dataset_lineage_id") or ""),
@@ -4772,6 +4950,10 @@ class AutopilotController:
             or ""
         )
         current_end = str(dataset.get("end_date") or "")
+        available_datasets = {
+            str(item.get("name") or ""): item
+            for item in list_qlib_datasets(self.settings.data_root)
+        }
         for predecessor in self.store.list_cycles(limit=500):
             if str(predecessor.get("id")) == str(cycle.get("id")):
                 continue
@@ -4780,6 +4962,17 @@ class AutopilotController:
             if str(predecessor.get("dataset_lineage_id") or "") != lineage_id:
                 continue
             predecessor_state = dict(predecessor.get("state") or {})
+            source_contract = predecessor_state.get("research_data_contract")
+            if not isinstance(source_contract, dict):
+                source_contract = _research_data_contract(
+                    available_datasets.get(str(predecessor.get("dataset") or ""), {})
+                )
+            target_contract = _research_data_contract(dataset)
+            if (
+                source_contract != target_contract
+                or not all(value not in {None, ""} for value in target_contract.values())
+            ):
+                continue
             champion = predecessor_state.get("prediction_champion")
             selection = predecessor_state.get("prediction_champion_evidence")
             model_selection = predecessor_state.get("model_champion_evidence")
@@ -4813,6 +5006,10 @@ class AutopilotController:
             if predecessor_end and current_end and predecessor_end > current_end:
                 continue
             source_identity = str(predecessor.get("dataset_identity_sha256") or "")
+            if _prediction_champion_identity_error(
+                predecessor, {"provenance": {"dataset_identity_sha256": source_identity}}
+            ) is not None:
+                continue
             with self.engine.connect() as connection:
                 if champion.get("kind") == "model":
                     valid = connection.scalar(
@@ -4843,6 +5040,8 @@ class AutopilotController:
             rollover = {
                 "contract_version": "prediction-champion-roll-forward-v2",
                 "source_cycle_id": str(predecessor["id"]),
+                "research_data_contract_compatible": True,
+                "full_model_selection_origin": _full_model_selection_origin(predecessor),
                 "source_dataset_identity_sha256": source_identity,
                 "target_dataset_identity_sha256": current_identity,
                 "dataset_lineage_id": lineage_id,

@@ -77,6 +77,17 @@ from .major_news_mentions import default_factors_dir as major_news_mentions_fact
 from .market_overview import MarketOverviewService
 from .market_permission import MarketPermissionStore
 from .model_artifact_store import ModelArtifactStore
+from .model_cell_execution import process_identity
+from .model_cell_recovery import (
+    MODEL_OWNER_LEASE_ENV,
+    ModelCellCleanupPending,
+    cleanup_model_batch,
+    model_batch_marker,
+    model_owner_lease,
+    model_owner_lease_path,
+    recover_model_batches,
+    register_model_batch,
+)
 from .model_research_governance import canonical_sha256 as model_canonical_sha256
 from .model_research_governance import model_metric_report
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
@@ -549,6 +560,13 @@ class LocalJobWorker:
         if self._thread and self._thread.is_alive():
             return
         if self._initialize_queue:
+            # Docker siblings can outlive SIGKILL/container restarts. Fence them
+            # before queue recovery releases any durable global resource charge.
+            allowed_kinds = self.settings.worker_job_kinds
+            model_recovery = (
+                recover_model_batches(self.settings.data_root)
+                if not allowed_kinds or "model_evaluate" in allowed_kinds else None
+            )
             self.factor_library.sync_builtin_library()
             for sota in self.factor_library.list_sota(limit=200):
                 register_feature_set(
@@ -557,7 +575,12 @@ class LocalJobWorker:
             # Only the first consumer in a process may recover jobs. A second
             # pool member doing this after its sibling claimed work would
             # incorrectly classify a healthy running job as interrupted.
-            self.store.recover_interrupted(self.settings.worker_job_kinds)
+            if model_recovery is not None:
+                self.store.recover_interrupted(
+                    self.settings.worker_job_kinds, **model_recovery
+                )
+            else:
+                self.store.recover_interrupted(self.settings.worker_job_kinds)
             for job in self.store.interrupted_dependency_failures(
                 self.settings.worker_job_kinds
             ):
@@ -633,6 +656,10 @@ class LocalJobWorker:
                 else:
                     with gate:
                         self._run(job)
+            except ModelCellCleanupPending:
+                # Keep the running job and its resource charge intact. Startup
+                # must clear its durable cleanup marker before recovery/claim.
+                return
             except SQLAlchemyError as exc:
                 # `_run` retries every database touch made while its child is
                 # alive.  This final guard covers failures before spawn or
@@ -989,6 +1016,7 @@ class LocalJobWorker:
         process,
         *,
         timeout_seconds: int | None = None,
+        termination_grace_seconds: int = 10,
     ) -> tuple[bool, int | None]:
         """Monitor one child without abandoning it during a database outage."""
 
@@ -1008,7 +1036,7 @@ class LocalJobWorker:
                 cancelled = True
                 process.terminate()
                 try:
-                    process.wait(timeout=10)
+                    process.wait(timeout=termination_grace_seconds)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
@@ -1019,7 +1047,7 @@ class LocalJobWorker:
             ):
                 process.terminate()
                 try:
-                    process.wait(timeout=10)
+                    process.wait(timeout=termination_grace_seconds)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
@@ -1028,6 +1056,17 @@ class LocalJobWorker:
                 )
             time.sleep(1)
         return cancelled, progress_mtime_ns
+
+    def _fence_model_cleanup(self, marker: Path | None) -> None:
+        if marker is None:
+            return
+        while True:
+            try:
+                cleanup_model_batch(marker)
+                return
+            except ModelCellCleanupPending:
+                if self._stop.wait(timeout=2):
+                    raise
 
     def _settle_simulation_order_plan(
         self,
@@ -1191,8 +1230,26 @@ class LocalJobWorker:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         factor_research_settled = False
         factor_evaluation_contract_error: str | None = None
+        cleanup_marker = None
+        owner_lease = None
         try:
             try:
+                cleanup_marker = (
+                    model_batch_marker(result_path) if job["kind"] == "model_evaluate" else None
+                )
+                if cleanup_marker is not None:
+                    owner_lease = model_owner_lease(result_path)
+                    owner_lease.__enter__()
+                    extra_env[MODEL_OWNER_LEASE_ENV] = str(model_owner_lease_path(result_path))
+                    claim_identity = self._retry_transient_database(
+                        lambda: self.store.active_model_claim_identity(
+                            str(job["id"]), expected_attempts=int(job["attempts"]),
+                        )
+                    )
+                    register_model_batch(result_path, job_claim=claim_identity)
+                    owner = process_identity(os.getpid())
+                    if owner is not None:
+                        extra_env["QUANTLAB_MODEL_BATCH_OWNER"] = json.dumps(owner)
                 with log_path.open("a", encoding="utf-8") as log:
                     process = subprocess.Popen(
                         command,
@@ -1203,6 +1260,8 @@ class LocalJobWorker:
                         creationflags=creationflags,
                         env={**os.environ, **extra_env},
                     )
+                    if cleanup_marker is not None:
+                        register_model_batch(result_path, pid=process.pid)
                     cancelled, progress_mtime_ns = self._monitor_process(
                         job["id"],
                         result_path,
@@ -1210,9 +1269,15 @@ class LocalJobWorker:
                         timeout_seconds=(
                             900 if job["kind"] == "strategy_health_collect" else None
                         ),
+                        termination_grace_seconds=(
+                            180 if job["kind"] == "model_evaluate" else 10
+                        ),
                     )
                     exit_code = int(process.returncode or 0)
             finally:
+                self._fence_model_cleanup(cleanup_marker)
+                if owner_lease is not None:
+                    owner_lease.__exit__(None, None, None)
                 if affinity_reservation is not None:
                     self._cpu_affinity_pool.release(affinity_reservation)
                 affinity_reservation = None
@@ -1997,6 +2062,8 @@ class LocalJobWorker:
                     )
                     if cluster_job["status"] == "queued":
                         self.notify()
+        except ModelCellCleanupPending:
+            raise
         except Exception as exc:
             error_message = str(exc)
             if (

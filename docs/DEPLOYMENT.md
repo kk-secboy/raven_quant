@@ -69,6 +69,9 @@ baseline 的 LightGBM `num_threads=8` 保持不变。跨 worker 的研究预算�
 `attempts/max_attempts`；若需禁止继续执行，用现有取消入口令该任务终结，并确认
 没有残留进程，再启动受控的新版本。不要通过重试旧任务覆盖需保留的中断制品。
 
+模型执行器的数据准备复用、空间预算、隔离验证与升级边界见
+[模型数据准备复用](model-prepared-data.md)。
+
 ## 3. 数据库迁移
 
 本地环境：

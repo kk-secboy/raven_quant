@@ -54,10 +54,14 @@ def _frozen_model_label_contract(model_signal: dict[str, Any] | None) -> tuple[d
 
 def _qlib_workflow_environment(settings: Settings, *, is_wsl: bool) -> dict[str, str]:
     artifact_root = settings.data_root / "artifacts" / "mlflow"
+    prepared_root = settings.data_root / "artifacts" / "model-prepared-data"
     return {
         "_MLFLOW_SERVER_ARTIFACT_ROOT": (
             _to_wsl_path(artifact_root) if is_wsl else str(artifact_root)
-        )
+        ),
+        "MODEL_PREPARED_DATA_ROOT": (
+            _to_wsl_path(prepared_root) if is_wsl else str(prepared_root)
+        ),
     }
 
 def _model_evaluation_attempt_result_path(
