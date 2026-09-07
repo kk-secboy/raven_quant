@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from quant_platform.backup_restore import WRITER_SERVICES
 from quant_platform.deployment_services import (
@@ -16,6 +17,32 @@ from quant_platform.release_preflight import EXPECTED_SERVICES
 from quant_platform.release_upgrade import BUILT_SERVICES
 
 pytestmark = pytest.mark.no_database
+
+
+def test_scheduler_startup_grace_covers_the_tick_budget_with_real_health_probe() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = yaml.safe_load((root / "deploy" / "compose.yaml").read_text("utf-8"))
+    scheduler = compose["services"]["scheduler"]
+    healthcheck = scheduler["healthcheck"]
+    tick_setting = scheduler["environment"]["SCHEDULER_MAX_TICK_SECONDS"]
+    tick_default = re.fullmatch(r"\$\{SCHEDULER_MAX_TICK_SECONDS:-(\d+)\}", tick_setting)
+    assert tick_default is not None
+    grace = re.fullmatch(r"(\d+)m", healthcheck["start_period"])
+    assert grace is not None
+    grace_seconds = int(grace.group(1)) * 60
+
+    assert int(tick_default.group(1)) <= grace_seconds <= 300
+    assert healthcheck.get("disable", False) is False
+    assert healthcheck["interval"] == "10s"
+    assert healthcheck["timeout"] == "5s"
+    assert healthcheck["retries"] == 12
+    assert healthcheck["test"] == [
+        "CMD",
+        "python",
+        "-c",
+        "import urllib.request; "
+        "urllib.request.urlopen('http://127.0.0.1:8780/health', timeout=3)",
+    ]
 
 
 def _compose_services() -> set[str]:

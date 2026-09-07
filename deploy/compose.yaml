@@ -144,7 +144,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 15s
+      start_period: 5m
 
   worker:
     image: quantlab-worker-runtime:v2
