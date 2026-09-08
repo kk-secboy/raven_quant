@@ -1212,3 +1212,15 @@ def test_v43_observes_model_progress_without_erasing_failures_or_duplicate_trial
         "新合同只在正常的新活动边界启用",
     ):
         assert contract in specification
+
+
+def test_maintenance_data_resume_preserves_checkpoint_and_consumed_budget() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`resume_cancelled_data_for_maintenance`", "断点数据命令白名单",
+        "不适用于模型、研究实验或策略任务", "审计失败则整体回滚",
+        "进度和全部 work units", "不清零 attempts、不增加 max_attempts",
+        "下一次正常领取仍消耗一次尝试，预算耗尽拒绝恢复",
+        "此入口不改变通用 retry 和研究失败证据",
+    ):
+        assert contract in specification

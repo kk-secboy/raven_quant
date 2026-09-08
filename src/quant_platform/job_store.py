@@ -8,12 +8,12 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import case, cast, false, func, literal, or_, select, text, update
+from sqlalchemy import case, cast, false, func, insert, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
-from quant_data.database import backtest_runs, jobs, open_database, row_dict
+from quant_data.database import audit_events, backtest_runs, jobs, open_database, row_dict
 from quant_platform.jsonb_safety import normalize_jsonb_document
 
 EVALUATION_STATUS_COUNTS_KEY = "_quantlab_evaluation_status_counts"
@@ -188,6 +188,19 @@ AUTO_RETRY_ATTEMPTS = {
     "simulation_replay": 3,
     "strategy_health_collect": 2,
 }
+
+# These commands use supplemental-download and its durable FetchSpec work units.
+# Research corpus and specialty jobs have other command paths and are excluded.
+MAINTENANCE_CHECKPOINT_DATA_BUNDLES = {
+    f"supplemental_{bundle}": bundle
+    for bundle in (
+        "cn_extended_daily", "cn_funds", "cn_macro", "cn_institutional", "cn_futures",
+        "cn_options_bonds", "hk_market", "us_market", "global_markets", "cn_capital_flow",
+        "cn_derivatives_enhanced", "cn_fund_index_enhanced", "cn_governance_risk",
+        "global_rates_enhanced",
+    )
+}
+MAINTENANCE_DATA_RESUME_ACTION = "jobs.maintenance.resume_cancelled_data"
 
 
 def _now() -> datetime:
@@ -773,6 +786,94 @@ class JobStore:
                 )
             )
         return False
+
+    def resume_cancelled_data_for_maintenance(
+        self,
+        job_id: str,
+        *,
+        expected_payload_sha256: str,
+        expected_attempts: int,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Resume a normally cancelled checkpoint download without replenishing retries.
+
+        The operator must first verify that its old subprocess has exited and
+        recover any expired work-unit leases through CheckpointStore. This only
+        queues the original job; it never changes download checkpoints or units.
+        """
+        if (
+            not isinstance(expected_payload_sha256, str)
+            or len(expected_payload_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in expected_payload_sha256)
+        ):
+            raise ValueError("expected payload SHA-256 must be 64 lowercase hexadecimal characters")
+        if type(expected_attempts) is not int or expected_attempts < 0:
+            raise ValueError("expected attempts must be a nonnegative integer")
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("maintenance actor is required")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("maintenance reason is required")
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(jobs).where(jobs.c.id == job_id).with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(job_id)
+            bundle = MAINTENANCE_CHECKPOINT_DATA_BUNDLES.get(str(row.kind))
+            if bundle is None or row.payload_json.get("bundle") != bundle:
+                raise ValueError("job is not an approved checkpoint data download")
+            digest = hashlib.sha256(
+                json.dumps(row.payload_json, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if digest != expected_payload_sha256:
+                raise ValueError("maintenance download payload has changed")
+            if row.attempts != expected_attempts or not 0 <= row.attempts < row.max_attempts:
+                raise ValueError("maintenance download attempt budget has changed or is exhausted")
+            audit_path = f"/internal/jobs/{job_id}/maintenance-resume"
+            if row.status == "queued":
+                owned = connection.execute(
+                    select(audit_events.c.id).where(
+                        audit_events.c.action == MAINTENANCE_DATA_RESUME_ACTION,
+                        audit_events.c.path == audit_path,
+                        audit_events.c.username == actor,
+                        audit_events.c.details_json["payload_sha256"].as_string() == digest,
+                        audit_events.c.details_json["attempts"].as_integer() == expected_attempts,
+                        audit_events.c.details_json["max_attempts"].as_integer()
+                        == row.max_attempts,
+                    ).limit(1)
+                ).first()
+                if owned is None:
+                    raise ValueError("queued download has no matching maintenance resume audit")
+                return self._decode(row_dict(row))
+            if row.status != "cancelled":
+                raise ValueError("only cancelled checkpoint downloads may resume for maintenance")
+            if row.cancel_requested_at is None or row.finished_at is None:
+                raise ValueError("checkpoint download has not completed normal cancellation")
+            connection.execute(
+                update(jobs).where(jobs.c.id == job_id).values(
+                    status="queued", exit_code=None, error=None, started_at=None,
+                    finished_at=None, cancel_requested_at=None, next_attempt_at=None,
+                )
+            )
+            connection.execute(
+                insert(audit_events).values(
+                    user_id=None, username=actor, action=MAINTENANCE_DATA_RESUME_ACTION,
+                    method="INTERNAL", path=audit_path, status_code=202, ip_hash=None,
+                    user_agent="quantlab-maintenance", created_at=_now(),
+                    details_json={
+                        "job_id": job_id, "kind": row.kind, "payload_sha256": digest,
+                        "attempts": row.attempts, "max_attempts": row.max_attempts,
+                        "previous_status": row.status, "reason": reason,
+                        "cancel_requested_at": row.cancel_requested_at.isoformat(),
+                        "finished_at": row.finished_at.isoformat(),
+                        "progress_and_work_units_retained": True,
+                    },
+                )
+            )
+            return self._decode(row_dict(connection.execute(
+                select(jobs).where(jobs.c.id == job_id)
+            ).one()))
 
     def retry(self, job_id: str) -> dict[str, Any]:
         with self.engine.begin() as connection:
