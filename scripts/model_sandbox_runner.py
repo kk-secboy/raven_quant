@@ -101,6 +101,46 @@ def canonical_sha256(value: Any) -> str:
     ).hexdigest()
 
 
+def prepare_evaluation_labels(dataset: Any, prediction_index: pd.Index) -> pd.DataFrame:
+    """Read unsampled test labels from the same frozen handler as the model.
+
+    The governed handler retains original labels in DK_I and applies CSZScoreNorm
+    only to DK_L; DK_R is deliberately unavailable because drop_raw=True. A plain
+    DatasetH shares that handler without TSDatasetH's history expansion or sampler.
+    """
+    from qlib.data.dataset import DatasetH
+    from qlib.data.dataset.handler import DataHandlerLP
+
+    if (
+        not isinstance(prediction_index, pd.MultiIndex)
+        or prediction_index.names != ["datetime", "instrument"]
+        or not prediction_index.is_unique
+    ):
+        raise ValueError("model predictions require a unique datetime/instrument index")
+    label_dataset = DatasetH(
+        handler=dataset.handler,
+        segments=dataset.segments,
+        fetch_kwargs=dataset.fetch_kwargs,
+    )
+    labels = label_dataset.prepare("test", col_set="label", data_key=DataHandlerLP.DK_I)
+    if (
+        not isinstance(labels, pd.DataFrame)
+        or labels.shape[1] != 1
+        or not isinstance(labels.index, pd.MultiIndex)
+        or labels.index.names != ["datetime", "instrument"]
+        or not labels.index.is_unique
+    ):
+        raise ValueError("model evaluation requires one label per unique datetime/instrument")
+    if labels.index.equals(prediction_index):
+        return labels
+    positions = labels.index.get_indexer(prediction_index)
+    if (positions < 0).any():
+        raise ValueError("model prediction index escaped the frozen test label index")
+    # Only the scalar label column is reordered; never materialize sequence data.
+    # Missing future labels remain NaN, preserving the original maturity boundary.
+    return labels.take(positions)
+
+
 def _read_memory_counter(path: Path) -> int | None:
     try:
         value = path.read_text(encoding="utf-8").strip()
@@ -960,7 +1000,7 @@ def main() -> None:
     if inference_only or live_retrain:
         metrics: dict[str, float] = {}
     else:
-        labels = dataset.prepare("test", col_set="label")
+        labels = prepare_evaluation_labels(dataset, predictions.index)
         label = labels.iloc[:, 0].rename("label")
         aligned = pd.concat([predictions, label], axis=1).dropna()
         if aligned.empty:
