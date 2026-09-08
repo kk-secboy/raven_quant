@@ -426,6 +426,43 @@ def test_failed_backup_restarts_writers_even_in_upgrade_mode(tmp_path: Path) -> 
     assert ("start", "scheduler", "api") in context.calls
 
 
+def test_pre_dump_guard_runs_after_stop_and_rejects_racing_work_before_dump(
+    tmp_path: Path,
+) -> None:
+    context = FakeBackupContext(tmp_path)
+
+    def reject_active_work() -> None:
+        assert ("stop", "scheduler", "api") in context.calls
+        assert not any("pg_dump" in call for call in context.calls)
+        raise RuntimeError("durable work became active before release backup")
+
+    with pytest.raises(RuntimeError, match="became active before release backup"):
+        create_backup(
+            context,  # type: ignore[arg-type]
+            tmp_path / "backups",
+            restart_services=False,
+            format_version=2,
+            pre_dump_guard=reject_active_work,
+        )
+
+    assert not any("pg_dump" in call for call in context.calls)
+    assert ("start", "scheduler", "api") in context.calls
+    assert not list((tmp_path / "backups").iterdir())
+
+
+def test_online_backup_rejects_quiescence_guard_before_touching_services(tmp_path: Path) -> None:
+    context = FakeBackupContext(tmp_path)
+    with pytest.raises(ValueError, match="requires a coordinated backup"):
+        create_backup(
+            context,  # type: ignore[arg-type]
+            tmp_path / "backups",
+            format_version=2,
+            online=True,
+            pre_dump_guard=lambda: None,
+        )
+    assert context.calls == []
+
+
 def test_control_plane_backup_is_sanitized_bounded_and_does_not_copy_data(
     tmp_path: Path,
 ) -> None:

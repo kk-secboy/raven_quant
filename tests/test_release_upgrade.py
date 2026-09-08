@@ -18,12 +18,19 @@ class FakeContext:
 
     def __init__(self, env_file: Path | None = None) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self.running = set(release_upgrade.LEGACY_EXPECTED_SERVICES)
         self.env_file = env_file or Path("unused-deploy.env")
         if env_file is not None:
             env_file.write_text("POSTGRES_PASSWORD=test\n", encoding="utf-8")
 
     def run(self, *args: str, **_kwargs) -> str:
         self.calls.append(args)
+        if args and args[0] == "stop":
+            self.running.difference_update(args[1:])
+        if args and args[0] == "start":
+            self.running.update(args[1:])
+        if args and "count(*) FROM quantlab.jobs" in args[-1]:
+            return "0|0|0058_simulation_benchmark\n"
         if args == ("config", "--format", "json"):
             return json.dumps(
                 {
@@ -34,6 +41,9 @@ class FakeContext:
                 }
             )
         return ""
+
+    def running_services(self) -> list[str]:
+        return sorted(self.running)
 
     def docker(self, *args: str, **_kwargs) -> str:
         self.calls.append(("docker", *args))
@@ -632,6 +642,126 @@ def test_release_upgrade_stops_before_build_when_preflight_blocks(
 
     assert result["status"] == "blocked"
     assert context.calls == []
+
+
+def test_release_quiesces_producers_in_order_and_drains_accepted_work(monkeypatch) -> None:
+    context = FakeContext()
+    observations = iter([(1, 0, "old"), (1, 1, "old"), (0, 0, "old")])
+    reads = []
+
+    def durable_state(_context):
+        reads.append(set(context.running_services()))
+        return next(observations)
+
+    monkeypatch.setattr(release_upgrade, "_reuse_database_state", durable_state)
+    monkeypatch.setattr(release_upgrade.time, "sleep", lambda _seconds: None)
+    stopped = []
+    result = release_upgrade._quiesce_release_admission(
+        context, stopped_services=stopped, wait_timeout=30,  # type: ignore[arg-type]
+    )
+
+    assert context.calls == [
+        ("stop", "--timeout", "30", "gateway"),
+        ("stop", "--timeout", "30", "scheduler"),
+        ("stop", "--timeout", "30", "api"),
+    ]
+    assert stopped == ["gateway", "scheduler", "api"]
+    assert all("worker" in active and "evaluation-worker" in active for active in reads)
+    assert all(not active.intersection(stopped) for active in reads[1:])
+    assert result["active_jobs"] == result["running_units"] == 0
+    assert result["accepted_work_cancelled"] is False
+
+
+def test_release_drain_timeout_does_not_stop_consumers_or_cancel_work(monkeypatch) -> None:
+    context = FakeContext()
+    clock = iter([0.0, 31.0])
+    monkeypatch.setattr(release_upgrade.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(release_upgrade, "_reuse_database_state", lambda _c: (1, 2, "old"))
+    stopped = []
+    with pytest.raises(RuntimeError, match="accepted work did not drain"):
+        release_upgrade._quiesce_release_admission(
+            context, stopped_services=stopped, wait_timeout=30,  # type: ignore[arg-type]
+        )
+    assert "worker" in context.running_services()
+    assert "evaluation-worker" in context.running_services()
+    assert all(call[0] == "stop" and call[-1] in stopped for call in context.calls)
+
+
+@pytest.mark.parametrize("changed", [(0, 0, "new"), (1, 0, "old"), (0, 1, "old")])
+def test_release_pre_dump_guard_rejects_new_work_or_schema(monkeypatch, changed) -> None:
+    context = FakeContext()
+    context.running = {"postgres", "web"}
+    monkeypatch.setattr(release_upgrade, "_reuse_database_state", lambda _c: changed)
+    with pytest.raises(RuntimeError, match="before release backup"):
+        release_upgrade._assert_release_backup_idle(context, "old")  # type: ignore[arg-type]
+
+
+def test_release_pre_dump_guard_rejects_restarted_writer_before_database_read(monkeypatch) -> None:
+    context = FakeContext()
+    context.running = {"postgres", "scheduler"}
+    monkeypatch.setattr(
+        release_upgrade, "_reuse_database_state",
+        lambda _c: pytest.fail("a live writer prevents the database check"),
+    )
+    with pytest.raises(RuntimeError, match="writer services remained active"):
+        release_upgrade._assert_release_backup_idle(context, "old")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("failure_stage", ["partial_stop", "drain", "backup"])
+def test_release_pre_backup_failure_restores_admission_without_database_rollback(
+    monkeypatch, tmp_path: Path, failure_stage: str,
+) -> None:
+    context = FakeContext(tmp_path / "deploy.env")
+    contract, _old_context = _rollback_contract_fixture(tmp_path)
+    monkeypatch.setattr(release_upgrade, "assess_release", lambda *_a, **_k: _gate())
+    monkeypatch.setattr(release_upgrade, "_capture_rollback_compose_contract",
+                        lambda *_a, **_k: contract)
+    monkeypatch.setattr(release_upgrade, "_capture_service_storage", lambda *_a, **_k: None)
+    monkeypatch.setattr(release_upgrade, "_capture_rollback_images",
+                        lambda *_a, **_k: {"api": "quantlab-rollback:test-api"})
+    monkeypatch.setattr(release_upgrade, "_assess_backup_capacity",
+                        lambda *_a, **_k: {"status": "pass"})
+    monkeypatch.setattr(release_upgrade, "_restore_previous_release",
+                        lambda *_a, **_k: pytest.fail("no pre-backup database rollback"))
+
+    if failure_stage == "partial_stop":
+        original = context.run
+
+        def run(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args == ("stop", "--timeout", "30", "scheduler"):
+                raise RuntimeError("scheduler stop command failed after stopping")
+            return result
+
+        context.run = run
+    if failure_stage == "drain":
+        clock = iter([0.0, 31.0])
+        monkeypatch.setattr(release_upgrade.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(release_upgrade, "_reuse_database_state",
+                            lambda _c: (1, 0, "old"))
+
+    def backup(*_args, **kwargs):
+        assert failure_stage == "backup"
+        assert callable(kwargs["pre_dump_guard"])
+        assert not set(context.running_services()).intersection(("gateway", "scheduler", "api"))
+        raise RuntimeError("backup copy failed")
+
+    monkeypatch.setattr(release_upgrade, "create_backup", backup)
+    result = release_upgrade.run_release_upgrade(
+        context, tmp_path, tmp_path / "backups",  # type: ignore[arg-type]
+        confirmed=True, wait_timeout=30,
+    )
+    assert result["status"] == "failed"
+    assert result["backup_directory"] is None
+    assert "rollback" not in result
+    assert "admission_restore_error" not in result
+    expected = (["scheduler", "gateway"] if failure_stage == "partial_stop"
+                else ["api", "scheduler", "gateway"])
+    assert result["restored_admission_services"] == expected
+    assert [call for call in context.calls if call[0] == "start"] == [
+        ("start", service) for service in expected
+    ]
+    assert set(context.running_services()) == release_upgrade.LEGACY_EXPECTED_SERVICES
 
 
 def test_release_upgrade_builds_backs_up_and_accepts_current_schema(

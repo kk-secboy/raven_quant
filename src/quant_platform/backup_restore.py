@@ -11,7 +11,7 @@ import sys
 import tarfile
 import threading
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -1350,6 +1350,7 @@ def create_backup(
     format_version: int = FULL_BACKUP_FORMAT_VERSION,
     minimum_free_gb: float = 0.0,
     online: bool = False,
+    pre_dump_guard: Callable[[], None] | None = None,
 ) -> Path:
     if retention_count < 1:
         raise ValueError("retention_count must be positive")
@@ -1362,6 +1363,8 @@ def create_backup(
         raise ValueError("minimum_free_gb must not be negative")
     if online and format_version != CONTROL_PLANE_BACKUP_FORMAT_VERSION:
         raise ValueError("online backup is only supported for control-plane v2")
+    if online and pre_dump_guard is not None:
+        raise ValueError("a pre-dump quiescence guard requires a coordinated backup")
     key_fingerprint = _platform_secret_key_fingerprint(context)
     root = backup_root.resolve()
     name = f"quantlab-{_utc_stamp()}"
@@ -1399,6 +1402,8 @@ def create_backup(
     try:
         if stopped:
             context.run("stop", *stopped)
+        if pre_dump_guard is not None:
+            pre_dump_guard()
         data_uncompressed_bytes = (
             _volume_usage_bytes(context, data_volume)
             if format_version == FULL_BACKUP_FORMAT_VERSION

@@ -63,6 +63,7 @@ _GOVERNED_SANDBOX_CONTEXTS = {
     "qlib": "qlib-sandbox",
     "model": "model-sandbox",
 }
+_ADMISSION_SERVICES = ("gateway", "scheduler", "api")
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +401,74 @@ def _reuse_database_state(context: ComposeContext) -> tuple[int, int, str]:
         return int(active_jobs), int(running_units), revision.strip()
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError("reusable-backup database state is unreadable") from exc
+
+
+def _quiesce_release_admission(
+    context: ComposeContext,
+    *,
+    stopped_services: list[str],
+    wait_timeout: int,
+) -> dict[str, Any]:
+    """Close producers before draining work accepted after the idle preflight.
+
+    Compose may reorder a multi-service stop by dependencies. Stop each admission
+    service separately, keeping consumers alive until accepted work completes.
+    Record ownership before each command so a partially failed stop can be undone.
+    """
+    running = set(context.running_services())
+    _active, _units, schema = _reuse_database_state(context)
+    for service in _ADMISSION_SERVICES:
+        if service not in running:
+            continue
+        stopped_services.append(service)
+        context.run("stop", "--timeout", str(wait_timeout), service)
+        if service in context.running_services():
+            raise RuntimeError(f"release admission service remained running: {service}")
+
+    started = time.monotonic()
+    while True:
+        if set(context.running_services()).intersection(_ADMISSION_SERVICES):
+            raise RuntimeError("release admission resumed while accepted work was draining")
+        active_jobs, running_units, revision = _reuse_database_state(context)
+        if revision != schema:
+            raise RuntimeError("database schema changed while release admission was quiesced")
+        if active_jobs == 0 and running_units == 0:
+            return {
+                "status": "pass",
+                "stopped_services": list(stopped_services),
+                "schema_revision": schema,
+                "active_jobs": 0,
+                "running_units": 0,
+                "drain_seconds": time.monotonic() - started,
+                "accepted_work_cancelled": False,
+            }
+        if time.monotonic() - started >= wait_timeout:
+            raise RuntimeError(
+                "accepted work did not drain before release timeout: "
+                f"{active_jobs} active jobs, {running_units} running work units"
+            )
+        time.sleep(2)
+
+
+def _assert_release_backup_idle(context: ComposeContext, expected_schema: str) -> None:
+    """Reject a stop/admission race before any PostgreSQL dump is produced."""
+    remaining = set(context.running_services()).intersection(WRITER_SERVICES)
+    if remaining:
+        raise RuntimeError("writer services remained active before release backup: "
+                           + ", ".join(sorted(remaining)))
+    active_jobs, running_units, schema = _reuse_database_state(context)
+    if active_jobs or running_units:
+        raise RuntimeError("durable work became active before release backup")
+    if schema != expected_schema:
+        raise RuntimeError("database schema changed before release backup")
+
+
+def _restore_release_admission(context: ComposeContext, stopped_services: list[str]) -> None:
+    # Reverse the stop order: API first, scheduler next, external ingress last.
+    for service in reversed(stopped_services):
+        context.run("start", service)
+        if service not in context.running_services():
+            raise RuntimeError(f"release admission service did not restart: {service}")
 
 
 def _data_usage_bytes(context: ComposeContext, source: Path) -> int:
@@ -1850,6 +1919,7 @@ def run_release_upgrade(
     release_committed = False
     configured_build_images: dict[str, str] = {}
     build_aliases_dirty = False
+    admission_stopped: list[str] = []
 
     def restore_uncommitted_build_aliases() -> None:
         nonlocal build_aliases_dirty
@@ -1985,6 +2055,19 @@ def run_release_upgrade(
             return result
 
         if reuse_backup is None:
+            admission = _quiesce_release_admission(
+                context, stopped_services=admission_stopped, wait_timeout=wait_timeout,
+            )
+            result["checks"]["admission_quiescence"] = admission
+
+            def guard_backup() -> None:
+                _assert_release_backup_idle(context, admission["schema_revision"])
+                result["checks"]["pre_backup_durable_work"] = {
+                    "status": "pass", "active_jobs": 0, "running_units": 0,
+                    "schema_revision": admission["schema_revision"],
+                    "writer_services_running": [],
+                }
+
             backup_directory = create_backup(
                 context,
                 backup_root,
@@ -1992,6 +2075,7 @@ def run_release_upgrade(
                 restart_services=False,
                 format_version=CONTROL_PLANE_BACKUP_FORMAT_VERSION,
                 minimum_free_gb=minimum_free_gb,
+                pre_dump_guard=guard_backup,
             )
             state_mutated = True
             rollback_base_context = _persist_rollback_compose_contract(
@@ -2225,6 +2309,14 @@ def run_release_upgrade(
             or not rollback_tags
             or rollback_base_context is None
         ):
+            if admission_stopped:
+                try:
+                    _restore_release_admission(context, admission_stopped)
+                    result["restored_admission_services"] = list(reversed(admission_stopped))
+                except Exception as admission_exc:
+                    result["admission_restore_error"] = (
+                        f"{type(admission_exc).__name__}: {admission_exc}"
+                    )
             result["status"] = "failed"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             return result
