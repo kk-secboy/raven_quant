@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -605,7 +606,9 @@ def test_quant_resource_limits_are_audited_as_resource_blocked(
     assert screen["profile_id"] == "balanced_5y"
     assert screen["seed"] == 11
     assert screen["model_engine"] == "platform_gru"
-    assert screen["resource_policy"]["stage"] == "screening"
+    assert screen["resource_policy"]["stage"] == "full_validation"
+    assert screen["mode"] == "reuse_first_full_cell"
+    assert screen["included_in_full_validation_grid"] is False
     assert screen["execution_evidence"]["status"] == "resource_blocked"
 
     full = module._run_ablation(
@@ -621,9 +624,102 @@ def test_quant_resource_limits_are_audited_as_resource_blocked(
         "evidence_sha256"
     ]
     assert [item["resource_stage"] for item in observed] == [
-        "screening",
+        "full_validation",
         "full_validation",
     ]
+
+
+@pytest.fixture
+def full_quant_grid(monkeypatch, tmp_path):
+    module = _module()
+    calls = []
+
+    def execute(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "passed",
+            "resource_stage": kwargs["resource_stage"],
+            "resource_policy": {"stage": kwargs["resource_stage"]},
+            "metrics": {"information_ratio": -1.0},
+            "predictions_path": str(kwargs["workspace"] / "output" / "predictions.parquet"),
+            "execution_evidence_sha256": "e" * 64,
+        }, "a" * 64
+
+    monkeypatch.setattr(module, "_execute_model_cell", execute)
+    common = {
+        "bundle": _bundle(module, tmp_path),
+        "feature_set": {"definition_sha256": "1" * 64},
+        "profiles": _profiles(),
+        "view": tmp_path / "view",
+        "factor_values_path": tmp_path / "factors.parquet",
+        "output": tmp_path / "candidate",
+        "manifest": _manifest(),
+    }
+    return module, common, calls
+
+
+def test_full_quant_grid_runs_27_full_cells_without_duplicate_precheck(full_quant_grid):
+    module, common, calls = full_quant_grid
+    first, ablations = module._run_validation_grid(**common)
+    assert len(calls) == 27
+    assert (calls[0]["name"], calls[0]["periods"], calls[0]["seed"]) == (
+        "joint", common["profiles"][1]["periods"], 11
+    )
+    expected = {(name, str(common["output"] / "ablations" / name / profile["id"]
+                           / f"seed-{seed}"))
+                for name in module.REQUIRED_QUANT_ABLATIONS
+                for profile in common["profiles"] for seed in module.REQUIRED_MODEL_SEEDS}
+    assert {(call["name"], str(call["workspace"])) for call in calls} == expected
+    assert {call["resource_stage"] for call in calls} == {"full_validation"}
+    assert all(call["periods"] in [profile["periods"] for profile in common["profiles"]]
+               for call in calls)
+    assert set(ablations) == set(module.REQUIRED_QUANT_ABLATIONS)
+    assert all(value["status"] == "passed" for value in ablations.values())
+    assert first["mode"] == "reuse_first_full_cell"
+    assert first["included_in_full_validation_grid"] is True
+    assert ablations["joint"]["profiles"]["balanced_5y"]["seeds"]["11"] is first
+
+
+@pytest.mark.parametrize("failure", ["resource", "runtime", "old_screen"])
+def test_first_quant_cell_failure_does_not_launch_more_validation(
+    full_quant_grid, monkeypatch, failure,
+):
+    module, common, calls = full_quant_grid
+
+    def execute(**kwargs):
+        calls.append(kwargs)
+        if failure == "runtime":
+            raise ValueError("invalid prediction contract")
+        stage = "screening" if failure == "old_screen" else "full_validation"
+        return {
+            "status": "resource_blocked" if failure == "resource" else "passed",
+            "resource_stage": stage, "resource_policy": {"stage": stage},
+            "error": "memory exhausted",
+        }, "a" * 64
+
+    monkeypatch.setattr(module, "_execute_model_cell", execute)
+    if failure == "resource":
+        first, ablations = module._run_validation_grid(**common)
+        assert first["status"] == "resource_blocked"
+        assert ablations == {}
+    else:
+        with pytest.raises(ValueError):
+            module._run_validation_grid(**common)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("candidate_id", "another-bundle"), ("dataset_identity_sha256", "f" * 64),
+    ("seed", 29), ("periods", {}), ("resource_stage", "screening"),
+    ("resource_policy", {"stage": "screening"}), ("status", "resource_blocked"),
+])
+def test_first_quant_cell_cannot_be_rebound_to_another_grid(full_quant_grid, field, value):
+    module, common, calls = full_quant_grid
+    first = deepcopy(module._run_resource_screen(**common))
+    first[field] = value
+    with pytest.raises(ValueError, match="differs from its registered validation grid"):
+        module._run_ablation(name="joint", first_full_cell=first, **common)
+    assert len(calls) == 1
 
 
 def test_quant_run_level_failure_summary_keeps_the_cell_root_cause() -> None:

@@ -475,6 +475,8 @@ def main() -> None:
             if inference_only
             else None
         ),
+        # Preserve the legacy request for audit; the same observed-duration policy
+        # governs tournament training, production refits and model inference.
         timeout_seconds=int(manifest.get("timeout_seconds") or 7200),
     )
     source_environment_sha256 = str(

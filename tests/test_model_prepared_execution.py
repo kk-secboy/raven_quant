@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+import sys
+import time
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -271,19 +273,23 @@ def test_model_has_only_one_readonly_entry_and_live_readonly_lease(setup, monkey
     assert len(observed) == 1
 
 
-def test_preparation_and_fitting_share_the_original_deadline(setup, monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr(execution.time, "monotonic", lambda: clock[0])
-    calls = _fake_docker(monkeypatch, clock=clock)
-    execution.run_with_prepared_data(**_call(setup))
+def test_preparation_and_fitting_ignore_legacy_wall_clock_deadline(setup, monkeypatch):
+    calls = _fake_docker(monkeypatch)
+    arguments = _call(setup)
+    arguments["timeout_seconds"] = 1
+    # The fake producer reports 23 seconds, already beyond the old entire budget.
+    assert execution.run_with_prepared_data(**arguments).returncode == 0
     producer_timeout = next(
         kwargs["timeout"] for command, kwargs in calls if "prepare_model_data.py" in command
     )
     model_timeout = next(
         kwargs["timeout"] for command, kwargs in calls if command[-1] == "runner.py"
     )
-    assert producer_timeout == 100
-    assert model_timeout == 77
+    assert producer_timeout is None
+    assert model_timeout is None
+    progress = json.loads((arguments["workspace"] / "execution-progress.json").read_text())
+    assert progress["status"] == "completed"
+    assert progress["wall_clock_deadline"] is None
 
 
 def test_cell_pins_prepared_manifest_outside_the_shared_entry(setup, monkeypatch):
@@ -459,20 +465,41 @@ def test_missing_terminal_progress_is_explicitly_partial_even_with_a_valid_summa
     )
 
 
-def test_cache_deadline_is_reported_as_the_original_model_budget_timeout(setup, monkeypatch):
-    @contextmanager
-    def expired(*_args, **_kwargs):
-        raise TimeoutError("prepared data cache exceeded its execution deadline")
-        yield  # pragma: no cover
+def test_cache_wait_and_build_have_no_fixed_deadline(setup, monkeypatch):
+    original = execution.prepared_data_cache
 
-    monkeypatch.setattr(execution, "prepared_data_cache", expired)
-    calls = _fake_docker(monkeypatch)
+    @contextmanager
+    def observed(**kwargs):
+        assert kwargs["deadline"] is None
+        with original(**kwargs) as prepared:
+            yield prepared
+
+    monkeypatch.setattr(execution, "prepared_data_cache", observed)
+    _fake_docker(monkeypatch)
     arguments = _call(setup)
-    with pytest.raises(subprocess.TimeoutExpired) as raised:
-        execution.run_with_prepared_data(**arguments)
-    assert raised.value.cmd == arguments["command"]
-    assert raised.value.timeout == arguments["timeout_seconds"]
-    assert calls == []
+    assert execution.run_with_prepared_data(**arguments).returncode == 0
+
+
+def test_real_model_subprocess_outlives_legacy_timeout_and_finishes(setup, monkeypatch):
+    @contextmanager
+    def uncached(**kwargs):
+        assert kwargs["deadline"] is None
+        yield None
+
+    monkeypatch.setattr(execution, "prepared_data_cache", uncached)
+    arguments = _call(setup)
+    arguments["timeout_seconds"] = 1
+    arguments["command"] = [
+        sys.executable, "-c", "import time; time.sleep(1.1); print('model-finished')",
+    ]
+    started = time.monotonic()
+    result = execution.run_with_prepared_data(**arguments)
+    assert time.monotonic() - started > arguments["timeout_seconds"]
+    assert result.returncode == 0
+    assert result.stdout.strip() == "model-finished"
+    progress = json.loads((arguments["workspace"] / "execution-progress.json").read_text())
+    assert progress["status"] == "completed"
+    assert progress["automatic_termination"] is False
 
 
 @pytest.mark.parametrize(

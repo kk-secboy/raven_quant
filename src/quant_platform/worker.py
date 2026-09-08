@@ -77,7 +77,7 @@ from .major_news_mentions import default_factors_dir as major_news_mentions_fact
 from .market_overview import MarketOverviewService
 from .market_permission import MarketPermissionStore
 from .model_artifact_store import ModelArtifactStore
-from .model_cell_execution import process_identity
+from .model_cell_execution import model_cell_store_root, process_identity
 from .model_cell_recovery import (
     MODEL_OWNER_LEASE_ENV,
     ModelCellCleanupPending,
@@ -88,6 +88,7 @@ from .model_cell_recovery import (
     recover_model_batches,
     register_model_batch,
 )
+from .model_cell_store import _regular as _safe_model_progress_path
 from .model_research_governance import canonical_sha256 as model_canonical_sha256
 from .model_research_governance import model_metric_report
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
@@ -2124,14 +2125,39 @@ class LocalJobWorker:
         result_path: Path | None,
         previous_mtime_ns: int | None,
     ) -> int | None:
-        if result_path is None or not result_path.exists():
+        if result_path is None:
             return previous_mtime_ns
+        progress_path = result_path
+        sidecar = False
+        if not result_path.exists():
+            # Only the current governed model attempt may publish this sidecar.
+            # Never scan historical cells or mistake operational observations for results.
+            try:
+                model_cell_store_root(result_path)
+                progress_path = result_path.with_name("model-progress.json")
+                _safe_model_progress_path(progress_path)
+            except (OSError, ValueError):
+                return previous_mtime_ns
+            sidecar = True
         try:
-            mtime_ns = result_path.stat().st_mtime_ns
+            info = progress_path.stat()
+            if sidecar and info.st_size > 1024 * 1024:
+                return previous_mtime_ns
+            # Different signs distinguish equal timestamps from the two sources.
+            # A real result always takes precedence as soon as it exists.
+            mtime_ns = info.st_mtime_ns * (-1 if sidecar else 1)
             if mtime_ns == previous_mtime_ns:
                 return previous_mtime_ns
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return previous_mtime_ns
+        if sidecar and (
+            not isinstance(payload, dict)
+            or payload.get("contract_version") != "model-batch-progress-v1-observe-only"
+            or payload.get("status") != "running"
+            or not isinstance(payload.get("active_cells"), list)
+            or len(payload["active_cells"]) > 2
+        ):
             return previous_mtime_ns
         if isinstance(payload, dict):
             self.store.update_progress(job_id, payload)

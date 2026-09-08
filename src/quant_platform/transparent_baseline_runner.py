@@ -353,16 +353,27 @@ STRATEGY_RESEARCH_V41_TARGET_RUNNER_SHA256 = (
 STRATEGY_RESEARCH_V41_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "7d6b07b833e71f9309ac0211c084b49a3fbbe0c93b6611e4c426016bd930b5f6"
 )
-STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION = (
     "qlib-rdagent-single-mainline-2026-09-07-v42"
 )
-STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
+STRATEGY_RESEARCH_V42_TARGET_RUNNER_SHA256 = (
     "bc0cfad1188eb3103295f33f959e3d4bfed5f8b17527610873796d0c4cacaf4c"
 )
 # Sealed against the complete v42 source closure. The source-closure
 # normalizer excludes only the seal values from their own digest.
-STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
+STRATEGY_RESEARCH_V42_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "6375f33d9a3dff138be9815f0fefc15ec7f21ae64cd303e0b682d265e5835dbf"
+)
+STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-09-08-v43"
+)
+STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
+    "bc0cfad1188eb3103295f33f959e3d4bfed5f8b17527610873796d0c4cacaf4c"
+)
+# Sealed against the complete v43 source closure. The source-closure
+# normalizer excludes only the seal values from their own digest.
+STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "6dc7f9cabe2c5e1850d8f1b7b51e9c4ce87d9d2b93947c7f8d4c3253287a483e"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
@@ -474,6 +485,7 @@ _TARGET_RUNNERS = {
     ),
     STRATEGY_RESEARCH_V40_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_V40_TARGET_RUNNER_SHA256,
     STRATEGY_RESEARCH_V41_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_V41_TARGET_RUNNER_SHA256,
+    STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_V42_TARGET_RUNNER_SHA256,
     STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
 }
 
@@ -612,6 +624,8 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return STRATEGY_RESEARCH_V40_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == STRATEGY_RESEARCH_V41_TARGET_RECIPE_VERSION:
         return STRATEGY_RESEARCH_V41_TARGET_RUNTIME_BUNDLE_SHA256
+    if normalized_recipe_version == STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION:
+        return STRATEGY_RESEARCH_V42_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == STRATEGY_RESEARCH_TARGET_RECIPE_VERSION:
         return STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     return None
@@ -668,6 +682,7 @@ def target_worker_runtime_image_for_recipe(
             STRATEGY_RESEARCH_V39_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V40_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_V41_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION,
             STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
     ):
@@ -702,7 +717,8 @@ def target_worker_runtime_image_for_recipe(
         STRATEGY_RESEARCH_V39_TARGET_RECIPE_VERSION: "v39",
         STRATEGY_RESEARCH_V40_TARGET_RECIPE_VERSION: "v40",
         STRATEGY_RESEARCH_V41_TARGET_RECIPE_VERSION: "v41",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v42",
+        STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION: "v42",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v43",
     }[normalized_recipe_version]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -864,7 +880,8 @@ def require_transparent_baseline_runner(
         STRATEGY_RESEARCH_V39_TARGET_RECIPE_VERSION: "v39",
         STRATEGY_RESEARCH_V40_TARGET_RECIPE_VERSION: "v40",
         STRATEGY_RESEARCH_V41_TARGET_RECIPE_VERSION: "v41",
-        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v42",
+        STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION: "v42",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v43",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -932,6 +949,7 @@ def require_transparent_baseline_runner(
         "v40",
         "v41",
         "v42",
+        "v43",
     }:
         try:
             bundle_sha256 = (
@@ -968,6 +986,7 @@ def require_transparent_baseline_runner(
                     "v40",
                     "v41",
                     "v42",
+                    "v43",
                 }
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
@@ -1007,7 +1026,8 @@ def require_transparent_baseline_runner(
             "v39": STRATEGY_RESEARCH_V39_TARGET_RUNTIME_BUNDLE_SHA256,
             "v40": STRATEGY_RESEARCH_V40_TARGET_RUNTIME_BUNDLE_SHA256,
             "v41": STRATEGY_RESEARCH_V41_TARGET_RUNTIME_BUNDLE_SHA256,
-            "v42": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v42": STRATEGY_RESEARCH_V42_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v43": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(

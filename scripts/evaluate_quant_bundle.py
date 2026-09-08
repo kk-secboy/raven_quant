@@ -1300,6 +1300,7 @@ def _run_resource_screen(
     output: Path,
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
+    """Run the first full joint cell once, then reuse it in the 27-cell grid."""
     profile = next(
         item for item in profiles if str(item.get("id")) == "balanced_5y"
     )
@@ -1314,16 +1315,27 @@ def _run_resource_screen(
             factor_values_path=factor_values_path,
             periods=periods,
             seed=seed,
-            resource_stage="screening",
-            workspace=output / "resource-screen" / "balanced_5y" / f"seed-{seed}",
+            resource_stage="full_validation",
+            workspace=output / "ablations" / "joint" / "balanced_5y" / f"seed-{seed}",
             manifest=manifest,
         )
     except Exception as exc:
         raise ValueError(
-            f"quant bundle resource screen balanced_5y/seed-{seed} failed: {exc}"
+            f"quant first full joint cell balanced_5y/seed-{seed} failed: {exc}"
         ) from exc
+    if (
+        cell.get("status") not in {"passed", "resource_blocked"}
+        or cell.get("resource_stage") != "full_validation"
+        or cell.get("resource_policy", {}).get("stage") != "full_validation"
+    ):
+        raise ValueError("quant first validation cell did not use the full budget")
     return {
         **cell,
+        "mode": "reuse_first_full_cell",
+        "included_in_full_validation_grid": cell["status"] == "passed",
+        "candidate_id": bundle["id"],
+        "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+        "feature_set_definition_sha256": feature_set["definition_sha256"],
         "ablation": "joint",
         "profile_id": "balanced_5y",
         "seed": seed,
@@ -1344,7 +1356,31 @@ def _run_ablation(
     factor_values_path: Path,
     output: Path,
     manifest: dict[str, Any],
+    first_full_cell: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if first_full_cell is not None:
+        expected = {
+            "mode": "reuse_first_full_cell",
+            "included_in_full_validation_grid": True,
+            "status": "passed",
+            "candidate_id": bundle["id"],
+            "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+            "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "ablation": "joint",
+            "profile_id": "balanced_5y",
+            "seed": int(REQUIRED_MODEL_SEEDS[0]),
+            "resource_stage": "full_validation",
+            "periods": next(
+                dict(profile["periods"])
+                for profile in profiles if str(profile["id"]) == "balanced_5y"
+            ),
+        }
+        if (
+            name != "joint"
+            or any(first_full_cell.get(key) != value for key, value in expected.items())
+            or first_full_cell.get("resource_policy", {}).get("stage") != "full_validation"
+        ):
+            raise ValueError("quant first full cell differs from its registered validation grid")
     result: dict[str, Any] = {
         "status": "passed",
         "source": "independent_qlib_recompute",
@@ -1368,18 +1404,25 @@ def _run_ablation(
         for seed in REQUIRED_MODEL_SEEDS:
             workspace = output / "ablations" / name / profile_id / f"seed-{seed}"
             try:
-                cell, environment_sha256 = _execute_model_cell(
-                    name=name,
-                    bundle=bundle,
-                    feature_set=feature_set,
-                    view=view,
-                    factor_values_path=factor_values_path,
-                    periods=periods,
-                    seed=seed,
-                    resource_stage="full_validation",
-                    workspace=workspace,
-                    manifest=manifest,
-                )
+                if (
+                    first_full_cell is not None
+                    and (profile_id, seed) == ("balanced_5y", REQUIRED_MODEL_SEEDS[0])
+                ):
+                    cell = first_full_cell
+                    environment_sha256 = str(cell["execution_environment_sha256"])
+                else:
+                    cell, environment_sha256 = _execute_model_cell(
+                        name=name,
+                        bundle=bundle,
+                        feature_set=feature_set,
+                        view=view,
+                        factor_values_path=factor_values_path,
+                        periods=periods,
+                        seed=seed,
+                        resource_stage="full_validation",
+                        workspace=workspace,
+                        manifest=manifest,
+                    )
             except UnsupportedQuantBaseline:
                 raise
             except Exception as exc:
@@ -1405,6 +1448,23 @@ def _run_ablation(
     result["execution_environment_sha256"] = next(iter(execution_environments))
     result["evidence_sha256"] = canonical_sha256(result)
     return result
+
+
+def _run_validation_grid(**kwargs: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    first_full_cell = _run_resource_screen(**kwargs)
+    ablations: dict[str, dict[str, Any]] = {}
+    if first_full_cell["status"] == "resource_blocked":
+        return first_full_cell, ablations
+    for name in REQUIRED_QUANT_ABLATIONS:
+        ablation = _run_ablation(
+            name=name,
+            first_full_cell=first_full_cell if name == "joint" else None,
+            **kwargs,
+        )
+        ablations[name] = ablation
+        if ablation["status"] == "resource_blocked":
+            break
+    return first_full_cell, ablations
 
 
 def main() -> None:
@@ -1562,7 +1622,7 @@ def main() -> None:
                 output=candidate_root,
                 universe=str(manifest.get("universe") or "cn_all"),
             )
-            resource_screen = _run_resource_screen(
+            resource_screen, ablations = _run_validation_grid(
                 bundle=candidate,
                 feature_set=feature_set,
                 profiles=profiles,
@@ -1571,26 +1631,15 @@ def main() -> None:
                 output=candidate_root,
                 manifest=manifest,
             )
-            ablations: dict[str, dict[str, Any]] = {}
             resource_block: str | None = None
-            if resource_screen["status"] != "resource_blocked":
-                for name in REQUIRED_QUANT_ABLATIONS:
-                    ablation = _run_ablation(
-                        name=name,
-                        bundle=candidate,
-                        feature_set=feature_set,
-                        profiles=profiles,
-                        view=view,
-                        factor_values_path=factor_values,
-                        output=candidate_root,
-                        manifest=manifest,
-                    )
-                    ablations[name] = ablation
-                    if ablation["status"] == "resource_blocked":
-                        resource_block = str(ablation["error"])
-                        break
-            else:
+            if resource_screen["status"] == "resource_blocked":
                 resource_block = str(resource_screen["error"])
+            else:
+                resource_block = next(
+                    (str(item["error"]) for item in ablations.values()
+                     if item["status"] == "resource_blocked"),
+                    None,
+                )
             execution_environments = {
                 str(resource_screen["execution_environment_sha256"]),
                 *(

@@ -330,7 +330,7 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-07-v42`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-08-v43`" in readme
     assert "不能沿用旧结果宣称等价" in readme
 
 
@@ -1195,5 +1195,20 @@ def test_v42_unified_execution_preserves_trials_and_separates_research_cadence()
         "全批并发不得超过 8 CPU、40 GiB 与两个单元", "已失败单元保留失败",
         "不增加统计重试机会", "不能复用半成品或跨种子、跨版本的拟合结果",
         "最终仍对完整候选集合计算原有 Holm/PBO", "取消时终止对应子进程和沙箱后才释放资源",
+    ):
+        assert contract in specification
+
+
+def test_v43_observes_model_progress_without_erasing_failures_or_duplicate_trials() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`qlib-rdagent-single-mainline-2026-09-08-v43`", "`0115_strategy_runtime_v43`",
+        "不因固定总耗时自动终止", "`duration_policy.mode=observe_only`",
+        "`automatic_termination=false`", "连续 30 分钟未观察到计算进展时提示检查",
+        "观察记录不是预测、实验结果或准入证据", "不再充当有效模型截止时间",
+        "网络 RPC 超时、因子代码隔离限额和 RD-Agent 主动研究时长预算不因此取消",
+        "重复资源预检并入首个正式实验格", "成功制品直接计入原有三窗口、三种子实验集合",
+        "首格失败保留真实失败和资源证据", "不增加统计机会，不减少正式格，不重开 OOS",
+        "新合同只在正常的新活动边界启用",
     ):
         assert contract in specification

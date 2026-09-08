@@ -1854,6 +1854,25 @@ strategy_versions = Table(
         ") ELSE true END) IS TRUE",
         name="ck_strategy_versions_v42_runtime_identity",
     ),
+    # The v43 source identity is independent of the immutable v42 constraint above.
+    CheckConstraint(
+        "(CASE WHEN "
+        "COALESCE(config_json ->> 'recipe_version', '') = "
+        "'qlib-rdagent-single-mainline-2026-09-08-v43' THEN ("
+        "COALESCE(config_json ->> 'recipe_id', '') IN "
+        "('short_relative_strength','swing_trend','long_quality_value') "
+        "AND evidence_mode = 'sealed_final_oos' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runner_sha256' = "
+        "'bc0cfad1188eb3103295f33f959e3d4bfed5f8b17527610873796d0c4cacaf4c' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runtime_bundle_sha256' = "
+        "'6dc7f9cabe2c5e1850d8f1b7b51e9c4ce87d9d2b93947c7f8d4c3253287a483e' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_worker_runtime_image_digest' ~ '^sha256:[0-9a-f]{64}$'"
+        ") ELSE true END) IS TRUE",
+        name="ck_strategy_versions_v43_runtime_identity",
+    ),
 )
 Index(
     "uq_strategy_versions_number",

@@ -32,7 +32,7 @@ from .research_execution_cadence import (
     validate_research_execution_cadence_contract,
 )
 
-MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v11-profile-thread-audit"
+MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v12-progress-observed"
 MODEL_MEMORY_AUDIT_CONTRACT_VERSION = "model-memory-audit-v1-cgroup-peak"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
 HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
@@ -40,8 +40,6 @@ MODEL_TEMPLATE_FILENAME = "platform_model_templates.py"
 MODEL_RESOURCE_STAGES = frozenset(
     {"screening", "full_validation", "production_refit", "inference"}
 )
-MODEL_SCREENING_TIMEOUT_SECONDS = 1800
-MODEL_FULL_TIMEOUT_SECONDS = 7200
 DEEP_SCREENING_EPOCH_CAP = 4
 DEEP_FULL_EPOCH_CAP = 12
 DEEP_EARLY_STOP_CAP = 3
@@ -261,10 +259,10 @@ def governed_model_resource_policy(
 ) -> dict[str, Any]:
     """Freeze a reproducible compute budget without changing date segments.
 
-    Screening is a feasibility pass on a governed full profile.  It reduces
-    epochs and wall-clock budget only; callers keep the registered universe,
-    train/validation dates and PIT cutoffs unchanged.  A candidate that cannot
-    finish this pass is resource-blocked rather than scored as a bad model.
+    Elapsed time is observational, never a model rejection or a termination
+    deadline. Callers keep the registered universe, train/validation dates,
+    epoch limits and PIT cutoffs unchanged. Actual memory/resource failures
+    remain resource-blocked rather than scored as a bad model.
     """
 
     if stage not in MODEL_RESOURCE_STAGES:
@@ -278,11 +276,6 @@ def governed_model_resource_policy(
     if model_engine in {"platform_gru", "platform_transformer"} and model_type != "TimeSeries":
         raise ValueError("GRU and Transformer belong to the governed sequence lane")
     requested = dict(requested_hyperparameters or {})
-    timeout_cap = (
-        MODEL_SCREENING_TIMEOUT_SECONDS
-        if stage == "screening"
-        else MODEL_FULL_TIMEOUT_SECONDS
-    )
 
     def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
         value = requested.get(name, default)
@@ -310,7 +303,9 @@ def governed_model_resource_policy(
 
     if isinstance(requested_timeout_seconds, bool):
         raise ValueError("model timeout must be an integer")
-    timeout_seconds = min(max(int(requested_timeout_seconds), 300), timeout_cap)
+    # Historical manifests carry this field. Preserve it as request evidence;
+    # it must not silently reintroduce a fixed wall-clock cutoff.
+    requested_timeout_seconds = int(requested_timeout_seconds)
     deep_engine = model_engine in {
         "platform_gru",
         "platform_transformer",
@@ -388,8 +383,15 @@ def governed_model_resource_policy(
             "allowed_seeds": list(allowed_seeds),
         },
         "data_contract_version": data_contract_version,
+        "duration_policy": {
+            "mode": "observe_only",
+            "automatic_termination": False,
+            "elapsed_warning_seconds": 1800,
+            "progress_warning_seconds": 1800,
+            "legacy_requested_timeout_seconds": requested_timeout_seconds,
+        },
         "limits": {
-            "timeout_seconds": timeout_seconds,
+            "timeout_seconds": None,
             "cpu_count": allocation["cpu_count"],
             "memory_gb": allocation["memory_gb"],
             "compute_threads": allocation["compute_threads"],
@@ -636,7 +638,7 @@ def execute_model_candidate(
     cell_allocation = governed_cell_resource_allocation(manifest)
     grid_policy = fixed_model_cell_grid_policy()
     compute_policy_source = Path(__file__).resolve().with_name("model_compute_policy.py")
-    effective_timeout_seconds = int(resource_policy["limits"]["timeout_seconds"])
+    effective_timeout_seconds = resource_policy["limits"]["timeout_seconds"]
     execution_environment = {
         "contract_version": "model-execution-environment-v1",
         "executor_version": MODEL_RECOMPUTE_EXECUTOR_VERSION,
@@ -661,6 +663,9 @@ def execute_model_candidate(
         ),
         "prepared_data_cache_sha256": file_sha256(
             Path(__file__).resolve().with_name("model_prepared_cache.py")
+        ),
+        "execution_monitor_sha256": file_sha256(
+            Path(__file__).resolve().with_name("model_execution_monitor.py")
         ),
         "sandbox_image": image,
         "sandbox_image_id": image_id,
@@ -830,9 +835,9 @@ def execute_model_candidate(
                     timeout=30,
                     check=False,
                 )
-        raise ModelResourceLimitError(
-            "model execution exceeded the governed wall-clock budget "
-            f"({effective_timeout_seconds}s, stage={resource_policy['stage']})"
+        raise RuntimeError(
+            "model execution control operation timed out; "
+            "no computation deadline is configured"
         ) from exc
     memory_audit_path = workspace / "output" / "memory_stages.jsonl"
     memory_audit_records = _read_model_memory_audit(memory_audit_path)

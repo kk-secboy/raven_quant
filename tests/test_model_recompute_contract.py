@@ -101,7 +101,7 @@ def test_model_sandbox_runner_uses_the_executor_contract_versions() -> None:
         module.MODEL_MEMORY_AUDIT_CONTRACT_VERSION
         == MODEL_MEMORY_AUDIT_CONTRACT_VERSION
     )
-    assert MODEL_RECOMPUTE_EXECUTOR_VERSION == "model-recompute-docker-v11-profile-thread-audit"
+    assert MODEL_RECOMPUTE_EXECUTOR_VERSION == "model-recompute-docker-v12-progress-observed"
     assert (
         module.MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
         == MODEL_SANDBOX_MLFLOW_ALLOW_FILE_STORE
@@ -400,7 +400,9 @@ def test_governed_model_resource_policy_caps_compute_not_research_data() -> None
         "lr": 2e-4,
         "weight_decay": 1e-4,
     }
-    assert screening["limits"]["timeout_seconds"] == 1800
+    assert screening["limits"]["timeout_seconds"] is None
+    assert screening["duration_policy"]["automatic_termination"] is False
+    assert screening["duration_policy"]["legacy_requested_timeout_seconds"] == 99_999
     assert MODEL_SANDBOX_MEMORY_GB == 40
     assert screening["limits"]["memory_gb"] == MODEL_SANDBOX_MEMORY_GB
     assert MODEL_QLIB_KERNELS == 1
@@ -420,7 +422,8 @@ def test_governed_model_resource_policy_caps_compute_not_research_data() -> None
     )
     assert full["effective_training_hyperparameters"]["n_epochs"] == 12
     assert full["effective_training_hyperparameters"]["early_stop"] == 3
-    assert full["limits"]["timeout_seconds"] == 7200
+    assert full["limits"]["timeout_seconds"] is None
+    assert full["duration_policy"]["mode"] == "observe_only"
     assert full["limits"]["cpu_only_timeseries_cap"] is True
     assert full["limits"]["exclusive_concurrency"] == 1
 

@@ -511,6 +511,8 @@ def model_evaluate_command(
         "open_cost": float(payload.get("open_cost", 0.0005)),
         "close_cost": float(payload.get("close_cost", 0.0015)),
         "min_cost": float(payload.get("min_cost", 5.0)),
+        # Legacy requested value is retained in the immutable request audit.
+        # The governed model duration policy observes progress; it is not a kill deadline.
         "model_timeout_seconds": int(payload.get("model_timeout_seconds", 7200)),
     }
     manifest_path.write_text(

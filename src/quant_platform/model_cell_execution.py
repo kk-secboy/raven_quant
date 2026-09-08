@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import logging
 import os
 import re
 import signal
@@ -12,7 +13,8 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ from .model_prepared_cache import _mkdir, _safe
 from .model_research_governance import file_sha256
 
 CELL_EXECUTION_VERSION = "model-cell-execution-v1"
+_LOG = logging.getLogger(__name__)
 
 
 class ModelCellCancelled(BaseException):
@@ -258,6 +261,59 @@ class ModelCellBatchExecutor:
                 raise ValueError("model cell cleanup escaped its registered batch")
             cleanup_cell_containers(workspace)
 
+    def _publish_progress(self, calls, active, results) -> None:
+        cells = []
+        warnings = set()
+        for index, (_process, directory, _log) in active.items():
+            manifest = calls[index]["manifest"]
+            progress = None
+            observation_status = "not_yet_available"
+            try:
+                active_path = directory / "active.json"
+                if active_path.exists():
+                    workspace = _safe(Path(str(read_json(active_path).get("workspace") or "")))
+                    if not workspace.is_relative_to(self.store.root):
+                        raise ValueError("model progress escaped its registered batch")
+                    path = workspace / "execution-progress.json"
+                    if path.exists():
+                        progress = read_json(path)
+                        cell_warnings = progress.get("warnings", [])
+                        if (
+                            progress.get("contract_version")
+                            != "model-execution-progress-v1-observe-only"
+                            or not isinstance(cell_warnings, list)
+                            or any(value not in {"elapsed_warning", "progress_not_observed"}
+                                   for value in cell_warnings)
+                        ):
+                            raise ValueError("model execution progress contract is invalid")
+                        warnings.update(cell_warnings)
+                        observation_status = "available"
+            except Exception:
+                progress = None
+                observation_status = "unavailable"
+                warnings.add("progress_observation_unavailable")
+            cells.append({
+                "candidate_id": manifest.get("candidate_id"),
+                "model_engine": manifest.get("model_engine"),
+                "profile_id": manifest.get("evaluation_profile_id"),
+                "seed": manifest.get("seed"),
+                "progress": progress,
+                "observation_status": observation_status,
+            })
+        atomic_json(self.control_root.parent / "model-progress.json", {
+            "contract_version": "model-batch-progress-v1-observe-only",
+            "status": "running",
+            "execution_phase": "model_compute",
+            "phase_label": "模型实验运行中；耗时提示不自动终止计算",
+            "updated_at": datetime.now(UTC).isoformat(),
+            "completed_cells": len(results),
+            "planned_cells": len(calls),
+            "cell_count_scope": "current_group",
+            "active_cells": cells,
+            "warnings": sorted(warnings),
+            "automatic_termination": False,
+        })
+
     def run_many(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         limits = fixed_model_cell_grid_policy()["batch_limits"]
         allocations = [governed_cell_resource_allocation(call["manifest"]) for call in calls]
@@ -270,6 +326,8 @@ class ModelCellBatchExecutor:
         pending = list(range(len(calls)))
         active: dict[int, tuple[subprocess.Popen, Path, Any]] = {}
         results: dict[int, dict[str, Any]] = {}
+        last_progress_at = float("-inf")
+        previous_completed = -1
         try:
             with cancellation_signals():
                 while pending or active:
@@ -326,6 +384,17 @@ class ModelCellBatchExecutor:
                             raise ValueError("model cell subprocess returned an unbound receipt")
                         results[index] = {**receipt, "reused": result["reused"]}
                         del active[index]  # Release only after verified process/container exit.
+                    if (
+                        len(results) != previous_completed
+                        or time.monotonic() - last_progress_at >= 30
+                    ):
+                        try:
+                            self._publish_progress(calls, active, results)
+                        except Exception:
+                            with suppress(Exception):
+                                _LOG.exception("Could not publish model batch progress; continuing")
+                        previous_completed = len(results)
+                        last_progress_at = time.monotonic()
                     if pending or active:
                         time.sleep(0.1)
         finally:

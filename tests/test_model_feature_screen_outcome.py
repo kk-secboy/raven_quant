@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 import quant_platform.worker as worker_module
@@ -103,9 +104,10 @@ def screen(tmp_path, monkeypatch):
         module, "verify_model_prediction_artifact",
         lambda *_a, **_k: {"coverage_gate_passed": True},
     )
-    state = SimpleNamespace(metrics=_metrics(), execution_error=None)
+    state = SimpleNamespace(metrics=_metrics(), execution_error=None, calls=[], batches=[])
 
     def execute(**kwargs):
+        state.calls.append(kwargs)
         if state.execution_error:
             raise state.execution_error
         output = kwargs["workspace"] / "output"
@@ -121,15 +123,22 @@ def screen(tmp_path, monkeypatch):
             paths[key + "_sha256"] = file_sha256(path)
         return {
             **paths, "metrics": state.metrics, "checkpoint_format": "lightgbm_text",
-            "resource_policy": {}, "model_label_contract": {},
+            "resource_policy": {"stage": kwargs["manifest"]["resource_stage"]},
+            "model_label_contract": {}, "latest_prediction_date": periods["valid_end"],
             "model_label_contract_sha256": "l" * 64,
             "research_execution_cadence_sha256": cadence["evidence_sha256"],
         }, {"evidence_sha256": "e" * 64, "execution_environment_sha256": "n" * 64}
 
     class DirectCells:
         def run_many(self, calls):
+            state.batches.append(len(calls))
             outcomes = []
             for call in calls:
+                call = dict(call)
+                cell_manifest = call["manifest"]
+                call.setdefault("workspace", output_path.parent / "test-cells"
+                                / cell_manifest["evaluation_profile_id"]
+                                / f"seed-{cell_manifest['seed']}")
                 try:
                     result, evidence = execute(**call)
                     outcomes.append({
@@ -139,6 +148,8 @@ def screen(tmp_path, monkeypatch):
                     })
                 except ModelResourceLimitError as exc:
                     outcomes.append({"status": "resource_blocked", "error": str(exc)})
+                except Exception as exc:
+                    outcomes.append({"status": "failed", "error": str(exc)})
             return outcomes
 
     monkeypatch.setattr(module, "_new_cell_executor", lambda *_: DirectCells())
@@ -171,7 +182,92 @@ def screen(tmp_path, monkeypatch):
     return SimpleNamespace(
         run=run, state=state, worker=worker, job=job, output_path=output_path,
         transitions=transitions, candidate_transitions=candidate_transitions,
+        module=module, manifest=manifest, manifest_path=manifest_path,
     )
+
+
+@pytest.fixture
+def full_model_grid(screen, monkeypatch):
+    manifest = screen.manifest
+    manifest["evaluation_stage"] = "model_full"
+    periods = manifest["evaluation_profiles"][0]["periods"]
+    manifest["evaluation_profiles"] = [
+        {"id": name, "periods": {**periods, "train_start": start}}
+        for name, start in (
+            ("recent_3y", periods["train_start"]),
+            ("balanced_5y", "2016-01-04"),
+            ("robust_10y", "2011-01-04"),
+        )
+    ]
+    screen.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(screen.module.pd, "read_parquet", lambda *_: pd.DataFrame(
+        {"return": 0.001, "bench": 0.0, "cost": 0.0001},
+        index=pd.date_range("2023-01-03", periods=60, freq="B"),
+    ))
+    monkeypatch.setattr(screen.module, "build_run_multiple_testing_evidence", lambda **_: {})
+    monkeypatch.setattr(
+        screen.module, "validate_independent_model_evidence", lambda *_a, **_k: None,
+    )
+    return screen
+
+
+def test_full_model_grid_reuses_first_full_cell_and_preserves_all_nine(full_model_grid):
+    grid = full_model_grid
+    grid.state.metrics["information_ratio"] = -1.0
+    item = grid.run()["evaluations"][0]
+    assert item["status"] == "passed"
+    assert grid.state.batches == [1, 8]
+    calls = [call["manifest"] for call in grid.state.calls]
+    assert (calls[0]["evaluation_profile_id"], calls[0]["seed"]) == ("balanced_5y", 11)
+    expected = {(profile["id"], seed)
+                for profile in grid.manifest["evaluation_profiles"] for seed in (11, 29, 47)}
+    assert len(calls) == len(expected) == 9
+    assert {(call["evaluation_profile_id"], call["seed"]) for call in calls} == expected
+    assert {call["resource_stage"] for call in calls} == {"full_validation"}
+    assert all(call["final_oos_opened"] is False for call in calls)
+    assert all(call["periods"] == next(
+        profile["periods"] for profile in grid.manifest["evaluation_profiles"]
+        if profile["id"] == call["evaluation_profile_id"]
+    ) for call in calls)
+    evidence = item["evidence"]
+    first = evidence["profiles"]["balanced_5y"]["seeds"]["11"]
+    feasibility = evidence["resource_screen"]
+    assert feasibility["mode"] == "reuse_first_full_cell"
+    assert feasibility["included_in_full_validation_grid"] is True
+    assert feasibility["cell_execution"] == first["cell_execution"]
+    assert feasibility["execution_evidence_sha256"] == first["execution_evidence_sha256"]
+
+
+@pytest.mark.parametrize("failure", [
+    "resource", "runtime", "invalid_metrics", "coverage", "old_screen",
+])
+def test_first_full_cell_failure_stops_remaining_grid(full_model_grid, monkeypatch, failure):
+    grid = full_model_grid
+    if failure == "resource":
+        grid.state.execution_error = ModelResourceLimitError("memory exhausted")
+    elif failure == "runtime":
+        grid.state.execution_error = ValueError("invalid output contract")
+    elif failure == "invalid_metrics":
+        grid.state.metrics["ic"] = float("nan")
+    elif failure == "coverage":
+        def invalid_coverage(*_a, **_k):
+            raise ValueError("prediction coverage is incomplete")
+        monkeypatch.setattr(grid.module, "verify_model_prediction_artifact", invalid_coverage)
+    else:
+        execute = grid.module._execute_cell
+
+        def old_screen_result(*args, **kwargs):
+            result = execute(*args, **kwargs)
+            result[0]["resource_policy"]["stage"] = "screening"
+            return result
+
+        monkeypatch.setattr(grid.module, "_execute_cell", old_screen_result)
+    item = grid.run()["evaluations"][0]
+    assert grid.state.batches == [1]
+    assert len(grid.state.calls) == 1
+    assert item["status"] == ("resource_blocked" if failure == "resource" else "failed")
+    if failure == "resource":
+        assert item["reason_code"] == "full_validation_resource_limit"
 
 
 def test_weak_effects_keep_evidence_and_settle_completed_screen(screen):

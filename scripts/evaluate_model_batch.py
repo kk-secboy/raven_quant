@@ -385,7 +385,11 @@ def _evaluate_batch(args: argparse.Namespace) -> None:
         )
         screening_periods = dict(screening_profile["periods"])
         screening_seed = int(REQUIRED_MODEL_SEEDS[0])
-        screening_workspace = artifact_root / candidate_id / "resource-screen"
+        # The first real validation cell establishes feasibility and remains one
+        # of the registered nine cells. No shorter training run is discarded.
+        screening_workspace = (
+            artifact_root / candidate_id / "balanced_5y" / f"seed-{screening_seed}"
+        )
         try:
             screening_result, screening_execution, screening_workspace = _execute_cell(
                 cell_executor,
@@ -394,23 +398,37 @@ def _evaluate_batch(args: argparse.Namespace) -> None:
                 manifest=execution_manifest(
                     screening_periods,
                     screening_seed,
-                    resource_stage="screening",
+                    resource_stage="full_validation",
                     profile_id="balanced_5y",
                 ),
                 workspace=screening_workspace,
                 runner_path=runner_path,
                 timeout_seconds=int(manifest.get("model_timeout_seconds", 7200)),
             )
+            if screening_result["resource_policy"].get("stage") != "full_validation":
+                raise ValueError("first model validation cell did not use the full budget")
+            model_metric_report(screening_result["metrics"])
+            verify_model_prediction_artifact(
+                screening_workspace / "output" / "predictions.parquet",
+                expected_sha256=screening_result["predictions_sha256"],
+                test_start=screening_periods["valid_start"],
+                test_end=screening_periods["valid_end"],
+                trading_days=calendar_between(
+                    view, screening_periods["valid_start"], screening_periods["valid_end"]
+                ),
+            )
         except ModelResourceLimitError as exc:
             evaluations.append(
                 {
                     "candidate_id": candidate_id,
                     "status": "resource_blocked",
-                    "reason_code": "screening_resource_limit",
+                    "reason_code": "full_validation_resource_limit",
                     "error": str(exc),
                     "evidence": {
                         **evidence,
                         "resource_screen": {
+                            "mode": "reuse_first_full_cell",
+                            "resource_stage": "full_validation",
                             "status": "resource_blocked",
                             "profile_id": "balanced_5y",
                             "seed": screening_seed,
@@ -427,11 +445,14 @@ def _evaluate_batch(args: argparse.Namespace) -> None:
                 {
                     "candidate_id": candidate_id,
                     "status": "failed",
-                    "error": f"resource feasibility screen failed: {exc}",
+                    "error": f"first full validation cell balanced_5y/seed-11 failed: {exc}",
                 }
             )
             continue
         evidence["resource_screen"] = {
+            "mode": "reuse_first_full_cell",
+            "resource_stage": "full_validation",
+            "included_in_full_validation_grid": True,
             "status": "passed",
             "profile_id": "balanced_5y",
             "seed": screening_seed,
@@ -465,6 +486,7 @@ def _evaluate_batch(args: argparse.Namespace) -> None:
                 "timeout_seconds": int(manifest.get("model_timeout_seconds", 7200)),
             }
             for profile in profiles for seed in REQUIRED_MODEL_SEEDS
+            if (str(profile["id"]), seed) != ("balanced_5y", screening_seed)
         ]
         grid_outcomes = iter(cell_executor.run_many(grid_calls))
         execution_environments: set[str] = set()
@@ -478,7 +500,12 @@ def _evaluate_batch(args: argparse.Namespace) -> None:
             for seed in REQUIRED_MODEL_SEEDS:
                 workspace = artifact_root / candidate_id / profile_id / f"seed-{seed}"
                 try:
-                    result, execution_evidence, workspace = _cell_result(next(grid_outcomes))
+                    if (profile_id, seed) == ("balanced_5y", screening_seed):
+                        result, execution_evidence, workspace = (
+                            screening_result, screening_execution, screening_workspace
+                        )
+                    else:
+                        result, execution_evidence, workspace = _cell_result(next(grid_outcomes))
                     predictions_path = workspace / "output" / "predictions.parquet"
                     coverage = verify_model_prediction_artifact(
                         predictions_path,

@@ -202,7 +202,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
                 "AND NOT tgisinternal"
             )
         ).scalar_one()
-    assert revision == "0114_strategy_runtime_v42"
+    assert revision == "0115_strategy_runtime_v43"
     assert (
         "source_version.config_json -> 'transparent_baseline_bootstrap' ->> "
         "'recipe_sha256'"

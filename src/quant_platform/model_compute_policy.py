@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 MODEL_COMPUTE_POLICY_VERSION = "model-compute-policy-v1-profile-grid"
-MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v8-explicit-thread-grid"
+MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v9-progress-observed"
 DEFAULT_COMPUTE_PROFILE = "cpu4"
 
 

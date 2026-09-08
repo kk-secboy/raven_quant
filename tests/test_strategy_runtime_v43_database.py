@@ -22,9 +22,9 @@ from quant_data.database import open_database
 from quant_platform import transparent_baseline_runner as runtime
 from quant_platform.db_cli import alembic_config
 
-V41_CHECK = "ck_strategy_versions_v41_runtime_identity"
 V42_CHECK = "ck_strategy_versions_v42_runtime_identity"
-HEAD = "0114_strategy_runtime_v42"
+V43_CHECK = "ck_strategy_versions_v43_runtime_identity"
+HEAD = "0115_strategy_runtime_v43"
 RECIPES = ("short_relative_strength", "swing_trend", "long_quality_value")
 
 
@@ -47,15 +47,15 @@ def runtime_probe(database_url: str) -> Iterator[Connection]:
     try:
         with engine.begin() as connection:
             definitions = _checks(connection)
-            assert {V41_CHECK, V42_CHECK} <= definitions.keys()
+            assert {V42_CHECK, V43_CHECK} <= definitions.keys()
             connection.execute(text(
-                "CREATE TEMPORARY TABLE v42_runtime_check_probe ON COMMIT DROP AS "
+                "CREATE TEMPORARY TABLE v43_runtime_check_probe ON COMMIT DROP AS "
                 "SELECT config_json, evidence_mode FROM quantlab.strategy_versions WITH NO DATA"
             ))
-            for name in (V41_CHECK, V42_CHECK):
+            for name in (V42_CHECK, V43_CHECK):
                 # Both names are constants; each expression comes from this test DB's catalog.
                 connection.execute(text(
-                    f"ALTER TABLE pg_temp.v42_runtime_check_probe "
+                    f"ALTER TABLE pg_temp.v43_runtime_check_probe "
                     f"ADD CONSTRAINT {name} {definitions[name]}"
                 ))
             yield connection
@@ -64,7 +64,7 @@ def runtime_probe(database_url: str) -> Iterator[Connection]:
 
 
 def _config(recipe_id: str, *, historical: bool = False) -> dict[str, Any]:
-    prefix = "STRATEGY_RESEARCH_V41_TARGET_" if historical else "STRATEGY_RESEARCH_V42_TARGET_"
+    prefix = "STRATEGY_RESEARCH_V42_TARGET_" if historical else "STRATEGY_RESEARCH_TARGET_"
     return {
         "recipe_id": recipe_id,
         "recipe_version": getattr(runtime, prefix + "RECIPE_VERSION"),
@@ -78,7 +78,7 @@ def _config(recipe_id: str, *, historical: bool = False) -> dict[str, Any]:
 
 def _insert(connection: Connection, config: dict[str, Any], mode: str | None) -> None:
     connection.execute(text(
-        "INSERT INTO pg_temp.v42_runtime_check_probe (config_json, evidence_mode) "
+        "INSERT INTO pg_temp.v43_runtime_check_probe (config_json, evidence_mode) "
         "VALUES (CAST(:config AS jsonb), :mode)"
     ), {"config": json.dumps(config), "mode": mode})
 
@@ -90,20 +90,20 @@ def test_migrated_checks_admit_all_current_and_historical_recipes(
         for historical in (False, True):
             _insert(runtime_probe, _config(recipe_id, historical=historical), "sealed_final_oos")
     assert runtime_probe.execute(text(
-        "SELECT count(*) FROM pg_temp.v42_runtime_check_probe"
+        "SELECT count(*) FROM pg_temp.v43_runtime_check_probe"
     )).scalar_one() == 6
     assert runtime_probe.execute(text(
-        "SELECT count(*) FROM pg_temp.v42_runtime_check_probe "
+        "SELECT count(*) FROM pg_temp.v43_runtime_check_probe "
         "WHERE config_json ->> 'recipe_version' = :version "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         "'target_runtime_bundle_sha256' = :bundle"
     ), {
-        "version": runtime.STRATEGY_RESEARCH_V41_TARGET_RECIPE_VERSION,
-        "bundle": runtime.STRATEGY_RESEARCH_V41_TARGET_RUNTIME_BUNDLE_SHA256,
+        "version": runtime.STRATEGY_RESEARCH_V42_TARGET_RECIPE_VERSION,
+        "bundle": runtime.STRATEGY_RESEARCH_V42_TARGET_RUNTIME_BUNDLE_SHA256,
     }).scalar_one() == 3
 
 
-def test_migrated_v42_check_rejects_incomplete_or_mismatched_identity(
+def test_migrated_v43_check_rejects_incomplete_or_mismatched_identity(
     runtime_probe: Connection,
 ) -> None:
     for recipe_id in RECIPES:
@@ -127,9 +127,9 @@ def test_migrated_v42_check_rejects_incomplete_or_mismatched_identity(
                 cases.append((f"{field}: {replacement}", invalid, "sealed_final_oos"))
         old_bundle = deepcopy(valid)
         old_bundle["transparent_baseline_bootstrap"]["target_runtime_bundle_sha256"] = (
-            runtime.STRATEGY_RESEARCH_V41_TARGET_RUNTIME_BUNDLE_SHA256
+            runtime.STRATEGY_RESEARCH_V42_TARGET_RUNTIME_BUNDLE_SHA256
         )
-        cases.append(("old v41 bundle", old_bundle, "sealed_final_oos"))
+        cases.append(("old v42 bundle", old_bundle, "sealed_final_oos"))
         unaccepted_candidate = deepcopy(valid)
         unaccepted_candidate["transparent_baseline_bootstrap"].update({
             "target_runner_sha256":
@@ -137,7 +137,7 @@ def test_migrated_v42_check_rejects_incomplete_or_mismatched_identity(
             "target_runtime_bundle_sha256":
                 "43951d567fa610b8deed4ba4fec31716b0c7a1c7b9537ad37e5a9087ff1a4ec7",
         })
-        cases.append(("unaccepted v42 candidate", unaccepted_candidate, "sealed_final_oos"))
+        cases.append(("unaccepted v43 candidate", unaccepted_candidate, "sealed_final_oos"))
         factor_candidate = deepcopy(valid)
         factor_candidate["transparent_baseline_bootstrap"].update({
             "target_runner_sha256":
@@ -169,32 +169,31 @@ def test_migrated_v42_check_rejects_incomplete_or_mismatched_identity(
             with pytest.raises(IntegrityError) as rejected, runtime_probe.begin_nested():
                 _insert(runtime_probe, config, mode)
             assert rejected.value.orig.sqlstate == "23514", (recipe_id, label)
-            assert rejected.value.orig.diag.constraint_name == V42_CHECK, (recipe_id, label)
+            assert rejected.value.orig.diag.constraint_name == V43_CHECK, (recipe_id, label)
     assert runtime_probe.execute(text(
-        "SELECT count(*) FROM pg_temp.v42_runtime_check_probe"
+        "SELECT count(*) FROM pg_temp.v43_runtime_check_probe"
     )).scalar_one() == 0
 
 
-def test_v42_real_migration_roundtrip_preserves_all_historical_checks(
+def test_v43_real_migration_roundtrip_preserves_all_historical_checks(
     database_url: str,
 ) -> None:
     engine = open_database(database_url)
     config = alembic_config(database_url)
     try:
-        command.downgrade(config, HEAD)
         with engine.connect() as connection:
             assert _head(connection) == HEAD
             before = _checks(connection)
-            assert {V41_CHECK, V42_CHECK} <= before.keys()
-        command.downgrade(config, "0113_strategy_runtime_v41")
+            assert {V42_CHECK, V43_CHECK} <= before.keys()
+        command.downgrade(config, "0114_strategy_runtime_v42")
         with engine.connect() as connection:
-            assert _head(connection) == "0113_strategy_runtime_v41"
+            assert _head(connection) == "0114_strategy_runtime_v42"
             after_downgrade = _checks(connection)
             assert after_downgrade == {
-                name: definition for name, definition in before.items() if name != V42_CHECK
+                name: definition for name, definition in before.items() if name != V43_CHECK
             }
-            assert after_downgrade[V41_CHECK].encode() == before[V41_CHECK].encode()
-        command.upgrade(config, HEAD)
+            assert after_downgrade[V42_CHECK].encode() == before[V42_CHECK].encode()
+        command.upgrade(config, "head")
         with engine.connect() as connection:
             assert _head(connection) == HEAD
             assert _checks(connection) == before

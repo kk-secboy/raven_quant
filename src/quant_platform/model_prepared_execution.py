@@ -8,13 +8,13 @@ import os
 import re
 import shutil
 import subprocess
-import time
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from .model_compute_policy import governed_cell_resource_allocation, model_thread_environment
 from .model_data_request import file_digest, prepared_data_request
+from .model_execution_monitor import ModelExecutionMonitor
 from .model_prepared_cache import prepared_data_cache
 from .model_prepared_data import canonical_key, manifest_sha256
 
@@ -166,26 +166,32 @@ def _producer_progress_audit(path: Path, *, exit_code: int | None) -> dict:
     return result
 
 
-@contextmanager
-def _cache_with_deadline(*, command: list[str], timeout_seconds: int, **kwargs):
-    try:
-        with prepared_data_cache(**kwargs) as prepared:
-            yield prepared
-    except TimeoutError as exc:
-        raise subprocess.TimeoutExpired(command, timeout_seconds) from exc
-
-
 def run_with_prepared_data(
     *, command: list[str], workspace: Path, provider: Path, runner_path: Path,
-    manifest: dict[str, Any], timeout_seconds: int,
+    manifest: dict[str, Any], timeout_seconds: int | None,
 ) -> subprocess.CompletedProcess:
-    """One deadline covers cache preparation and fitting; scientific budgets stay fixed.
+    """Observe cache preparation and fitting without a wall-clock deadline.
+
+    The legacy timeout argument is intentionally not a stopping condition.
+    Scientific budgets and CPU/memory isolation stay fixed.
 
     Only this controller can write the cache. The producer sees no candidate code;
     the model sees only its entry and lease, both read-only. Entry hashes are cell
     evidence, never part of the shared execution-environment identity.
     """
-    started = time.monotonic()
+    with ModelExecutionMonitor(workspace) as monitor:
+        result = _run_with_prepared_data(
+            command=command, workspace=workspace, provider=provider,
+            runner_path=runner_path, manifest=manifest, monitor=monitor,
+        )
+        monitor.finish("completed" if result.returncode == 0 else "failed")
+        return result
+
+
+def _run_with_prepared_data(
+    *, command: list[str], workspace: Path, provider: Path, runner_path: Path,
+    manifest: dict[str, Any], monitor: ModelExecutionMonitor,
+) -> subprocess.CompletedProcess:
     environment = manifest["execution_environment"]
     identity = environment["prepared_data_producer"]
     image = environment["sandbox_image"]
@@ -221,13 +227,8 @@ def run_with_prepared_data(
 
     persist_binding()
 
-    def remaining() -> float:
-        seconds = timeout_seconds - (time.monotonic() - started)
-        if seconds <= 0:
-            raise subprocess.TimeoutExpired(command, timeout_seconds)
-        return seconds
-
     def build(destination: Path) -> None:
+        monitor.set_phase("preparing_data")
         producer_dir.mkdir()
         audit_dir = producer_dir / "audit"
         audit_dir.mkdir(mode=0o777)
@@ -295,7 +296,7 @@ def run_with_prepared_data(
 
         try:
             completed = subprocess.run(producer_command, capture_output=True, text=True,
-                                       timeout=remaining(), check=False)
+                                       timeout=None, check=False)
         except BaseException as exc:
             _stop_container(cidfile)
             preserve_logs(
@@ -329,9 +330,8 @@ def run_with_prepared_data(
             message = (completed.stderr or completed.stdout)[-4000:]
             raise PreparedDataBuildError(completed.returncode, message)
 
-    with _cache_with_deadline(
-        command=command, timeout_seconds=timeout_seconds,
-        cache_root=cache_root, contract=request, build=build, deadline=started + timeout_seconds,
+    with prepared_data_cache(
+        cache_root=cache_root, contract=request, build=build, deadline=None,
     ) as prepared:
         run_command = list(command)
         binding["mode"] = "uncached_capacity" if prepared is None else "prepared_readonly"
@@ -354,9 +354,10 @@ def run_with_prepared_data(
                 "--mount", f"type=bind,src={prepared['lease_path']},dst=/prepared.lease,readonly",
             ]
         persist_binding()
+        monitor.set_phase("model_compute")
         try:
             completed = subprocess.run(run_command, capture_output=True, text=True,
-                                       timeout=remaining(), check=False)
+                                       timeout=None, check=False)
         except BaseException:
             _stop_container(workspace / "container.cid")
             raise

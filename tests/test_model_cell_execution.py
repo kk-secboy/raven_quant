@@ -183,7 +183,8 @@ def test_output_namespace_is_stable_only_inside_one_job(tmp_path):
         execution.model_cell_store_root(tmp_path / "result.json")
 
 
-def test_scheduler_parallel_budget_and_deterministic_output(cell, monkeypatch):
+@pytest.mark.parametrize("progress_failure", [None, "broken_publisher", "write_denied"])
+def test_scheduler_parallel_budget_and_deterministic_output(cell, monkeypatch, progress_failure):
     batch = execution.ModelCellBatchExecutor(
         store_root=cell.root / "cells", batch_identity=cell.batch,
         control_root=cell.root / "controls",
@@ -225,10 +226,79 @@ def test_scheduler_parallel_budget_and_deterministic_output(cell, monkeypatch):
     monkeypatch.setattr(execution.subprocess, "Popen", Process)
     monkeypatch.setattr(execution, "process_identity", lambda _: None)
     monkeypatch.setattr(execution.time, "sleep", lambda _: None)
+    if progress_failure == "broken_publisher":
+        def broken_progress(*_args):
+            raise ValueError("temporarily malformed observational sidecar")
+        monkeypatch.setattr(batch, "_publish_progress", broken_progress)
+    elif progress_failure == "write_denied":
+        publish = execution.atomic_json
+
+        def denied_progress(path, payload):
+            if path.name == "model-progress.json":
+                raise PermissionError("progress file is unavailable")
+            return publish(path, payload)
+        monkeypatch.setattr(execution, "atomic_json", denied_progress)
     outcomes = batch.run_many(calls)
     assert [item["request"]["manifest"]["seed"] for item in outcomes] == [0, 1, 2, 3]
     assert max(event[2] for event in events) == 2
     assert ("start", 2, 1) in events and ("start", 3, 1) in events
+
+
+@pytest.mark.parametrize("sidecar", [
+    "absent", "invalid_active", "outside_workspace", "invalid_json", "wrong_contract",
+    "invalid_warnings", "valid",
+])
+def test_batch_progress_is_observation_only_and_isolates_bad_cells(cell, sidecar):
+    batch = execution.ModelCellBatchExecutor(
+        store_root=cell.root / "cells", batch_identity=cell.batch,
+        control_root=cell.root / "controls",
+    )
+    active = {}
+    for index in range(2):
+        directory = cell.root / f"control-{index}"
+        workspace = batch.store.root / f"work-{index}"
+        directory.mkdir()
+        workspace.mkdir()
+        active[index] = (None, directory, None)
+        atomic_json(directory / "active.json", {"workspace": str(workspace)})
+        progress = {
+            "contract_version": "model-execution-progress-v1-observe-only",
+            "warnings": ["progress_not_observed"],
+            "seconds_without_observed_progress": 9000,
+            "automatic_termination": False,
+        }
+        if index == 0:
+            if sidecar == "absent":
+                continue
+            if sidecar == "invalid_active":
+                (directory / "active.json").write_text("{")
+                continue
+            if sidecar == "outside_workspace":
+                atomic_json(directory / "active.json", {"workspace": str(cell.root)})
+                continue
+            if sidecar == "invalid_json":
+                (workspace / "execution-progress.json").write_text("{")
+                continue
+            if sidecar == "wrong_contract":
+                progress["contract_version"] = "bad-contract"
+            if sidecar == "invalid_warnings":
+                progress["warnings"] = [{}]
+        atomic_json(workspace / "execution-progress.json", progress)
+    calls = [cell.call, cell.call]
+    batch._publish_progress(calls, active, {})
+    first = read_json(cell.root / "model-progress.json")
+    batch._publish_progress(calls, active, {})
+    second = read_json(cell.root / "model-progress.json")
+    assert second["status"] == "running"
+    assert second["automatic_termination"] is False
+    assert second["completed_cells"] == 0
+    assert second["active_cells"][1]["observation_status"] == "available"
+    assert second["active_cells"][1]["progress"]["seconds_without_observed_progress"] == 9000
+    assert first["active_cells"] == second["active_cells"]  # Heartbeat is not computation.
+    expected = "available" if sidecar == "valid" else (
+        "not_yet_available" if sidecar == "absent" else "unavailable"
+    )
+    assert second["active_cells"][0]["observation_status"] == expected
 
 
 def test_cleanup_requires_container_mount_ownership(tmp_path, monkeypatch):
