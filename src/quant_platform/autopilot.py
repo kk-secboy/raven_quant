@@ -34,6 +34,11 @@ from .autopilot_completion import aggregate_pre_final_grid
 from .factor_autopilot import FactorAutopilotService
 from .factor_library_store import FactorLibraryStore
 from .feature_set_registry import get_feature_set
+from .fin_quant_handoff_recovery import (
+    RECOVERY_KEY,
+    FinQuantHandoffRecovery,
+    require_recovery_lineage,
+)
 from .horizon_factor_bundle import (
     build_horizon_factor_bundle,
     validate_horizon_factor_bundle,
@@ -644,6 +649,7 @@ def _prediction_champion_identity_error(
 
 def _joint_completion_verified(
     cycle: dict[str, Any], tournament: dict[str, Any] | None,
+    source_cycle: dict[str, Any] | None = None,
 ) -> bool:
     """Consume the controller's frozen selection, without reclassifying trials.
 
@@ -654,6 +660,13 @@ def _joint_completion_verified(
     if tournament is None:
         return False
     state = dict(cycle.get("state") or {})
+    tournament_owner = str(cycle.get("id") or "")
+    if RECOVERY_KEY in state:
+        try:
+            lineage = require_recovery_lineage(cycle, tournament, source_cycle)
+        except (KeyError, TypeError, ValueError):
+            return False
+        tournament_owner = lineage["source_cycle_id"]
     identity = str(cycle.get("dataset_identity_sha256") or "")
     if _prediction_champion_identity_error(
         cycle, {"provenance": {"dataset_identity_sha256": identity}}
@@ -663,7 +676,7 @@ def _joint_completion_verified(
     if (
         not tournament_id
         or str(tournament.get("id") or "") != tournament_id
-        or str(tournament.get("cycle_id") or "") != str(cycle.get("id") or "")
+        or str(tournament.get("cycle_id") or "") != tournament_owner
         or tournament.get("dataset_identity_sha256") != identity
         or tournament.get("status") != "succeeded"
         or not tournament.get("finished_at")
@@ -1463,10 +1476,30 @@ class AutopilotStore:
                     if tournament_row is not None
                     else None
                 )
+                recovery_source = None
+                if RECOVERY_KEY in dict(cycle.state_json or {}):
+                    from types import SimpleNamespace
+
+                    recovery = FinQuantHandoffRecovery(
+                        SimpleNamespace(settings=Settings.from_env())
+                    )
+                    try:
+                        recovery_source = recovery.verify(
+                            {**row_dict(cycle), "state": dict(cycle.state_json or {})},
+                            connection=connection,
+                        )["source"]
+                    except (KeyError, ValueError) as exc:
+                        connection.execute(update(autopilot_cycles)
+                            .where(autopilot_cycles.c.id == cycle.id).values(
+                                status="blocked", stage="research_blocked", error=str(exc),
+                                updated_at=now, finished_at=now,
+                            ))
+                        continue
                 resolution = _cycle_terminal_resolution(
                     branch_states,
                     joint_completion_verified=_joint_completion_verified(
-                        {**row_dict(cycle), "state": dict(cycle.state_json or {})}, tournament
+                        {**row_dict(cycle), "state": dict(cycle.state_json or {})}, tournament,
+                        recovery_source,
                     ),
                 )
                 if resolution is not None:
@@ -1675,6 +1708,10 @@ class AutopilotController:
             for item in list_qlib_datasets(self.settings.data_root)
         }
         listed_cycles = self.store.list_cycles(limit=500)
+        if self._handoff_recovery_completion_pending(listed_cycles, horizon_profile):
+            # Scheduler dispatches managed completion immediately after this
+            # tick. Do not let a newer publication claim its horizon first.
+            return {"cycles": 0, "branches": 0, "failed": 0}
         manual_owners = [
             item for item in listed_cycles
             if item.get("horizon_profile") == horizon_profile
@@ -1812,6 +1849,8 @@ class AutopilotController:
                 "branches": created,
                 "failed": failed + int(cycle.get("status") == "blocked"),
             }
+        if RECOVERY_KEY in (cycle.get("state") or {}):
+            return self._tick_handoff_recovery(cycle, dataset, config, current)
         cycle = self.store.get_cycle(str(cycle["id"]))
         research_already_started = bool(cycle.get("branches")) or bool(
             (cycle.get("state") or {}).get("research_tournament_id")
@@ -2237,12 +2276,87 @@ class AutopilotController:
         return self.store.retry_failed_branch(branch_id, actor="autopilot")
 
     def _active_model_tournament(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        recovery = (cycle.get("state") or {}).get(RECOVERY_KEY)
+        if recovery is not None:
+            return FinQuantHandoffRecovery(self).verify(cycle)["tournament"]
         tournament_id = str(
             (cycle.get("state") or {}).get("active_research_tournament_id") or ""
         )
         if tournament_id:
             return self.tournaments.get_tournament(tournament_id)
         return self.tournaments.get_for_cycle(str(cycle["id"]))
+
+    def _tick_handoff_recovery(
+        self, cycle: dict[str, Any], dataset: dict[str, Any],
+        config: dict[str, Any], current: datetime,
+    ) -> dict[str, int]:
+        """Continue a sealed competition at the first unexecuted research stage."""
+        try:
+            tournament = self._active_model_tournament(cycle)
+            source = self.store.get_cycle(cycle["state"][RECOVERY_KEY]["source_cycle_id"])
+            if not _joint_completion_verified(cycle, tournament, source):
+                raise ValueError("handoff recovery model selection is no longer valid")
+            branch = self.store.branch_for_scope(cycle["id"], "fin_quant", "joint")
+            if branch is not None:
+                # The ordinary reconciliation/worker paths settle the new
+                # branch. No old attempt, failed row or tournament is retried.
+                return {"cycles": 1, "branches": 0, "failed": 0}
+            input_sha256 = self._quant_input_sha256(cycle, dataset)
+            if not self._quant_due(cycle, dataset, current, config, input_sha256=input_sha256):
+                raise ValueError("handoff recovery incumbent admission is not ready")
+            champion = cycle["state"]["prediction_champion"]
+            self._enqueue(
+                cycle, dataset, "fin_quant", "joint", config=config,
+                feature_set_id=champion["primary_feature_set_id"],
+                tournament_id=tournament["id"],
+                branch_details={
+                    "quant_input_sha256": input_sha256,
+                    "model_champion_feature_set_id": champion["primary_feature_set_id"],
+                    "prediction_champion_kind": champion["kind"],
+                    "prediction_champion_id": champion["candidate_id"],
+                    "prediction_champion_primary_model_candidate_id":
+                        champion.get("primary_model_candidate_id"),
+                    "prediction_champion": champion,
+                    "prediction_champion_evidence": cycle["state"]["prediction_champion_evidence"],
+                    "handoff_recovery_sha256": cycle["state"][RECOVERY_KEY]["sha256"],
+                },
+            )
+            return {"cycles": 1, "branches": 1, "failed": 0}
+        except (KeyError, ValueError) as exc:
+            self.store.set_cycle_state(
+                cycle["id"], state=cycle["state"], stage="research_blocked", status="blocked",
+                error=str(exc), finished=True,
+            )
+            return {"cycles": 1, "branches": 0, "failed": 1}
+
+    def _handoff_recovery_completion_pending(
+        self, cycles: list[dict[str, Any]], horizon_profile: str,
+    ) -> bool:
+        recovered = {item["id"] for item in cycles
+                     if item.get("horizon_profile") == horizon_profile
+                     and item.get("status") == "succeeded"
+                     and item.get("stage") == "research_complete"
+                     and RECOVERY_KEY in (item.get("state") or {})}
+        if not recovered:
+            return False
+        from .fin_strategy_research_completion import ManagedResearchCompletion
+
+        completion = object.__new__(ManagedResearchCompletion)
+        completion.engine = self.engine
+        return bool(recovered.intersection(completion.pending_cycle_ids())) or (
+            self._handoff_recovery_dispatch_inflight(recovered)
+        )
+
+    def _handoff_recovery_dispatch_inflight(self, recovered: set[str]) -> bool:
+        from quant_data.database import schedule_runs, schedules
+
+        from .fin_strategy_research_completion import COMPLETION_NAME_PREFIX
+
+        with self.engine.connect() as connection:
+            return connection.scalar(select(schedule_runs.c.id).join(schedules).where(
+                schedules.c.name.in_([COMPLETION_NAME_PREFIX + cid for cid in recovered]),
+                schedule_runs.c.status.in_(("queued", "running")),
+            ).limit(1)) is not None
 
     @staticmethod
     def _operational_trial_ids(tournament: dict[str, Any]) -> set[str]:

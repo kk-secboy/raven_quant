@@ -47,6 +47,14 @@ def main() -> None:
     )
     parser.add_argument("--report", type=Path)
     parser.add_argument(
+        "--preserve-model-sandbox-image",
+        help="Reuse an existing digest-pinned model image only after exact numeric-source checks",
+    )
+    parser.add_argument(
+        "--preserve-model-sandbox-image-id",
+        help="Expected immutable image ID already present in the target private Docker daemon",
+    )
+    parser.add_argument(
         "--stable-release-link",
         type=Path,
         default=Path("/opt/quantlab"),
@@ -79,6 +87,8 @@ def main() -> None:
         stable_release_link=(
             None if args.skip_stable_link else args.stable_release_link
         ),
+        preserve_model_sandbox_image=args.preserve_model_sandbox_image,
+        preserve_model_sandbox_image_id=args.preserve_model_sandbox_image_id,
     )
     output = json.dumps(result, ensure_ascii=False, indent=2)
     report = args.report

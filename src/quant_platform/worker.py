@@ -90,11 +90,15 @@ from .model_cell_recovery import (
 )
 from .model_cell_store import _regular as _safe_model_progress_path
 from .model_research_governance import canonical_sha256 as model_canonical_sha256
-from .model_research_governance import model_metric_report
+from .model_research_governance import model_metric_report, resolve_model_label_contract
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
 from .news_flash_factors import default_factors_dir as news_flash_factors_dir
 from .ops_calendar import load_calendar_days
 from .parameter_experiment_store import ParameterExperimentStore
+from .prediction_label_binding import (
+    BASELINE_LABEL_BINDING_VERSION,
+    require_compatible_prediction_label_binding,
+)
 from .promotion import PromotionStore
 from .rdagent_candidate_store import RDAGentCandidateStore
 from .rdagent_dataset_view import isolate_rdagent_periods
@@ -4651,7 +4655,11 @@ class LocalJobWorker:
         )
         label_binding = resolve_research_label_binding(payload)
         if label_binding is not None:
-            self._require_prediction_label_matches_binding(frozen, label_binding)
+            self._require_prediction_label_matches_binding(
+                frozen,
+                label_binding,
+                primary_model_candidate_id=str(champion.get("primary_model_candidate_id") or ""),
+            )
         if (
             str(champion.get("kind") or "") != str(frozen["kind"])
             or str(champion.get("candidate_id") or "")
@@ -4672,44 +4680,83 @@ class LocalJobWorker:
 
     @staticmethod
     def _require_prediction_label_matches_binding(
-        frozen_prediction: dict[str, Any], label_binding: dict[str, Any]
+        frozen_prediction: dict[str, Any],
+        label_binding: dict[str, Any],
+        *,
+        primary_model_candidate_id: str = "",
     ) -> None:
-        """Reject a fin_quant incumbent evaluated on another return horizon."""
+        """Verify every incumbent cell against its unchanged source binding."""
 
-        grids: list[dict[str, Any]] = []
+        if frozen_prediction.get("source_label_binding_contract_version") != (
+            BASELINE_LABEL_BINDING_VERSION
+        ):
+            raise ValueError("fin_quant incumbent has no versioned source label binding")
+        target = validate_research_label_binding(label_binding)
+        is_ensemble = frozen_prediction.get("kind") == "ensemble"
         if frozen_prediction.get("kind") == "model":
-            grids.append(dict(frozen_prediction.get("profiles") or {}))
-        elif frozen_prediction.get("kind") == "ensemble":
-            grids.extend(
-                dict(component.get("profiles") or {})
-                for component in frozen_prediction.get("components") or []
-                if isinstance(component, dict)
-            )
-        if not grids:
+            members = [frozen_prediction]
+        elif is_ensemble:
+            members = frozen_prediction.get("components")
+            if (
+                not isinstance(members, list)
+                or not members
+                or any(not isinstance(member, dict) for member in members)
+            ):
+                raise ValueError("fin_quant incumbent has no frozen model label grid")
+            member_ids = [str(member.get("model_candidate_id") or "") for member in members]
+            if (
+                any(not member_id for member_id in member_ids)
+                or len(set(member_ids)) != len(member_ids)
+                or primary_model_candidate_id not in member_ids
+            ):
+                raise ValueError("fin_quant incumbent ensemble primary member is invalid")
+        else:
             raise ValueError("fin_quant incumbent has no frozen model label grid")
-        expected_fields = {
-            "horizon_profile": label_binding["horizon_profile"],
-            "legacy": False,
-            "allowed_label_horizons_sessions": label_binding[
-                "allowed_label_horizons_sessions"
-            ],
-            "label_horizon_sessions": label_binding["label_horizon_sessions"],
-            "label_reference_offset_sessions": label_binding[
-                "label_reference_offset_sessions"
-            ],
-            "label_expression": label_binding["label_expression"],
-            "purge_sessions": label_binding["purge_sessions"],
-            "embargo_sessions": label_binding["embargo_sessions"],
-            "research_window_contract_sha256": label_binding[
-                "research_window_contract_sha256"
-            ],
-        }
-        observed = 0
-        for profiles in grids:
+        if (
+            frozen_prediction.get("dataset") != target["dataset_name"]
+            or frozen_prediction.get("dataset_identity_sha256")
+            != target["dataset_identity_sha256"]
+        ):
+            raise ValueError("fin_quant incumbent label binding uses another dataset")
+        for member in members:
+            raw_binding = member.get("research_label_binding")
+            if not isinstance(raw_binding, dict):
+                raise ValueError("fin_quant incumbent has no frozen source label binding")
+            source = require_compatible_prediction_label_binding(
+                raw_binding,
+                target,
+                allow_different_features=is_ensemble,
+            )
+            if (
+                member.get("research_label_binding_sha256") != source["binding_sha256"]
+                or member.get("feature_set_id") != source["feature_set_id"]
+                or member.get("feature_set_definition_sha256") != source["feature_set_sha256"]
+            ):
+                raise ValueError("fin_quant incumbent source label binding identity changed")
+            if (
+                is_ensemble
+                and member["model_candidate_id"] == primary_model_candidate_id
+                and (
+                    source["feature_set_id"] != target["feature_set_id"]
+                    or source["feature_set_sha256"] != target["feature_set_sha256"]
+                )
+            ):
+                raise ValueError("fin_quant incumbent primary feature set differs from research")
+            expected_contract = resolve_model_label_contract(
+                research_window_contract=source["research_window_contract"],
+                research_window_contract_sha256=source["research_window_contract_sha256"],
+                label_horizon_sessions=source["label_horizon_sessions"],
+            )
+            profiles = member.get("profiles")
+            if not isinstance(profiles, dict) or not profiles:
+                raise ValueError("fin_quant incumbent has no frozen model label grid")
             for profile in profiles.values():
                 if not isinstance(profile, dict):
                     raise ValueError("fin_quant incumbent model profile is malformed")
-                for cell in (profile.get("seeds") or {}).values():
+                seeds = profile.get("seeds")
+                if not isinstance(seeds, dict) or not seeds:
+                    raise ValueError("fin_quant incumbent has no frozen model label evidence")
+                for cell in seeds.values():
                     if not isinstance(cell, dict):
                         raise ValueError("fin_quant incumbent model seed is malformed")
                     contract = cell.get("model_label_contract")
@@ -4717,21 +4764,67 @@ class LocalJobWorker:
                     if (
                         not isinstance(contract, dict)
                         or model_canonical_sha256(contract) != digest
-                        or any(
-                            contract.get(key) != value
-                            for key, value in expected_fields.items()
-                        )
+                        or contract != expected_contract
                     ):
                         raise ValueError(
-                            "fin_quant incumbent prediction uses another label horizon"
+                            "fin_quant incumbent prediction uses another label horizon "
+                            "or changed source evidence"
                         )
-                    observed += 1
-        if observed == 0:
-            raise ValueError("fin_quant incumbent has no frozen model label evidence")
+
+    def _quant_preregistration_research_run_id(self, job: dict) -> str:
+        """Bind quant output ownership before registering any new candidates."""
+        from types import SimpleNamespace
+
+        from .autopilot import AutopilotStore
+        from .fin_quant_handoff_recovery import RECOVERY_KEY, FinQuantHandoffRecovery
+
+        payload = job["payload"]
+        run_id = str(payload.get("research_run_id") or "")
+        parent_id = str(payload.get("research_tournament_id") or "")
+        if not run_id or not parent_id:
+            raise ValueError(
+                "fin_quant evaluation has no research owner or model-tournament parent"
+            )
+        run = self.research.get_run(run_id)
+        config = dict(run.get("config") or {})
+        cycle_id = str(config.get("autopilot_cycle_id") or "")
+        if (
+            run.get("id") != run_id or run.get("job_id") != job.get("id")
+            or not cycle_id or config.get("research_tournament_id") != parent_id
+            or config.get("dataset_identity_sha256") != payload.get("dataset_identity_sha256")
+        ):
+            raise ValueError("fin_quant research run, executing job or frozen owner differs")
+        parent = self.research_tournaments.get_tournament(parent_id)
+        if str(parent.get("cycle_id") or "") == cycle_id:
+            return run_id
+        store = object.__new__(AutopilotStore)
+        store.engine = self.research.engine
+        cycle = store.get_cycle(cycle_id)
+        recovery = FinQuantHandoffRecovery(SimpleNamespace(
+            settings=self.settings, engine=self.research.engine,
+        ))
+        evidence = recovery.verify(cycle)
+        lineage = (cycle.get("state") or {}).get(RECOVERY_KEY) or {}
+        branches = [branch for branch in cycle.get("branches", [])
+                    if branch.get("scenario") == "fin_quant" and branch.get("scope_key") == "joint"]
+        if (
+            cycle.get("status") != "active" or cycle.get("finished_at") is not None
+            or len(branches) != 1 or branches[0].get("research_run_id") != run_id
+            or branches[0].get("job_id") != job.get("id")
+            or lineage.get("source_tournament_id") != parent_id
+            or evidence["tournament"].get("id") != parent_id
+            or cycle.get("dataset_identity_sha256") != payload.get("dataset_identity_sha256")
+            or any(config.get(key) != cycle["state"].get(key)
+                   or payload.get(key) != cycle["state"].get(key)
+                   for key in ("prediction_champion", "prediction_champion_evidence"))
+        ):
+            raise ValueError("fin_quant recovery output does not belong to its verified successor")
+        return run_id
 
     def _queue_quant_bundle_evaluation(self, job: dict, result: dict) -> int:
         _validate_fin_quant_research_result(result)
         payload = job["payload"]
+        research_run_id = self._quant_preregistration_research_run_id(job)
         feature_set = payload.get("feature_set") or {}
         periods = payload.get("periods") or {}
         label_binding = resolve_research_label_binding(payload)
@@ -4971,6 +5064,7 @@ class LocalJobWorker:
             dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
             baseline_prediction_champion=baseline,
             candidates=preregistration_candidates,
+            research_run_id=research_run_id,
         )
         trial_ids = {
             str(item["candidate_id"]): str(item["id"])

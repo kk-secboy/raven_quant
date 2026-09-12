@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.dialects import postgresql
 
 from quant_data.config import Settings
+from quant_data.database import schedules
 from quant_platform.feature_set_registry import get_feature_set
 from quant_platform.fin_strategy_schedule import (
     LATEST_REPRODUCIBLE_DAILY_DATASET,
@@ -364,6 +366,106 @@ def test_managed_schedule_reconcile_is_database_idempotent(database_url: str) ->
         validate_managed_fin_strategy_payload(item["payload"]) is not None
         for item in second
     )
+
+
+def test_managed_reconcile_preserves_operator_pause_after_one_hour(database_url: str) -> None:
+    store = ScheduleStore(database_url)
+    current = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    original = reconcile_managed_fin_strategy_schedules(store, enabled=True, now=current)
+    paused = store.set_status(original[0]["id"], "paused", now=current)
+
+    reconciled = reconcile_managed_fin_strategy_schedules(
+        store, enabled=True, now=current + timedelta(hours=1),
+    )
+
+    assert store.get(paused["id"]) == paused
+    assert sum(row["status"] == "active" for row in reconciled) == 2
+
+
+def test_managed_global_disable_preserves_intent_for_reenable(database_url: str) -> None:
+    store = ScheduleStore(database_url)
+    current = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    original = reconcile_managed_fin_strategy_schedules(store, enabled=True, now=current)
+    paused_id = original[0]["id"]
+    store.set_status(paused_id, "paused", now=current)
+
+    disabled = reconcile_managed_fin_strategy_schedules(
+        store, enabled=False, now=current + timedelta(hours=1),
+    )
+    assert all(row["status"] == "paused" for row in disabled)
+    assert all(row["desired_status"] == ("paused" if row["id"] == paused_id else "active")
+               for row in disabled)
+
+    enabled = reconcile_managed_fin_strategy_schedules(
+        store, enabled=True, now=current + timedelta(hours=2),
+    )
+    assert all(row["status"] == row["desired_status"]
+               == ("paused" if row["id"] == paused_id else "active") for row in enabled)
+
+
+@pytest.mark.parametrize("desired_status", ["active", "paused"])
+def test_managed_reconcile_preserves_governance_suspension(
+    database_url: str, desired_status: str,
+) -> None:
+    store = ScheduleStore(database_url)
+    current = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    original = reconcile_managed_fin_strategy_schedules(store, enabled=True, now=current)[0]
+    reason = "governance review required"
+    with store.engine.begin() as connection:
+        connection.execute(update(schedules).where(schedules.c.id == original["id"]).values(
+            status="paused", desired_status=desired_status, suspension_reason=reason,
+        ))
+
+    for index, enabled in enumerate((True, False, True), start=1):
+        reconcile_managed_fin_strategy_schedules(
+            store, enabled=enabled, now=current + timedelta(hours=index),
+        )
+        observed = store.get(original["id"])
+        assert observed["status"] == "paused"
+        assert observed["desired_status"] == desired_status
+        assert observed["suspension_reason"] == reason
+
+
+def test_managed_definition_upgrade_preserves_operator_pause(database_url: str) -> None:
+    store = ScheduleStore(database_url)
+    current = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    spec = build_managed_fin_strategy_schedule_specs()[0]
+    previous = deepcopy(spec)
+    previous["payload"]["managed_fin_strategy"]["contract_version"] = "previous-release-v1"
+    original = store.upsert_managed(**previous, enabled=True, actor="test", now=current)
+    store.set_status(original["id"], "paused", now=current)
+
+    observed = store.upsert_managed(
+        **spec, enabled=True, actor="test", now=current + timedelta(hours=1),
+    )
+
+    assert observed["id"] == original["id"]
+    assert observed["payload"] == spec["payload"]
+    assert observed["status"] == observed["desired_status"] == "paused"
+    assert observed["suspension_reason"] is None
+
+
+def test_managed_reconcile_rereads_pause_after_initial_lookup(
+    database_url: str, monkeypatch,
+) -> None:
+    store = ScheduleStore(database_url)
+    current = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    spec = build_managed_fin_strategy_schedule_specs()[0]
+    original = store.upsert_managed(**spec, enabled=True, actor="test", now=current)
+    lookup = store.get_by_name
+
+    def pause_after_lookup(name):
+        stale = lookup(name)
+        store.set_status(original["id"], "paused", now=current + timedelta(minutes=30))
+        return stale
+
+    monkeypatch.setattr(store, "get_by_name", pause_after_lookup)
+    observed = store.upsert_managed(
+        **spec, enabled=True, actor="test", now=current + timedelta(hours=1),
+    )
+
+    assert observed["status"] == observed["desired_status"] == "paused"
+    assert store.get(original["id"]) == observed
 
 
 def test_managed_trigger_consumption_includes_unattached_research_run(

@@ -54,6 +54,12 @@ from .model_research_governance import (
 from .model_research_governance import (
     validate_quant_bundle_evidence as _validate_quant_bundle_evidence,
 )
+from .prediction_label_binding import (
+    BASELINE_LABEL_BINDING_VERSION,
+    LEGACY_BASELINE_LABEL_SHAPE,
+    baseline_label_shape_for_replay,
+    baseline_member_label_shape,
+)
 from .research_execution_cadence import (
     build_research_execution_cadence_contract,
     validate_research_execution_cadence_contract,
@@ -1414,6 +1420,22 @@ class RDAGentCandidateStore:
             != dict(base_features.get("feature_expressions") or {})
         ):
             raise ValueError("fin_quant baseline model feature contract changed")
+        label_binding = manifest.get("research_label_binding")
+        if label_binding is not None:
+            label_binding = validate_research_label_binding(label_binding)
+            if (
+                label_binding["binding_sha256"]
+                != manifest.get("research_label_binding_sha256")
+                or label_binding["dataset_name"] != dataset
+                or label_binding["dataset_identity_sha256"] != dataset_identity_sha256
+                or label_binding["feature_set_id"] != feature_set_id
+                or label_binding["feature_set_sha256"]
+                != feature_set["definition_sha256"]
+                or label_binding["periods"]["valid_end"] != pre_final_end.isoformat()
+                or label_binding["periods"]["test_start"] != final_oos_start.isoformat()
+                or label_binding["periods"]["test_end"] != final_oos_end.isoformat()
+            ):
+                raise ValueError("fin_quant baseline model source label binding changed")
         return {
             "model_candidate_id": candidate_id,
             "candidate_manifest_sha256": str(candidate["manifest_sha256"]),
@@ -1425,6 +1447,10 @@ class RDAGentCandidateStore:
                 candidate["feature_set_definition_sha256"]
             ),
             "feature_set": feature_set,
+            "research_label_binding": label_binding,
+            "research_label_binding_sha256": (
+                label_binding["binding_sha256"] if label_binding is not None else None
+            ),
             "model": {
                 "candidate_id": candidate_id,
                 "code_path": str(artifact.storage_path),
@@ -1451,6 +1477,7 @@ class RDAGentCandidateStore:
         pre_final_end: date,
         final_oos_start: date,
         final_oos_end: date,
+        baseline_label_shape: str = BASELINE_LABEL_BINDING_VERSION,
     ) -> dict[str, Any]:
         """Freeze the incumbent used by fin_quant's factor-only ablation.
 
@@ -1461,6 +1488,10 @@ class RDAGentCandidateStore:
         """
 
         kind = str(candidate_kind or "").strip().lower()
+        if baseline_label_shape not in {
+            BASELINE_LABEL_BINDING_VERSION, LEGACY_BASELINE_LABEL_SHAPE
+        }:
+            raise ValueError("fin_quant baseline label shape is unsupported")
         identity = _sha(dataset_identity_sha256, "dataset identity")
         dataset_name = _nonempty(dataset, "dataset")
         if kind == "model":
@@ -1488,6 +1519,8 @@ class RDAGentCandidateStore:
                     "feature_set_definition_sha256"
                 ],
                 "feature_set": member["feature_set"],
+                "research_label_binding": member["research_label_binding"],
+                "research_label_binding_sha256": member["research_label_binding_sha256"],
                 "model": member["model"],
                 "profiles": member["profiles"],
                 "quant_retraining_supported": True,
@@ -1698,7 +1731,18 @@ class RDAGentCandidateStore:
             }
         else:
             raise ValueError("fin_quant baseline prediction kind is invalid")
+        if baseline_label_shape == LEGACY_BASELINE_LABEL_SHAPE:
+            # Used only when replaying a hash-verified historical envelope.
+            # Do not add new fields to its original evidence identity.
+            members = [frozen] if kind == "model" else frozen["components"]
+            for member in members:
+                member.pop("research_label_binding", None)
+                member.pop("research_label_binding_sha256", None)
+        else:
+            frozen["source_label_binding_contract_version"] = BASELINE_LABEL_BINDING_VERSION
         frozen["evidence_sha256"] = canonical_sha256(frozen)
+        if baseline_label_shape_for_replay(frozen) != baseline_label_shape:
+            raise ValueError("fin_quant baseline label shape is inconsistent")
         return frozen
 
     def record_model_evaluation(
@@ -2396,6 +2440,9 @@ class RDAGentCandidateStore:
                     "combiner": "equal_rank",
                     "stacking": False,
                     "components": list(frozen_ensemble["components"]),
+                    "source_label_binding_contract_version": (
+                        frozen_ensemble["source_label_binding_contract_version"]
+                    ),
                 }
             artifact = self._one(
                 connection, research_run_artifacts, bundle_artifact_id, "bundle artifact"
@@ -2930,6 +2977,7 @@ class RDAGentCandidateStore:
                             pre_final_end=row.pre_final_end,
                             final_oos_start=row.final_oos_start,
                             final_oos_end=row.final_oos_end,
+                            baseline_label_shape=baseline_label_shape_for_replay(frozen_baseline),
                         )
                         selection_sha = str(
                             frozen_baseline.get("selection_evidence_sha256") or ""
@@ -2966,6 +3014,23 @@ class RDAGentCandidateStore:
                         "quant bundle model ensemble",
                     )
                     frozen_ensemble = dict(manifest.get("model_ensemble") or {})
+                    ensemble_label_shape = baseline_member_label_shape(frozen_ensemble)
+                    if ensemble_label_shape == LEGACY_BASELINE_LABEL_SHAPE:
+                        # Preserve the original registry-reference comparison
+                        # for historical non-joint ensemble bundles.
+                        expected_components = list(ensemble.components_json or [])
+                    else:
+                        observed_ensemble = self.freeze_quant_baseline_prediction(
+                            candidate_kind="ensemble",
+                            candidate_id=str(row.model_ensemble_candidate_id),
+                            dataset=str(row.dataset),
+                            dataset_identity_sha256=str(row.dataset_identity_sha256),
+                            pre_final_end=row.pre_final_end,
+                            final_oos_start=row.final_oos_start,
+                            final_oos_end=row.final_oos_end,
+                            baseline_label_shape=ensemble_label_shape,
+                        )
+                        expected_components = list(observed_ensemble["components"])
                     if (
                         str(ensemble.status) != "research_admitted"
                         or str(ensemble.dataset) != str(row.dataset)
@@ -2980,7 +3045,7 @@ class RDAGentCandidateStore:
                         or frozen_ensemble.get("combiner") != "equal_rank"
                         or frozen_ensemble.get("stacking") is not False
                         or list(frozen_ensemble.get("components") or [])
-                        != list(ensemble.components_json or [])
+                        != expected_components
                         or dict(manifest.get("prediction_component") or {})
                         != frozen_ensemble
                     ):

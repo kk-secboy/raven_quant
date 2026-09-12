@@ -366,35 +366,44 @@ class ScheduleStore:
                     if enabled
                     else self.set_status(str(created["id"]), "paused", now=current)
                 )
-        if existing["kind"] != kind:
-            raise ValueError(f"managed schedule {name!r} has an incompatible kind")
-        _require_nonlegacy_research_schedule(
-            payload=existing["payload"],
-            created_by=existing["created_by"],
-            suspension_reason=existing.get("suspension_reason"),
-        )
-        effective_status = "active" if enabled else "paused"
-        unchanged = (
-            existing["timezone"] == timezone
-            and existing["run_time"] == run_time.isoformat(timespec="minutes")
-            and bool(existing["trading_days_only"]) == trading_days_only
-            and existing["payload"] == payload
-            and int(existing["misfire_grace_seconds"]) == misfire_grace_seconds
-            and existing["status"] == effective_status
-            and existing["desired_status"] == effective_status
-            and existing.get("suspension_reason") is None
-        )
-        if unchanged:
-            return existing
-        next_run_at = next_occurrence(current, timezone, run_time)
         with self.engine.begin() as connection:
+            # Re-read operator intent under the same lock used by set_status.
+            # A periodic reconciler must not undo a concurrent pause or release
+            # a governance suspension when refreshing managed definitions.
+            existing = self._schedule_row(connection.execute(
+                select(schedules)
+                .where(schedules.c.id == existing["id"])
+                .with_for_update()
+            ).one())
+            if existing["kind"] != kind:
+                raise ValueError(f"managed schedule {name!r} has an incompatible kind")
+            _require_nonlegacy_research_schedule(
+                payload=existing["payload"],
+                created_by=existing["created_by"],
+                suspension_reason=existing.get("suspension_reason"),
+            )
+            effective_status = (
+                "active"
+                if enabled and existing["desired_status"] == "active"
+                and existing.get("suspension_reason") is None
+                else "paused"
+            )
+            unchanged = (
+                existing["timezone"] == timezone
+                and existing["run_time"] == run_time.isoformat(timespec="minutes")
+                and bool(existing["trading_days_only"]) == trading_days_only
+                and existing["payload"] == payload
+                and int(existing["misfire_grace_seconds"]) == misfire_grace_seconds
+                and existing["status"] == effective_status
+            )
+            if unchanged:
+                return existing
+            next_run_at = next_occurrence(current, timezone, run_time)
             connection.execute(
                 update(schedules)
                 .where(schedules.c.id == existing["id"])
                 .values(
                     status=effective_status,
-                    desired_status=effective_status,
-                    suspension_reason=None,
                     timezone=timezone,
                     run_time=run_time,
                     trading_days_only=trading_days_only,

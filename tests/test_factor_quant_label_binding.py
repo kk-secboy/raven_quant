@@ -11,6 +11,7 @@ from quant_platform.factor_evaluation_recovery import (
     validate_factor_evaluation_result_contract,
 )
 from quant_platform.model_research_governance import canonical_sha256
+from quant_platform.prediction_label_binding import BASELINE_LABEL_BINDING_VERSION
 from quant_platform.research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
@@ -345,6 +346,13 @@ def _frozen_model_prediction(binding: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "kind": "model",
+        "source_label_binding_contract_version": BASELINE_LABEL_BINDING_VERSION,
+        "dataset": binding["dataset_name"],
+        "dataset_identity_sha256": binding["dataset_identity_sha256"],
+        "feature_set_id": binding["feature_set_id"],
+        "feature_set_definition_sha256": binding["feature_set_sha256"],
+        "research_label_binding": binding,
+        "research_label_binding_sha256": binding["binding_sha256"],
         "profiles": {
             "recent_3y": {
                 "seeds": {

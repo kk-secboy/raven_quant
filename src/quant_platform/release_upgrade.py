@@ -64,6 +64,130 @@ _GOVERNED_SANDBOX_CONTEXTS = {
     "model": "model-sandbox",
 }
 _ADMISSION_SERVICES = ("gateway", "scheduler", "api")
+_MODEL_REUSE_EXTRA_MODULES = (
+    "qlib_portfolio_calendar.py", "qlib_research_strategy.py", "qlib_workflow.py",
+    "research_execution_cadence.py", "research_horizon.py", "upstream_versions.py",
+)
+_MODEL_REUSE_ENTRYPOINTS = (
+    "scripts/evaluate_model_batch.py", "scripts/model_sandbox_runner.py",
+    "scripts/prepare_model_data.py",
+)
+
+
+def _model_reuse_source_inventory(root: Path) -> dict[str, str]:
+    """Bind numeric execution/preparation and the build inputs of its image.
+
+    The controller and the image are different source views: runner scripts are
+    mounted at execution time, while dependencies survive in site-packages after
+    the sandbox Dockerfile removes /app. Both views must agree before reuse.
+    """
+    from .runtime_source_closure import local_python_source_closure_inventory
+
+    closure = local_python_source_closure_inventory(root, entry_paths=_MODEL_REUSE_ENTRYPOINTS)
+    required = [
+        *(item["path"] for item in closure["inventory"]),
+        *_MODEL_REUSE_ENTRYPOINTS,
+        "pyproject.toml", ".dockerignore", "deploy/Dockerfile.worker",
+        "deploy/Dockerfile.governed-full-source-overlay", "deploy/model-sandbox/Dockerfile",
+        *("src/quant_platform/" + name for name in _MODEL_REUSE_EXTRA_MODULES),
+        "src/quant_platform/model_recompute.py", "src/quant_platform/model_prepared_data.py",
+        "src/quant_platform/model_prepared_execution.py", "src/quant_data/__init__.py",
+    ]
+    files = {root / name for name in required}
+    files.update((root / "src/quant_platform").glob("model_*.py"))
+    files.update((root / "src/quant_data").rglob("*.py"))
+    files.update(path for path in (root / "deploy/model-sandbox").rglob("*") if path.is_file())
+    result = {}
+    for path in sorted(files):
+        if not path.is_file() or path.is_symlink() or not _inside_path(path, root):
+            raise RuntimeError("model sandbox reuse source missing or unsafe: " + str(path))
+        result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def _model_reuse_runtime_probe(sources: dict[str, str], *, installed_only: bool) -> str:
+    expected = {
+        name: digest for name, digest in sources.items()
+        if name.startswith("src/") or (not installed_only and name in _MODEL_REUSE_ENTRYPOINTS)
+    }
+    return "\n".join((
+        "import hashlib, json, sysconfig",
+        "from pathlib import Path",
+        "expected = " + repr(expected),
+        "installed_only = " + repr(installed_only),
+        "purelib = Path(sysconfig.get_paths()['purelib'])",
+        "observed = {}",
+        "for name, want in expected.items():",
+        "    paths = [] if installed_only else [Path('/app') / name]",
+        "    if name.startswith('src/'): paths.append(purelib / name[4:])",
+        "    for path in paths:",
+        "        if not path.is_file() or path.is_symlink(): raise RuntimeError('unsafe: '+name)",
+        "        if hashlib.sha256(path.read_bytes()).hexdigest() != want:",
+        "            raise RuntimeError('model reuse source differs: '+name)",
+        "    observed[name] = want",
+        "print(json.dumps(observed, sort_keys=True))",
+    ))
+
+
+def _assert_model_reuse_image(context: ComposeContext, image: str, image_id: str) -> None:
+    observed = context.run(
+        "exec", "-T", "rdagent-docker", "docker", "image", "inspect", "--format", "{{.Id}}",
+        image, capture=True, timeout=30,
+    ).strip()
+    if observed != image_id:
+        raise RuntimeError("preserved model sandbox is missing or its image ID changed")
+
+
+def _verify_model_reuse_runtime(
+    context: ComposeContext, sources: dict[str, str], image: str, *, live_worker: bool,
+) -> None:
+    installed_only = not live_worker
+    probe = _model_reuse_runtime_probe(sources, installed_only=installed_only)
+    command = (
+        ("exec", "-T", "worker", "python", "-I", "-B", "-c", probe)
+        if live_worker else (
+            "exec", "-T", "rdagent-docker", "docker", "run", "--rm", "--network", "none",
+            "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--memory", "256m", "--cpus", "1", "--pids-limit", "64", "--entrypoint", "python",
+            image, "-I", "-B", "-c", probe,
+        )
+    )
+    expected = {
+        name: digest for name, digest in sources.items()
+        if name.startswith("src/") or (live_worker and name in _MODEL_REUSE_ENTRYPOINTS)
+    }
+    observed = json.loads(context.run(*command, capture=True, timeout=120))
+    if observed != expected:
+        raise RuntimeError("model sandbox reuse source verification returned incomplete evidence")
+
+
+def _verify_model_sandbox_reuse(
+    context: ComposeContext, project_root: Path, baseline_root: Path,
+    image: str, image_id: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image) or not _IMAGE_ID.fullmatch(image_id):
+        raise ValueError("model sandbox reuse requires a digest reference and exact image ID")
+    from dotenv import dotenv_values
+
+    if dotenv_values(context.env_file).get("MODEL_SANDBOX_IMAGE") != image:
+        raise RuntimeError("candidate does not preserve the configured model sandbox")
+    if dotenv_values(baseline_root / "deploy/.env").get("MODEL_SANDBOX_IMAGE") != image:
+        raise RuntimeError("requested model sandbox differs from the existing release")
+    sources = _model_reuse_source_inventory(project_root)
+    if _model_reuse_source_inventory(baseline_root) != sources:
+        raise RuntimeError("model execution, preparation, or image build sources changed")
+    _assert_model_reuse_image(context, image, image_id)
+    _verify_model_reuse_runtime(context, sources, image, live_worker=True)
+    _verify_model_reuse_runtime(context, sources, image, live_worker=False)
+    return {
+        "contract_version": "model-sandbox-reuse-v1", "status": "verified",
+        "image": image, "image_id": image_id, "sources": sources,
+        "source_inventory_sha256": hashlib.sha256(
+            json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "baseline_root": str(baseline_root.resolve()),
+        "live_worker_sources_verified": True, "sandbox_installed_sources_verified": True,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,6 +1066,7 @@ def _prepare_sandbox_images(
     release_id: str,
     *,
     wait_timeout: int,
+    preserved_model_sandbox: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Seal locally built sandboxes in a loopback-only deployment registry.
 
@@ -950,6 +1075,18 @@ def _prepare_sandbox_images(
     daemon. Registry data and DinD layers live on the data disk via Compose.
     """
 
+    if preserved_model_sandbox is not None:
+        proof = preserved_model_sandbox
+        if (
+            proof.get("contract_version") != "model-sandbox-reuse-v1"
+            or proof.get("status") != "verified"
+            or proof.get("live_worker_sources_verified") is not True
+            or proof.get("sandbox_installed_sources_verified") is not True
+            or proof.get("sources") != _model_reuse_source_inventory(project_root)
+        ):
+            raise RuntimeError("model sandbox preservation proof is missing or changed")
+        _assert_model_reuse_image(context, proof["image"], proof["image_id"])
+        _verify_model_reuse_runtime(context, proof["sources"], proof["image"], live_worker=False)
     port = _registry_port(context)
     host_registry = f"127.0.0.1:{port}"
     dind_registry = "rdagent-registry:5000"
@@ -1039,14 +1176,17 @@ def _prepare_sandbox_images(
             timeout=image_timeout,
             build_args=(f"QLIB_SANDBOX_BASE_IMAGE={host_base_image}",),
         )
-        model_image = _build_and_publish_host_image(
-            context,
-            context_root=project_root.resolve() / "deploy" / "model-sandbox",
-            host_image_tag=host_model_tag,
-            host_repository=host_model_repository,
-            dind_repository=dind_model_repository,
-            timeout=image_timeout,
-            build_args=(f"MODEL_SANDBOX_BASE_IMAGE={host_base_image}",),
+        model_image = (
+            str(preserved_model_sandbox["image"])
+            if preserved_model_sandbox is not None else _build_and_publish_host_image(
+                context,
+                context_root=project_root.resolve() / "deploy" / "model-sandbox",
+                host_image_tag=host_model_tag,
+                host_repository=host_model_repository,
+                dind_repository=dind_model_repository,
+                timeout=image_timeout,
+                build_args=(f"MODEL_SANDBOX_BASE_IMAGE={host_base_image}",),
+            )
         )
 
         qlib_calendars = context.run(
@@ -1114,6 +1254,8 @@ def _prepare_sandbox_images(
             ),
             timeout=image_timeout,
         )
+        if preserved_model_sandbox is not None:
+            _assert_model_reuse_image(context, model_image, preserved_model_sandbox["image_id"])
         sealed = {
             "RDAGENT_RUNTIME_IMAGE_DIGEST": runtime_image_id,
             "QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST": sandbox_base_image_id,
@@ -1128,6 +1270,7 @@ def _prepare_sandbox_images(
             "sandbox_base_image_id": sandbox_base_image_id,
             "qlib_smoke_dataset": qlib_smoke_home,
             "smoke_passed": True,
+            "model_sandbox_reuse": preserved_model_sandbox,
         }
     finally:
         context.run(
@@ -1879,6 +2022,8 @@ def run_release_upgrade(
     prune_rollback_images: bool = True,
     reuse_backup: Path | None = None,
     stable_release_link: Path | None = None,
+    preserve_model_sandbox_image: str | None = None,
+    preserve_model_sandbox_image_id: str | None = None,
 ) -> dict[str, Any]:
     if not confirmed:
         raise ValueError("release upgrade requires --confirm-upgrade")
@@ -1890,6 +2035,12 @@ def run_release_upgrade(
         raise ValueError("rollback_image_retention must be positive")
     if not re.fullmatch(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*", rollback_tag_repository):
         raise ValueError("rollback_tag_repository must be a lowercase Docker repository")
+    if bool(preserve_model_sandbox_image) != bool(preserve_model_sandbox_image_id):
+        raise ValueError("model sandbox preservation requires both reference and image ID")
+    if preserve_model_sandbox_image and (
+        stable_release_link is None or not stable_release_link.is_symlink()
+    ):
+        raise ValueError("model sandbox preservation requires the existing stable release link")
 
     release_id = _stamp()
     result: dict[str, Any] = {
@@ -1920,6 +2071,7 @@ def run_release_upgrade(
     configured_build_images: dict[str, str] = {}
     build_aliases_dirty = False
     admission_stopped: list[str] = []
+    preserved_model_sandbox: dict[str, Any] | None = None
 
     def restore_uncommitted_build_aliases() -> None:
         nonlocal build_aliases_dirty
@@ -1976,6 +2128,16 @@ def run_release_upgrade(
             trusted_external_root=backup_root,
         )
         rollback_base_context = _rollback_contract_context(rollback_contract)
+        if preserve_model_sandbox_image:
+            assert stable_release_link is not None and preserve_model_sandbox_image_id is not None
+            baseline_root = stable_release_link.resolve(strict=True)
+            if baseline_root / "deploy/compose.yaml" not in rollback_contract.compose_sources:
+                raise RuntimeError("stable model baseline differs from the live rollback contract")
+            preserved_model_sandbox = _verify_model_sandbox_reuse(
+                context, project_root, baseline_root,
+                preserve_model_sandbox_image, preserve_model_sandbox_image_id,
+            )
+            result["checks"]["model_sandbox_reuse"] = preserved_model_sandbox
         result["rollback_compose_contract"] = {
             "working_directory": str(rollback_contract.working_directory),
             "env_file": str(rollback_contract.env_source),
@@ -2160,6 +2322,8 @@ def run_release_upgrade(
             project_root,
             release_id,
             wait_timeout=wait_timeout,
+            **({"preserved_model_sandbox": preserved_model_sandbox}
+               if preserved_model_sandbox is not None else {}),
         )
         release_identity = _stamp_release_identity(context, release_id)
         result["release_identity"] = {

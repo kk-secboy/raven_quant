@@ -252,6 +252,25 @@ $PY scripts/canonicalize_release_baseline.py \
   --confirm-upgrade
 ```
 
+仅控制面修复需要保留当前模型计算环境时，可同时指定
+`--preserve-model-sandbox-image <当前 digest 引用>` 和
+`--preserve-model-sandbox-image-id <私有 Docker 中的实际 sha256 ID>`。
+工具会核对当前 release、候选源码、已运行 worker 和模型沙箱内安装文件的计算依赖，
+并在镜像准备阶段再次检查；源码、配置或镜像身份不一致则停止。
+默认仍重建模型沙箱。此选项不跳过备份、RD-Agent/Qlib 镜像准备和发布验收，
+也不改变任务回执本身的恢复条件。
+
+发布通过后，若旧显式完整活动在模型竞赛成功后，因
+`fin_quant incumbent prediction uses another label horizon` 阻断于研究启动前，
+可从受保护生产环境运行 `scripts/recover_fin_quant_handoff.py`。
+先用 `--source-cycle`、唯一的 `--event-key`、`--actor` 和 `--reason` 生成只读 JSON 计划；
+核对源数据、预算、竞赛证据、发布身份和没有下游输出后，将该计划保存为文件，
+以 `--execute --plan <文件> --plan-sha256 <文件字节的 SHA256>` 执行。
+执行会重新锁定并验证状态，只创建一个带审计的后继活动。
+先暂停同周期其他活动并排空发布队列，再正常恢复调度；不得重置旧任务 attempts，
+不得修改旧终态活动，也不得直接调用实验脚本冒充受管调度。
+该入口拒绝已产生联合研究输出、已有策略调度或已打开 OOS 的活动。
+
 先在隔离项目中演练同一路径：
 
 ```powershell

@@ -1068,23 +1068,47 @@ class ResearchTournamentStore:
         dataset_identity_sha256: str,
         baseline_prediction_champion: Mapping[str, Any],
         candidates: Sequence[Mapping[str, Any]],
+        research_run_id: str | None = None,
     ) -> dict[str, Any]:
         parent = self.get_tournament(parent_tournament_id)
+        owner_cycle_id = str(parent["cycle_id"])
+        recovery_lineage = None
+        if research_run_id is not None:
+            with self.engine.connect() as connection:
+                run = connection.execute(select(research_runs).where(
+                    research_runs.c.id == research_run_id)).first()
+                if run is None:
+                    raise ValueError("fin_quant preregistration source run is missing")
+                run_cycle_id = str((run.config_json or {}).get("autopilot_cycle_id") or "")
+                if not run_cycle_id:
+                    raise ValueError("fin_quant preregistration run has no activity owner")
+                if run_cycle_id != owner_cycle_id:
+                    owner_cycle_id, recovery_lineage = self._quant_recovery_owner(
+                        connection, parent, research_run_id, candidates,
+                    )
         manifest = build_quant_preregistered_manifest(
             parent_tournament=parent,
             dataset_identity_sha256=dataset_identity_sha256,
             baseline_prediction_champion=baseline_prediction_champion,
             candidates=candidates,
         )
+        if recovery_lineage is not None:
+            manifest["handoff_recovery"] = recovery_lineage
         manifest_sha = canonical_sha256(manifest)
         now = _utcnow()
         tournament_id = uuid.uuid4().hex
         try:
             with self.engine.begin() as connection:
+                if recovery_lineage is not None:
+                    checked_owner, checked_lineage = self._quant_recovery_owner(
+                        connection, parent, research_run_id, candidates,
+                    )
+                    if checked_owner != owner_cycle_id or checked_lineage != recovery_lineage:
+                        raise ValueError("fin_quant recovery ownership changed before registration")
                 connection.execute(
                     insert(research_tournaments).values(
                         id=tournament_id,
-                        cycle_id=str(parent["cycle_id"]),
+                        cycle_id=owner_cycle_id,
                         stage="quant",
                         dataset_identity_sha256=dataset_identity_sha256,
                         status="running",
@@ -1121,13 +1145,62 @@ class ResearchTournamentStore:
                     )
         except IntegrityError:
             pass
-        existing = self.get_for_cycle_stage(str(parent["cycle_id"]), "quant")
+        existing = self.get_for_cycle_stage(owner_cycle_id, "quant")
         if (
             str(existing["manifest_sha256"]) != manifest_sha
             or str(existing["dataset_identity_sha256"]) != dataset_identity_sha256
         ):
             raise ValueError("fin_quant research family changed after preregistration")
         return existing
+
+    def _quant_recovery_owner(
+        self, connection: Any, parent: Mapping[str, Any], research_run_id: str,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, dict[str, str]]:
+        from types import SimpleNamespace
+
+        from quant_data.config import Settings
+        from quant_data.database import quant_bundle_candidates
+
+        from .autopilot import AutopilotStore
+        from .fin_quant_handoff_recovery import FinQuantHandoffRecovery, _JoinedEngine
+
+        run = connection.execute(select(research_runs).where(
+            research_runs.c.id == research_run_id).with_for_update()).first()
+        if run is None:
+            raise ValueError("fin_quant recovery run is missing")
+        cycle_id = str((run.config_json or {}).get("autopilot_cycle_id") or "")
+        store = object.__new__(AutopilotStore)
+        store.engine = _JoinedEngine(connection)
+        cycle = store.get_cycle(cycle_id)
+        if cycle.get("status") != "active" or cycle.get("finished_at"):
+            raise ValueError("fin_quant recovery activity is not active")
+        service = FinQuantHandoffRecovery(SimpleNamespace(settings=Settings.from_env()))
+        evidence = service.verify(cycle, connection=connection)
+        if str(evidence["tournament"]["id"]) != str(parent["id"]):
+            raise ValueError("fin_quant recovery refers to another model tournament")
+        branch = connection.execute(select(autopilot_branches).where(
+            autopilot_branches.c.cycle_id == cycle_id,
+            autopilot_branches.c.research_run_id == research_run_id,
+            autopilot_branches.c.scenario == "fin_quant",
+        ).with_for_update()).first()
+        if branch is None or branch.job_id != run.job_id or branch.status not in {
+            "queued", "running", "evaluating",
+        }:
+            raise ValueError("fin_quant recovery run/job/branch ownership differs")
+        ids = {str(item.get("candidate_id") or "") for item in candidates}
+        owned = set(connection.scalars(select(quant_bundle_candidates.c.id).where(
+            quant_bundle_candidates.c.research_run_id == research_run_id,
+            quant_bundle_candidates.c.id.in_(ids),
+        )))
+        if not ids or owned != ids:
+            raise ValueError("fin_quant recovery candidate belongs to another research run")
+        return cycle_id, {
+            "cycle_id": cycle_id, "research_run_id": research_run_id,
+            "source_cycle_id": str(parent["cycle_id"]),
+            "source_tournament_id": str(parent["id"]),
+            "lineage_sha256": str(cycle["state"]["fin_quant_handoff_recovery"]["sha256"]),
+        }
 
     def get_for_cycle(self, cycle_id: str) -> dict[str, Any]:
         return self.get_for_cycle_stage(cycle_id, "feature_screen")

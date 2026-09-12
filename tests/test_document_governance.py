@@ -1224,3 +1224,19 @@ def test_maintenance_data_resume_preserves_checkpoint_and_consumed_budget() -> N
         "此入口不改变通用 retry 和研究失败证据",
     ):
         assert contract in specification
+
+
+def test_fin_quant_handoff_recovery_preserves_source_and_unopened_oos() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`fin-quant-handoff-recovery-v1`", "逐格重建并校验源哈希",
+        "不得改写历史窗口哈希、预测或回测回执", "联合研究尚未产生实验输出",
+        "执行时加锁重验计划并原子写入审计", "旧终态活动、失败记录和尝试次数保持不变",
+        "每个源活动只能创建一个恢复后继活动", "不能链式恢复",
+        "不重新竞赛、不更换数据、不增加研究预算",
+        "已有联合研究输出、下游策略调度或已打开 OOS 时拒绝此恢复",
+        "不自动授予历史实验回执复用权限", "证据缺失或依赖变化则拒绝保留",
+        "不能把暂停自动改回启用", "同一行锁内读取最新意愿",
+        "先完成受管策略交接，不能让更新的数据先开启模型竞赛",
+    ):
+        assert contract in specification
