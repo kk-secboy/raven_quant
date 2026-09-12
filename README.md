@@ -228,6 +228,12 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml ps
 都不包含默认密码。完整迁移、健康检查、备份恢复和安全升级步骤见
 [部署手册](docs/DEPLOYMENT.md)。
 
+## 修复发布后的研究恢复
+
+已取消且尚未导出候选的联合研究，可用 `scripts/recover_fin_quant_handoff.py --restart-cycle`
+生成绑定新发布身份的重启计划，再通过 `--plan`、`--plan-sha256`、`--execute` 执行。
+它保留原模型选拔与旧实验，只转移原任务剩余的执行尝试预算；旧任务不能直接跨版本重试。
+
 ## 测试
 
 ```powershell

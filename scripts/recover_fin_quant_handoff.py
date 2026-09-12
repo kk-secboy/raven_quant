@@ -14,6 +14,7 @@ from quant_platform.research_tournament import canonical_sha256
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-cycle")
+    parser.add_argument("--restart-cycle", help="Restart unexported research on a repaired release")
     parser.add_argument("--event-key")
     parser.add_argument("--actor", default="codex-operator")
     parser.add_argument("--reason")
@@ -30,9 +31,12 @@ def main() -> None:
         print(json.dumps({"cycle_id": result["id"], "status": result["status"],
                           "source_cycle_id": plan["source_cycle_id"]}, ensure_ascii=False))
     else:
-        if not args.source_cycle or not args.event_key or not args.reason:
-            parser.error("planning requires --source-cycle, --event-key and --reason")
-        print(json.dumps(service.plan(args.source_cycle, args.event_key, args.actor, args.reason),
+        if (bool(args.source_cycle) == bool(args.restart_cycle)
+                or not args.event_key or not args.reason):
+            parser.error("planning requires one source/restart cycle, --event-key and --reason")
+        planner = service.plan_runtime_restart if args.restart_cycle else service.plan
+        print(json.dumps(planner(args.restart_cycle or args.source_cycle,
+                                 args.event_key, args.actor, args.reason),
                          sort_keys=True, indent=2, ensure_ascii=False))
 
 

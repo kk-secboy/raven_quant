@@ -1240,3 +1240,13 @@ def test_fin_quant_handoff_recovery_preserves_source_and_unopened_oos() -> None:
         "先完成受管策略交接，不能让更新的数据先开启模型竞赛",
     ):
         assert contract in specification
+
+
+def test_runtime_restart_keeps_history_and_remaining_attempt_budget() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`fin-quant-runtime-restart-v1`", "原任务剩余的执行尝试预算",
+        "不加载旧 pickle", "重启活动不能再次重启",
+        "终结旧活动、创建新活动和审计必须同一事务成功或全部回滚",
+    ):
+        assert contract in specification

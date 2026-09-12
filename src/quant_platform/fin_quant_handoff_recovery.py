@@ -200,12 +200,13 @@ def require_recovery_lineage(
 ) -> dict[str, Any]:
     """Validate the only permitted cross-cycle model-tournament reference."""
     from .autopilot import _manual_research_event
+    from .fin_quant_runtime_restart import RUNTIME_RESTART_VERSION
 
     lineage = deepcopy((cycle.get("state") or {}).get(RECOVERY_KEY))
     require(isinstance(lineage, dict), "lineage is missing")
     digest = lineage.pop("sha256", None)
     require(digest == canonical_sha256(lineage), "lineage hash changed")
-    require(lineage.get("contract_version") == RECOVERY_VERSION
+    require(lineage.get("contract_version") in {RECOVERY_VERSION, RUNTIME_RESTART_VERSION}
             and source is not None and source.get("id") == lineage.get("source_cycle_id")
             and source.get("id") != cycle.get("id"), "source ownership differs")
     require(canonical_sha256(source_identity(source)) == lineage.get("source_cycle_sha256"),
@@ -362,17 +363,23 @@ class FinQuantHandoffRecovery:
                 "publication_proof": publication_proof}
 
     def verify(self, cycle: dict[str, Any], *, connection: Any = None) -> dict[str, Any]:
-        source_id = (cycle.get("state") or {}).get(RECOVERY_KEY, {}).get("source_cycle_id")
+        from .fin_quant_runtime_restart import (
+            RUNTIME_RESTART_VERSION,
+            verify_runtime_predecessor,
+        )
+
         if connection is None:
             with self.controller.engine.connect() as reader:
-                evidence = self._read(reader, source_id)
-        else:
-            evidence = self._read(connection, source_id)
+                return self.verify(cycle, connection=reader)
+        source_id = (cycle.get("state") or {}).get(RECOVERY_KEY, {}).get("source_cycle_id")
+        evidence = self._read(connection, source_id)
         require_recovery_evidence(cycle, evidence, self.controller.settings)
+        if cycle["state"][RECOVERY_KEY]["contract_version"] == RUNTIME_RESTART_VERSION:
+            verify_runtime_predecessor(self, connection, cycle, evidence)
         return evidence
 
     def _plan(self, connection: Any, source_cycle_id: str, event_key: str,
-              actor: str, reason: str) -> dict[str, Any]:
+              actor: str, reason: str, restart_cycle_id: str | None = None) -> dict[str, Any]:
         from .autopilot import _manual_research_event, _research_event_request
         from .rdagent_runtime import validate_duration_limit
 
@@ -393,7 +400,7 @@ class FinQuantHandoffRecovery:
                   "config_digest": settings.quantlab_config_digest}
         require(target["release_id"] and len(target["config_digest"]) == 64,
                 "target release identity is absent")
-        return {
+        plan = {
             "contract_version": RECOVERY_VERSION, "request": request,
             "source_cycle_id": source_cycle_id,
             "source_cycle_sha256": canonical_sha256(source_identity(evidence["source"])),
@@ -419,6 +426,32 @@ class FinQuantHandoffRecovery:
             "model_selection_reused": True, "new_model_experiments": 0,
             "final_oos_opened": False, "source_outputs_absent": True,
         }
+        if restart_cycle_id is not None:
+            from .fin_quant_runtime_restart import (
+                RUNTIME_RESTART_VERSION,
+                read_runtime_predecessor,
+            )
+
+            prior = read_runtime_predecessor(self, connection, restart_cycle_id, evidence)
+            require(prior["cycle"].get("finished_at") is None,
+                    "runtime restart predecessor was already closed")
+            require(prior["proof"]["old_release"] != target, "runtime release was not repaired")
+            plan.update(contract_version=RUNTIME_RESTART_VERSION,
+                        runtime_restart=prior["proof"])
+        return plan
+
+    def plan_runtime_restart(self, cycle_id: str, event_key: str, actor: str,
+                             reason: str) -> dict[str, Any]:
+        from .autopilot import AutopilotStore
+
+        with self.controller.engine.connect() as connection:
+            connection.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            store = object.__new__(AutopilotStore)
+            store.engine = _JoinedEngine(connection)
+            prior = store.get_cycle(cycle_id)
+            root_id = (prior["state"].get(RECOVERY_KEY) or {}).get("source_cycle_id")
+            require(root_id, "runtime predecessor has no sealed model source")
+            return self._plan(connection, root_id, event_key, actor, reason, cycle_id)
 
     def plan(self, source_cycle_id: str, event_key: str, actor: str,
              reason: str) -> dict[str, Any]:
@@ -428,9 +461,14 @@ class FinQuantHandoffRecovery:
 
     def execute(self, plan: dict[str, Any], *, expected_sha256: str) -> dict[str, Any]:
         from .autopilot import AutopilotStore, _manual_research_event, _now
+        from .fin_quant_runtime_restart import RUNTIME_RESTART_VERSION, read_runtime_predecessor
 
         require(canonical_sha256(plan) == expected_sha256, "approved plan hash changed")
-        require(plan.get("contract_version") == RECOVERY_VERSION, "unsupported recovery plan")
+        require(plan.get("contract_version") in {RECOVERY_VERSION, RUNTIME_RESTART_VERSION},
+                "unsupported recovery plan")
+        restart = plan.get("runtime_restart")
+        require(bool(restart) == (plan["contract_version"] == RUNTIME_RESTART_VERSION),
+                "runtime restart binding is missing or unexpected")
         request = plan["request"]
         with self.controller.engine.begin() as connection:
             AutopilotStore._lock_horizon(connection, request["horizon_profile"])
@@ -448,6 +486,15 @@ class FinQuantHandoffRecovery:
             ):
                 connection.execute(select(table.c.id).where(clause)
                     .order_by(table.c.id).with_for_update()).all()
+            if restart:
+                for table, column, value in (
+                    (autopilot_cycles, autopilot_cycles.c.id, restart["cycle_id"]),
+                    (autopilot_branches, autopilot_branches.c.cycle_id, restart["cycle_id"]),
+                    (research_runs, research_runs.c.id, restart["run_id"]),
+                    (jobs, jobs.c.id, restart["job_id"]),
+                ):
+                    connection.execute(select(table.c.id).where(column == value)
+                        .order_by(table.c.id).with_for_update()).all()
             store = object.__new__(AutopilotStore)
             store.engine = _JoinedEngine(connection)
             existing = store.get_research_event(request["event_key"])
@@ -456,22 +503,39 @@ class FinQuantHandoffRecovery:
                         == expected_sha256, "event key belongs to another recovery")
                 return existing
             actual = self._plan(connection, plan["source_cycle_id"], request["event_key"],
-                                request["actor"], request["reason"])
+                                request["actor"], request["reason"],
+                                restart["cycle_id"] if restart else None)
             require(actual == plan, "live state or target release changed after planning")
             # Prevent duplicate operator recovery with a different event key.
+            owner_column = autopilot_cycles.c.state_json[RECOVERY_KEY]["source_cycle_id"]
+            owner_id = plan["source_cycle_id"]
+            if restart:
+                owner_column = autopilot_cycles.c.state_json[RECOVERY_KEY]["runtime_restart"][
+                    "cycle_id"]
+                owner_id = restart["cycle_id"]
             require(connection.scalar(select(autopilot_cycles.c.id).where(
-                autopilot_cycles.c.state_json[RECOVERY_KEY]["source_cycle_id"].as_string()
-                == plan["source_cycle_id"]).limit(1)) is None,
+                owner_column.as_string() == owner_id).limit(1)) is None,
                 "source already owns a recovery successor")
             evidence = self._read(connection, plan["source_cycle_id"])
             source = evidence["source"]
             source_event = _manual_research_event(source)
+            closed_restart = None
+            if restart:
+                prior = store.get_cycle(restart["cycle_id"])
+                store.set_cycle_state(prior["id"], state=prior["state"],
+                    stage="runtime_restart_preserved", status="paused", finished=True,
+                    error="Unexported research preserved; restart uses repaired runtime.")
+                closed_restart = read_runtime_predecessor(
+                    self, connection, prior["id"], evidence)["proof"]
             cycle = store.create_research_event(
                 request=request, dataset=evidence["dataset"], config=source_event["config"],
                 config_revision=source_event["config_revision"],
             )
             lineage = {**deepcopy(plan), "plan_sha256": expected_sha256,
                        "recovery_event_sha256": cycle["state"]["research_event"]["sha256"]}
+            if closed_restart:
+                lineage["runtime_restart_before_sha256"] = canonical_sha256(restart)
+                lineage["runtime_restart"] = closed_restart
             lineage["sha256"] = canonical_sha256(lineage)
             state = {**cycle["state"], **{
                 key: deepcopy(source["state"][key])

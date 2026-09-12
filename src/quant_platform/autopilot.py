@@ -5505,6 +5505,8 @@ class AutopilotController:
         tournament_id: str | None = None,
         branch_details: dict[str, Any] | None = None,
     ) -> None:
+        from .fin_quant_runtime_restart import remaining_restart_attempts
+
         scenario = get_rdagent_scenario(scenario_id)
         if scenario.id in FROZEN_RDAGENT_SCENARIOS:
             # Fail closed even if a future caller forgets the freeze: callers
@@ -5721,6 +5723,8 @@ class AutopilotController:
                 / "logs"
                 / f"autopilot-{scenario_id}-{run['id']}.log",
                 dedupe_active_kind=False,
+                max_attempts=(remaining_restart_attempts(cycle)
+                              if scenario_id == "fin_quant" else None),
                 idempotency_key=(
                     f"autopilot:{cycle['id']}:{scenario_id}:{scope_key}:"
                     f"{RDAGENT_INTEGRATION_CONTRACT_VERSION}:{runtime_fingerprint}"
