@@ -105,7 +105,9 @@ def _redact(text: str, secrets: list[str]) -> str:
     return text
 
 
-def _run_streaming_redacted(command: list[str], *, timeout: int, env: dict[str, str]) -> None:
+def _run_streaming_redacted(
+    command: list[str], *, timeout: int | None, env: dict[str, str]
+) -> None:
     """Stream child output without ever persisting configured secret values."""
 
     secrets = _secret_values()
@@ -133,10 +135,10 @@ def _run_streaming_redacted(command: list[str], *, timeout: int, env: dict[str, 
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     ended = False
     while not ended or process.poll() is None:
-        if time.monotonic() >= deadline and process.poll() is None:
+        if deadline is not None and time.monotonic() >= deadline and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
@@ -274,11 +276,13 @@ def run(args: argparse.Namespace) -> None:
         separators=(",", ":"),
     )
     command = _scenario_command(args)
-    # Give RD-Agent a short cleanup/export margin beyond the governed budget.
+    # fin_quant's upstream duration stops admission at step boundaries. Let
+    # an admitted experiment finish and export instead of killing it while
+    # Qlib is still training. Other scenarios retain their existing deadline.
     _run_streaming_redacted(
         command,
         env=env,
-        timeout=_duration_seconds(args.duration) + 300,
+        timeout=None if args.scenario == "fin_quant" else _duration_seconds(args.duration) + 300,
     )
     export = [
         sys.executable,

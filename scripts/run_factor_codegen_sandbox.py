@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 DEFAULT_IMAGE = "quantlab-factor-sandbox:v2"
@@ -27,6 +28,32 @@ def _within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _archive_previous_output(workspace: Path) -> Path | None:
+    """Keep restored debug output out of the next sandbox execution.
+
+    RD-Agent restores its checkpoint as the worker user (root), including
+    result.h5. The unprivileged factor container cannot overwrite that file.
+    Preserve the old bytes in a private directory and require a fresh output;
+    a successful process that writes nothing must never reuse a debug result.
+    The caller has already verified the mutable governed workspace boundary.
+    """
+    output = workspace / "result.h5"
+    try:
+        info = output.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RuntimeError("previous factor output must be a regular, unlinked file")
+    # Keep history outside the sandbox mount and the upstream workspace ZIP;
+    # the child cannot mutate it and later checkpoints do not recursively grow.
+    archive = Path(tempfile.mkdtemp(
+        prefix=f".{workspace.name}-factor-output-", dir=workspace.parent
+    ))
+    saved = archive / output.name
+    output.rename(saved)
+    return saved
 
 
 def _materialize_linked_inputs(workspace: Path, trusted_roots: tuple[Path, ...]) -> None:
@@ -164,6 +191,7 @@ def main(argv: list[str]) -> int:
     trusted_roots = [Path("/opt/rdagent/git_ignore_folder").resolve()]
     if runtime_root is not None:
         trusted_roots.append(runtime_root / "factor-source-data")
+    _archive_previous_output(workspace)
     _materialize_linked_inputs(workspace, tuple(trusted_roots))
     workspace.chmod(workspace.stat().st_mode | stat.S_IWOTH | stat.S_IXOTH)
     script.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)

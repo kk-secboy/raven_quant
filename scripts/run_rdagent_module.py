@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -63,6 +64,77 @@ def _enable_qlib_file_tracking_compatibility() -> None:
 
 
 _FIN_QUANT_ARMS = ("factor", "model")
+
+
+def _enable_fin_quant_execution_compatibility() -> None:
+    """Use the pinned Docker runtime and drain admitted Qlib training steps."""
+    from rdagent.components.workflow import rd_loop
+    from rdagent.core.experiment import FBWorkspace
+    from rdagent.utils.env import QTDockerEnv
+    from rdagent.utils.qlib import TEST_FEATURE_CODE
+
+    if getattr(QTDockerEnv, "_quantlab_fin_quant_execution_enabled", False):
+        return
+    original_run = QTDockerEnv.run
+    original_init_features = rd_loop.RDLoop._init_base_features
+    original_check_step = rd_loop.RDLoop._check_exit_conditions_on_step
+    validation_succeeded = False
+
+    def governed_run(self: Any, *args: Any, **kwargs: Any) -> Any:
+        bound = inspect.signature(original_run).bind(self, *args, **kwargs)
+        entry = bound.arguments.get("entry") or self.conf.default_entry
+        if not str(entry).startswith("qrun "):
+            return original_run(*bound.args, **bound.kwargs)
+        original_conf = self.conf
+        # QTDockerEnv's default config is shared. Copy it so validation and
+        # code execution retain their bounded timeout and resource limits.
+        self.conf = original_conf.model_copy(update={"running_timeout_period": None})
+        try:
+            return original_run(*bound.args, **bound.kwargs)
+        finally:
+            self.conf = original_conf
+
+    def validate_features(expressions: list[str]) -> bool:
+        nonlocal validation_succeeded
+        workspace = FBWorkspace()
+        workspace.inject_files(
+            **{"test_fea.py": TEST_FEATURE_CODE.format(experessions=str(expressions))}
+        )
+        runtime = QTDockerEnv()
+        runtime.prepare()
+        result = workspace.run(env=runtime, entry="python test_fea.py")
+        validation_succeeded = result.exit_code == 0
+        return validation_succeeded
+
+    def init_features(self: Any, base_features_path: str | None) -> None:
+        nonlocal validation_succeeded
+        validation_succeeded = False
+        original_init_features(self, base_features_path)
+        if base_features_path is None:
+            raise RuntimeError("fin_quant requires governed base features")
+        expected = json.loads(
+            (Path(base_features_path) / "base_factors.json").read_text(encoding="utf-8")
+        )
+        if not validation_succeeded or self.plan.get("features") != expected:
+            raise RuntimeError("fin_quant failed to load the governed base features")
+
+    def check_step(self: Any, loop_id: int | None = None, step_id: int | None = None) -> None:
+        # The pinned loop checks its timer before *every* step. After a long
+        # training step this would drop feedback/record and lose the result.
+        # Stop admitting hypotheses when time is up, but finish an admitted
+        # iteration, retaining the upstream explicit step/loop count limits.
+        if step_id is None or step_id == 0:
+            return original_check_step(self, loop_id, step_id)
+        if self.step_n is not None:
+            if self.step_n <= 0:
+                raise self.LoopTerminationError("Step count reached")
+            self.step_n -= 1
+
+    QTDockerEnv.run = governed_run  # type: ignore[method-assign]
+    QTDockerEnv._quantlab_fin_quant_execution_enabled = True
+    rd_loop.validate_qlib_features = validate_features
+    rd_loop.RDLoop._init_base_features = init_features  # type: ignore[method-assign]
+    rd_loop.RDLoop._check_exit_conditions_on_step = check_step  # type: ignore[method-assign]
 
 
 def _next_missing_fin_quant_arm(attempted: set[str]) -> str | None:
@@ -160,6 +232,7 @@ def main(argv: list[str]) -> int:
         )
     target = importlib.import_module(module)
     if module == "rdagent.app.qlib_rd_loop.quant":
+        _enable_fin_quant_execution_compatibility()
         _enable_fin_quant_arm_coverage()
     entry = getattr(target, "main", None)
     if not callable(entry):
