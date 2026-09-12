@@ -260,6 +260,14 @@ $PY scripts/canonicalize_release_baseline.py \
 默认仍重建模型沙箱。此选项不跳过备份、RD-Agent/Qlib 镜像准备和发布验收，
 也不改变任务回执本身的恢复条件。
 
+若调度器持续入队导致队列无法保持空闲，可显式增加 `--drain-active-work`。
+默认仍要求两次发布预检时队列空闲；此选项保留构建前后全部预检，只将已成功读取的
+活动任务数标记为待排空，其他健康、数据、容量和数据库检查仍必须通过。
+构建后由工具依次关闭外部入口、调度器和 API，保留消费者继续完成已有任务；确认
+活动任务及运行工作单元都归零后才协调停止消费者、再次检查并创建新备份。
+它不会取消任务；排空受 `--wait-timeout` 限制，超时或备份前失败会恢复已关闭的入口。
+此选项不能与 `--reuse-backup` 同时使用，也不放宽备份、切换或最终验收条件。
+
 发布通过后，若旧显式完整活动在模型竞赛成功后，因
 `fin_quant incumbent prediction uses another label horizon` 阻断于研究启动前，
 可从受保护生产环境运行 `scripts/recover_fin_quant_handoff.py`。

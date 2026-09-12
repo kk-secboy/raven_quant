@@ -41,6 +41,14 @@ def main() -> None:
     parser.add_argument("--minimum-free-gb", type=float, default=20.0)
     parser.add_argument("--wait-timeout", type=int, default=300)
     parser.add_argument(
+        "--drain-active-work",
+        action="store_true",
+        help=(
+            "After full preflight and build, close admission and wait for accepted work "
+            "to finish before a fresh backup; incompatible with --reuse-backup"
+        ),
+    )
+    parser.add_argument(
         "--pull",
         action="store_true",
         help="Refresh base images during the build; requires registry connectivity",
@@ -89,6 +97,7 @@ def main() -> None:
         ),
         preserve_model_sandbox_image=args.preserve_model_sandbox_image,
         preserve_model_sandbox_image_id=args.preserve_model_sandbox_image_id,
+        drain_active_work=args.drain_active_work,
     )
     output = json.dumps(result, ensure_ascii=False, indent=2)
     report = args.report

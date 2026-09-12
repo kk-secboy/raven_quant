@@ -533,7 +533,7 @@ def _quiesce_release_admission(
     stopped_services: list[str],
     wait_timeout: int,
 ) -> dict[str, Any]:
-    """Close producers before draining work accepted after the idle preflight.
+    """Close producers before draining all previously accepted work.
 
     Compose may reorder a multi-service stop by dependencies. Stop each admission
     service separately, keeping consumers alive until accepted work completes.
@@ -1840,7 +1840,7 @@ def _post_start_acceptance(
 ) -> dict[str, Any]:
     """Evaluate the release after job-producing services have started.
 
-    The two pre-mutation gates require the durable queue to be idle.  Once the
+    The backup boundary requires the durable queue to be idle. Once the
     scheduler and workers are healthy, however, they may immediately enqueue
     or claim scheduled work. Only rows created or claimed at/after the sealed
     database-clock cutover are tolerated. Every earlier row and every other
@@ -1923,6 +1923,64 @@ def _post_start_acceptance(
         "blocking_checks": blocking,
         "durable_state": durable_state,
         "evidence": evidence,
+    }
+
+
+def _pre_drain_acceptance(assessment: dict[str, Any]) -> dict[str, Any]:
+    """Defer only a measured busy queue until producers are closed and it drains.
+
+    Preserve the complete preflight report. Unknown counts or a database-query
+    failure cannot be treated as work that consumers will eventually finish.
+    This acceptance is never a backup or cutover gate.
+    """
+    checks = assessment.get("checks")
+    checks_valid = isinstance(checks, list) and bool(checks) and all(
+        isinstance(check, dict)
+        and isinstance(check.get("id"), str)
+        and bool(check["id"])
+        and check.get("status") in {"pass", "block"}
+        for check in checks
+    )
+    by_id = {check["id"]: check for check in checks} if checks_valid else {}
+    checks_valid = (
+        checks_valid
+        and len(by_id) == len(checks)
+        and {"postgres_running", "schema_compatible", "durable_work_idle"}.issubset(by_id)
+    )
+    blockers = sorted(key for key, check in by_id.items() if check["status"] == "block")
+    queue = assessment.get("queue")
+    queue_valid = isinstance(queue, dict) and all(
+        type(queue.get(key)) is int and queue[key] >= 0
+        for key in ("active_jobs", "pending_units", "running_units", "failed_units")
+    )
+    database_valid = (
+        queue_valid
+        and isinstance(assessment.get("database_revision"), str)
+        and bool(assessment["database_revision"].strip())
+        and by_id.get("postgres_running", {}).get("status") == "pass"
+        and "database_query" not in blockers
+    )
+    busy = queue_valid and (queue["active_jobs"] > 0 or queue["running_units"] > 0)
+    queue_check_consistent = by_id.get("durable_work_idle", {}).get("status") == (
+        "block" if busy else "pass"
+    )
+    status_consistent = assessment.get("status") == ("blocked" if blockers else "ready")
+    blocking = [key for key in blockers if key != "durable_work_idle"]
+    if not checks_valid or not status_consistent or not queue_check_consistent:
+        blocking.append("invalid_assessment")
+    if not database_valid:
+        blocking.append("unreadable_durable_work_state")
+    if assessment.get("migration_state") not in {"current", "upgrade_required"}:
+        blocking.append("invalid_migration_state")
+    accepted = not blocking
+    return {
+        "status": "pass" if accepted else "block",
+        "deferred_checks": ["durable_work_idle"] if accepted and busy else [],
+        "blocking_checks": sorted(set(blocking)),
+        "evidence": (
+            "all other preflight checks passed; durable work must drain before fresh backup"
+            if accepted else "preflight health, schema, or readable queue checks failed"
+        ),
     }
 
 
@@ -2024,6 +2082,7 @@ def run_release_upgrade(
     stable_release_link: Path | None = None,
     preserve_model_sandbox_image: str | None = None,
     preserve_model_sandbox_image_id: str | None = None,
+    drain_active_work: bool = False,
 ) -> dict[str, Any]:
     if not confirmed:
         raise ValueError("release upgrade requires --confirm-upgrade")
@@ -2033,6 +2092,10 @@ def run_release_upgrade(
         raise ValueError("wait_timeout must be at least 30 seconds")
     if rollback_image_retention < 1:
         raise ValueError("rollback_image_retention must be positive")
+    if drain_active_work and reuse_backup is not None:
+        raise ValueError(
+            "--drain-active-work requires a fresh backup; --reuse-backup is incompatible"
+        )
     if not re.fullmatch(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*", rollback_tag_repository):
         raise ValueError("rollback_tag_repository must be a lowercase Docker repository")
     if bool(preserve_model_sandbox_image) != bool(preserve_model_sandbox_image_id):
@@ -2056,6 +2119,7 @@ def run_release_upgrade(
         "rollback_rdagent_docker_storage": None,
         "backup_directory": None,
         "backup_reused": False,
+        "drain_active_work": drain_active_work,
         "cutover_at": None,
     }
     backup_directory: Path | None = None
@@ -2094,7 +2158,12 @@ def run_release_upgrade(
             verify_image_availability=False,
         )
         result["checks"]["initial_preflight"] = initial
-        if initial["status"] != "ready":
+        initial_accepted = initial["status"] == "ready"
+        if drain_active_work:
+            initial_drain = _pre_drain_acceptance(initial)
+            result["checks"]["initial_drain_acceptance"] = initial_drain
+            initial_accepted = initial_drain["status"] == "pass"
+        if not initial_accepted:
             result["status"] = "blocked"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             return result
@@ -2189,7 +2258,12 @@ def run_release_upgrade(
             verify_image_availability=False,
         )
         result["checks"]["post_build_preflight"] = final_gate
-        if final_gate["status"] != "ready":
+        final_accepted = final_gate["status"] == "ready"
+        if drain_active_work:
+            post_build_drain = _pre_drain_acceptance(final_gate)
+            result["checks"]["post_build_drain_acceptance"] = post_build_drain
+            final_accepted = post_build_drain["status"] == "pass"
+        if not final_accepted:
             restore_uncommitted_build_aliases()
             result["status"] = "blocked"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")

@@ -12,6 +12,31 @@ from quant_platform import release_upgrade
 pytestmark = pytest.mark.no_database
 
 
+@pytest.mark.parametrize("busy", [False, True])
+def test_pre_drain_acceptance_defers_only_measured_work(busy: bool) -> None:
+    assessment = {
+        "status": "blocked" if busy else "ready",
+        "database_revision": "0115_strategy_runtime_v43",
+        "migration_state": "current",
+        "queue": {"active_jobs": int(busy), "pending_units": 2,
+                  "running_units": 0, "failed_units": 0},
+        "checks": [
+            {"id": name, "status": "block" if busy and name == "durable_work_idle"
+             else "pass"}
+            for name in ("postgres_running", "schema_compatible", "services_healthy",
+                         "durable_work_idle")
+        ],
+    }
+    assert release_upgrade._pre_drain_acceptance(assessment)["status"] == "pass"
+    assessment["checks"][2]["status"] = "block"
+    assessment["status"] = "blocked"
+    assert release_upgrade._pre_drain_acceptance(assessment)["status"] == "block"
+    assessment["checks"][2]["status"] = "pass"
+    assessment["status"] = "blocked" if busy else "ready"
+    assessment["queue"]["active_jobs"] = -1
+    assert release_upgrade._pre_drain_acceptance(assessment)["status"] == "block"
+
+
 class FakeContext:
     project_name = "quantlab-test"
     profiles: tuple[str, ...] = ()
