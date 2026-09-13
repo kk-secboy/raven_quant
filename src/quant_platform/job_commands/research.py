@@ -19,7 +19,8 @@ def _embedding_environment(llm: dict) -> dict[str, str]:
 
     Chat stays on the governed relay (OPENAI_API_BASE); LiteLLM's hosted_vllm
     provider carries its own HOSTED_VLLM_* credentials, so embedding traffic
-    needs no code patch — pure environment configuration.
+    needs no credential-routing patch. Document chunking is handled separately
+    at the embedding backend, without changing this credential boundary.
     """
     key = str(llm.get("embedding_api_key") or "").strip()
     if not key:

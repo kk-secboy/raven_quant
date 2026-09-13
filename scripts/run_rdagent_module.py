@@ -231,6 +231,9 @@ def main(argv: list[str]) -> int:
             "embedding_api_key / embedding_api_base / embedding_model fields first"
         )
     target = importlib.import_module(module)
+    from quant_platform.rdagent_embeddings import enable_embedding_document_chunking
+
+    enable_embedding_document_chunking()
     if module == "rdagent.app.qlib_rd_loop.quant":
         from quant_platform.fin_quant_model_dimensions import enable_fin_quant_model_dimensions
 

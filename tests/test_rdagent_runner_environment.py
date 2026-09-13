@@ -195,7 +195,7 @@ def test_disposable_qlib_container_allows_local_mlflow_tracking(
     }
 
 
-def test_embedding_environment_uses_hosted_vllm_env_without_patches() -> None:
+def test_embedding_environment_separates_chat_and_embedding_credentials() -> None:
     from quant_platform.job_commands.research import _embedding_environment
 
     assert _embedding_environment({}) == {}
@@ -207,7 +207,7 @@ def test_embedding_environment_uses_hosted_vllm_env_without_patches() -> None:
         }
     )
     # LiteLLM's hosted_vllm provider carries its own credentials, so embedding
-    # traffic reaches the embedding provider without any code patching.
+    # traffic reaches its provider without changing the chat credentials.
     assert env == {
         "EMBEDDING_MODEL": "hosted_vllm/embedding-3",
         "HOSTED_VLLM_API_KEY": "emb-key",

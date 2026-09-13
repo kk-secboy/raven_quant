@@ -25,6 +25,10 @@ def test_model_dimensions_are_applied_after_upstream_import_before_execution(mon
         "quant_platform.fin_quant_model_dimensions.enable_fin_quant_model_dimensions",
         lambda: calls.append("model_dimensions"),
     )
+    monkeypatch.setattr(
+        "quant_platform.rdagent_embeddings.enable_embedding_document_chunking",
+        lambda: calls.append("embedding_documents"),
+    )
 
     def upstream_import(_name):
         calls.append("upstream_import")
@@ -35,7 +39,7 @@ def test_model_dimensions_are_applied_after_upstream_import_before_execution(mon
     fire.Fire = lambda entry: entry()
     monkeypatch.setitem(sys.modules, "fire", fire)
     run_rdagent_module.main(["runner", "rdagent.app.qlib_rd_loop.quant"])
-    assert calls == ["upstream_import", "model_dimensions", "main"]
+    assert calls == ["upstream_import", "embedding_documents", "model_dimensions", "main"]
 
 
 def test_streaming_without_outer_deadline_still_checks_exit_and_redacts(monkeypatch, capsys):
