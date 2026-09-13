@@ -28,7 +28,7 @@ def test_research_resource_costs_match_the_governed_queue_contract() -> None:
     assert research_job_cpu_cost("rdagent_factor_report") == 4
     assert research_job_memory_gb("rdagent_factor_report") == 8
     assert research_job_cpu_cost("rdagent_quant") == 12
-    assert research_job_memory_gb("rdagent_quant") == 20
+    assert research_job_memory_gb("rdagent_quant") == 40
     assert research_job_memory_gb("factor_sota_evaluate") == 40
     assert research_job_memory_gb("model_evaluate") == 40
     assert research_job_memory_gb("quant_bundle_evaluate") == 40
@@ -57,6 +57,20 @@ def test_all_cpu_research_workers_share_one_host_budget() -> None:
     assert compose.count('RESEARCH_CPU_BUDGET: "24"') == 6
     assert compose.count('RESEARCH_MEMORY_BUDGET_GB: "40"') == 6
     assert 'WORKER_JOB_KINDS: model_refit,recommendation_refresh,' in compose
+
+
+def test_joint_research_reserves_host_budget_and_matches_container_capacity() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (Path(__file__).parents[1] / "deploy/compose.yaml").read_text(encoding="utf-8")
+    )
+    worker = compose["services"]["rdagent-quant-worker"]
+    budget = int(worker["environment"]["RESEARCH_MEMORY_BUDGET_GB"])
+    assert worker["mem_limit"] == f"{budget}g"
+    assert research_job_memory_gb("rdagent_quant") == budget
+    for other in ("qlib_baseline", "data_qlib", "model_evaluate", "rdagent_run"):
+        assert research_job_memory_gb("rdagent_quant") + research_job_memory_gb(other) > budget
 
 
 def test_primary_data_worker_has_hard_limits_and_numerical_thread_caps() -> None:

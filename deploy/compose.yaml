@@ -528,7 +528,7 @@ services:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
     cpus: "12.0"
-    mem_limit: 20g
+    mem_limit: 40g
     logging: *default-logging
     labels: *release-labels
     environment:

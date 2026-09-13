@@ -64,7 +64,9 @@ RESEARCH_JOB_MEMORY_GB = {
     "minute_qlib": 24,
     "rdagent_run": 12,
     "rdagent_factor_report": 8,
-    "rdagent_quant": 20,
+    # The joint loop retains factor matrices while its model sandbox trains.
+    # Reserve the shared research budget so another heavy job cannot overlap.
+    "rdagent_quant": 40,
     "minute_research": 8,
     # The full Alpha158/LightGBM baseline reached about 36.4 GiB RSS on the
     # production 32-core/64-GiB host.  Charge the full 40-GiB research budget

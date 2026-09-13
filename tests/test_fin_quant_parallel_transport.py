@@ -9,15 +9,12 @@ import pytest
 pytestmark = pytest.mark.no_database
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Production Pandarallel uses Linux fork")
-def test_pipe_factor_deduplication_matches_upstream_without_temporary_files(monkeypatch):
+@pytest.mark.skipif(sys.platform != "linux", reason="Pinned production RD-Agent runtime")
+def test_daily_factor_deduplication_ignores_upstream_parallel_initialization(monkeypatch):
     pytest.importorskip("rdagent")
     core = pytest.importorskip("pandarallel.core")
     from pandarallel import pandarallel
 
-    initialize = pandarallel.initialize
-    monkeypatch.setattr(pandarallel, "initialize",
-                        lambda **kw: initialize(**{**kw, "nb_workers": 2}))
     from quant_platform.rdagent_runner import QuantLabFactorRunner
 
     # Reproduce the late upstream import resetting a previously configured pipe.
@@ -25,9 +22,10 @@ def test_pipe_factor_deduplication_matches_upstream_without_temporary_files(monk
     pandarallel.initialize(verbose=1, use_memory_fs=True)
 
     def reject_tempfile(*args, **kwargs):
-        raise AssertionError("factor deduplication must not allocate temporary pickle files")
+        raise AssertionError("factor deduplication must not fork or serialize full frames")
 
     monkeypatch.setattr(core, "NamedTemporaryFile", reject_tempfile)
+    monkeypatch.setattr(pd.core.groupby.DataFrameGroupBy, "parallel_apply", reject_tempfile)
     rows = 2000
     index = pd.MultiIndex.from_product(
         [pd.date_range("2020-01-01", periods=10), range(rows // 10)],

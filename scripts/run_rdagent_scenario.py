@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -120,6 +121,7 @@ def _run_streaming_redacted(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        start_new_session=os.name == "posix",
     )
     if process.stdout is None:
         process.kill()
@@ -137,26 +139,79 @@ def _run_streaming_redacted(
     thread.start()
     deadline = time.monotonic() + timeout if timeout is not None else None
     ended = False
-    while not ended or process.poll() is None:
-        if deadline is not None and time.monotonic() >= deadline and process.poll() is None:
-            process.terminate()
+    exited_at = None
+    previous_handlers = {}
+
+    def terminate_wrapper(signum, _frame):
+        # Worker cancellation must also reach the child in its owned session.
+        raise SystemExit(128 + signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, terminate_wrapper)
+    try:
+        while True:
+            # Poll independently of EOF: an orphan can keep stdout open after
+            # the research leader is OOM-killed. This is not an execution timer.
+            return_code = process.poll()
+            now = time.monotonic()
+            if return_code is not None:
+                if exited_at is None:
+                    exited_at = now
+                if ended or now - exited_at >= 2:
+                    break
+            elif deadline is not None and now >= deadline:
+                raise subprocess.TimeoutExpired(command, timeout)
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            raise subprocess.TimeoutExpired(command, timeout)
+                item = messages.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                ended = True
+            else:
+                print(_redact(item, secrets), end="", flush=True)
+    finally:
         try:
-            item = messages.get(timeout=0.2)
-        except queue.Empty:
-            continue
-        if item is None:
-            ended = True
-        else:
-            print(_redact(item, secrets), end="", flush=True)
-    thread.join(timeout=2)
+            _stop_owned_processes(process)
+            thread.join(timeout=2)
+            while not messages.empty():
+                item = messages.get_nowait()
+                if item is not None:
+                    print(_redact(item, secrets), end="", flush=True)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
     return_code = process.wait()
     if return_code:
         raise subprocess.CalledProcessError(return_code, command)
+
+
+def _stop_owned_processes(process: subprocess.Popen) -> None:
+    """Clean up only the session created for this command, even if its leader died."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    process.wait(timeout=2)
 
 
 def _verify_feature_set(args: argparse.Namespace) -> str | None:

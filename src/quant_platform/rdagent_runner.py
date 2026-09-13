@@ -17,6 +17,8 @@ from rdagent.scenarios.qlib.experiment.factor_experiment import QlibFactorExperi
 from rdagent.scenarios.qlib.experiment.model_experiment import QlibModelExperiment
 from rdagent.scenarios.qlib.experiment.workspace import QlibFBWorkspace
 
+from quant_platform.factor_deduplication import deduplicate_daily_factors
+
 _UPSTREAM_MARKET = "market: &market csi300"
 _GOVERNED_MARKET = "market: &market cn_all"
 _BENCHMARK_ANCHOR = "benchmark: &benchmark SH000300"
@@ -199,13 +201,9 @@ def _govern_experiment_market(
 
 class QuantLabFactorRunner(UpstreamQlibFactorRunner):
     def deduplicate_new_factors(self, SOTA_feature, new_feature):
-        from pandarallel import pandarallel
-
-        # The configured runner is imported lazily after the RD-Agent entrypoint.
-        # Upstream initializes Pandarallel during that import, overwriting an
-        # entrypoint-level setting. Bind transport at its actual point of use.
-        pandarallel.initialize(verbose=1, use_memory_fs=False)
-        return super().deduplicate_new_factors(SOTA_feature, new_feature)
+        return deduplicate_daily_factors(
+            SOTA_feature, new_feature, self.calculate_information_coefficient
+        )
 
     def develop(self, exp: QlibFactorExperiment) -> QlibFactorExperiment:
         _govern_experiment_market(exp, _FACTOR_CONFIGS)
