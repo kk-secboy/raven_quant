@@ -15,14 +15,14 @@ def test_pipe_factor_deduplication_matches_upstream_without_temporary_files(monk
     core = pytest.importorskip("pandarallel.core")
     from pandarallel import pandarallel
 
-    from scripts.run_rdagent_module import _enable_fin_quant_pipe_transport
-
     initialize = pandarallel.initialize
     monkeypatch.setattr(pandarallel, "initialize",
                         lambda **kw: initialize(**{**kw, "nb_workers": 2}))
-    from rdagent.scenarios.qlib.developer.factor_runner import QlibFactorRunner
+    from quant_platform.rdagent_runner import QuantLabFactorRunner
 
-    _enable_fin_quant_pipe_transport()
+    # Reproduce the late upstream import resetting a previously configured pipe.
+    pandarallel.initialize(verbose=1, use_memory_fs=False)
+    pandarallel.initialize(verbose=1, use_memory_fs=True)
 
     def reject_tempfile(*args, **kwargs):
         raise AssertionError("factor deduplication must not allocate temporary pickle files")
@@ -37,7 +37,7 @@ def test_pipe_factor_deduplication_matches_upstream_without_temporary_files(monk
     proposed = pd.DataFrame({"duplicate": sota["a"], "negative": -sota["a"],
                             "independent": rng.normal(size=rows)}, index=index)
     proposed.iloc[::13, 2] = np.nan
-    runner = object.__new__(QlibFactorRunner)
+    runner = object.__new__(QuantLabFactorRunner)
     actual = runner.deduplicate_new_factors(sota, proposed)
     correlations = pd.concat([sota, proposed], axis=1).groupby("datetime").apply(
         lambda group: runner.calculate_information_coefficient(group, 2, 3)).mean()

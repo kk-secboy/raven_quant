@@ -198,6 +198,15 @@ def _govern_experiment_market(
 
 
 class QuantLabFactorRunner(UpstreamQlibFactorRunner):
+    def deduplicate_new_factors(self, SOTA_feature, new_feature):
+        from pandarallel import pandarallel
+
+        # The configured runner is imported lazily after the RD-Agent entrypoint.
+        # Upstream initializes Pandarallel during that import, overwriting an
+        # entrypoint-level setting. Bind transport at its actual point of use.
+        pandarallel.initialize(verbose=1, use_memory_fs=False)
+        return super().deduplicate_new_factors(SOTA_feature, new_feature)
+
     def develop(self, exp: QlibFactorExperiment) -> QlibFactorExperiment:
         _govern_experiment_market(exp, _FACTOR_CONFIGS)
         _install_execute_guard(
