@@ -242,8 +242,11 @@ def main(argv: list[str]) -> int:
         )
     target = importlib.import_module(module)
     if module == "rdagent.app.qlib_rd_loop.quant":
+        from quant_platform.fin_quant_model_dimensions import enable_fin_quant_model_dimensions
+
         _enable_fin_quant_pipe_transport()
         _enable_fin_quant_execution_compatibility()
+        enable_fin_quant_model_dimensions()
         _enable_fin_quant_arm_coverage()
     entry = getattr(target, "main", None)
     if not callable(entry):

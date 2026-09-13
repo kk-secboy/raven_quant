@@ -24,6 +24,10 @@ def test_pipe_transport_is_applied_after_upstream_import_before_execution(monkey
     monkeypatch.setattr(
         run_rdagent_module, "_enable_fin_quant_execution_compatibility", lambda: None)
     monkeypatch.setattr(run_rdagent_module, "_enable_fin_quant_arm_coverage", lambda: None)
+    monkeypatch.setattr(
+        "quant_platform.fin_quant_model_dimensions.enable_fin_quant_model_dimensions",
+        lambda: calls.append("model_dimensions"),
+    )
 
     def upstream_import(_name):
         calls.append("upstream_import_initialized_memory_files")
@@ -35,7 +39,7 @@ def test_pipe_transport_is_applied_after_upstream_import_before_execution(monkey
     monkeypatch.setitem(sys.modules, "fire", fire)
     run_rdagent_module.main(["runner", "rdagent.app.qlib_rd_loop.quant"])
     assert calls == ["upstream_import_initialized_memory_files",
-                     {"verbose": 1, "use_memory_fs": False}, "main"]
+                     {"verbose": 1, "use_memory_fs": False}, "model_dimensions", "main"]
 
 
 def test_streaming_without_outer_deadline_still_checks_exit_and_redacts(monkeypatch, capsys):
