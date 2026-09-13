@@ -233,6 +233,8 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml ps
 已取消且尚未导出候选的联合研究，可用 `scripts/recover_fin_quant_handoff.py --restart-cycle`
 生成绑定新发布身份的重启计划，再通过 `--plan`、`--plan-sha256`、`--execute` 执行。
 它保留原模型选拔与旧实验，只转移原任务剩余的执行尝试预算；旧任务不能直接跨版本重试。
+若原任务已经失败并耗尽尝试，修复发布后可显式指定 `--repair-attempts 1`，
+把一次新的操作员重试预算记入计划和审计；旧尝试计数、失败及实验记录保持不变。
 
 ## 测试
 

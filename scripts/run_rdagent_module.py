@@ -66,6 +66,16 @@ def _enable_qlib_file_tracking_compatibility() -> None:
 _FIN_QUANT_ARMS = ("factor", "model")
 
 
+def _enable_fin_quant_pipe_transport() -> None:
+    """Keep upstream parallel IC calculations off Docker's small /dev/shm."""
+    from pandarallel import pandarallel
+
+    # Run after the upstream factor_runner import, which initializes the global
+    # pandas parallel methods using memory files by default. Pipe transport keeps
+    # the same chunks, worker count, function and reducer without temporary files.
+    pandarallel.initialize(verbose=1, use_memory_fs=False)
+
+
 def _enable_fin_quant_execution_compatibility() -> None:
     """Use the pinned Docker runtime and drain admitted Qlib training steps."""
     from rdagent.components.workflow import rd_loop
@@ -232,6 +242,7 @@ def main(argv: list[str]) -> int:
         )
     target = importlib.import_module(module)
     if module == "rdagent.app.qlib_rd_loop.quant":
+        _enable_fin_quant_pipe_transport()
         _enable_fin_quant_execution_compatibility()
         _enable_fin_quant_arm_coverage()
     entry = getattr(target, "main", None)

@@ -32,20 +32,29 @@ from .fin_quant_handoff_recovery import (
 from .research_tournament import canonical_sha256
 
 RUNTIME_RESTART_VERSION = "fin-quant-runtime-restart-v1"
+RUNTIME_REPAIR_VERSION = "fin-quant-runtime-repair-v1"
+RUNTIME_RECOVERY_VERSIONS = {RUNTIME_RESTART_VERSION, RUNTIME_REPAIR_VERSION}
 
 
 def remaining_restart_attempts(cycle: dict[str, Any]) -> int | None:
     lineage = (cycle.get("state") or {}).get(RECOVERY_KEY) or {}
-    if lineage.get("contract_version") != RUNTIME_RESTART_VERSION:
+    if lineage.get("contract_version") not in RUNTIME_RECOVERY_VERSIONS:
         return None
     restart = lineage["runtime_restart"]
     remaining = restart["max_attempts"] - restart["consumed_attempts"]
+    if lineage["contract_version"] == RUNTIME_REPAIR_VERSION:
+        require(remaining == restart["remaining_attempts"] == 0
+                and type(lineage.get("operator_retry_attempts")) is int
+                and lineage["operator_retry_attempts"] == 1,
+                "operator repair requires exactly one new attempt after exhaustion")
+        return 1
     require(0 < remaining == restart["remaining_attempts"], "restart attempt budget changed")
     return remaining
 
 
 def read_runtime_predecessor(service: Any, connection: Any, cycle_id: str,
-                             source: dict[str, Any]) -> dict[str, Any]:
+                             source: dict[str, Any], *, operator_repair: bool = False,
+                             ) -> dict[str, Any]:
     from .autopilot import AutopilotStore
     from .fin_quant_handoff_recovery import _JoinedEngine
 
@@ -53,7 +62,8 @@ def read_runtime_predecessor(service: Any, connection: Any, cycle_id: str,
     store.engine = _JoinedEngine(connection)
     prior = store.get_cycle(cycle_id)
     lineage = prior["state"].get(RECOVERY_KEY) or {}
-    require(lineage.get("contract_version") == RECOVERY_VERSION,
+    versions = {RECOVERY_VERSION} | (RUNTIME_RECOVERY_VERSIONS if operator_repair else set())
+    require(lineage.get("contract_version") in versions,
             "only the original handoff activity may consume a runtime restart")
     # Historical verification uses its recorded release. The new activity is
     # separately pinned to the actual accepted release by ordinary verification.
@@ -62,6 +72,8 @@ def read_runtime_predecessor(service: Any, connection: Any, cycle_id: str,
         quantlab_release_id=target.get("release_id"),
         quantlab_config_digest=target.get("config_digest"),
     ))
+    if lineage["contract_version"] in RUNTIME_RECOVERY_VERSIONS:
+        verify_runtime_predecessor(service, connection, prior, source)
     require(prior["status"] in {"paused", "blocked"}, "predecessor is not stopped")
     branches = prior["branches"]
     require(len(branches) == 1 and branches[0]["scenario"] == "fin_quant"
@@ -74,13 +86,18 @@ def read_runtime_predecessor(service: Any, connection: Any, cycle_id: str,
     run, job = row_dict(run_row), row_dict(job_row)
     payload = job["payload_json"]
     require(run["status"] in {"failed", "cancelled"}
-            and job["status"] == "cancelled" and job["kind"] == "rdagent_quant"
+            and job["status"] == ("failed" if operator_repair else "cancelled")
+            and job["kind"] == "rdagent_quant"
             and run["finished_at"] and job["finished_at"]
             and run["job_id"] == job["id"] == branch["job_id"]
             and payload["research_run_id"] == run["id"]
             and run["config_json"]["autopilot_cycle_id"] == prior["id"],
             "predecessor cancellation has not settled")
-    require(0 < job["attempts"] < job["max_attempts"], "predecessor retry budget exhausted")
+    if operator_repair:
+        require(prior["finished_at"] and 0 < job["attempts"] == job["max_attempts"],
+                "operator repair requires a terminal exhausted failure")
+    else:
+        require(0 < job["attempts"] < job["max_attempts"], "predecessor retry budget exhausted")
     require(payload["expected_rdagent_runtime"] == run["config_json"]["expected_rdagent_runtime"],
             "predecessor runtime ownership differs")
     event = prior["state"]["research_event"]
@@ -142,7 +159,9 @@ def verify_runtime_predecessor(service: Any, connection: Any, cycle: dict[str, A
                                source: dict[str, Any]) -> None:
     lineage = cycle["state"][RECOVERY_KEY]
     frozen = lineage["runtime_restart"]
-    current = read_runtime_predecessor(service, connection, frozen["cycle_id"], source)
+    current = read_runtime_predecessor(
+        service, connection, frozen["cycle_id"], source,
+        operator_repair=lineage["contract_version"] == RUNTIME_REPAIR_VERSION)
     require(current["cycle"]["finished_at"] is not None, "predecessor still owns the horizon")
     require(current["proof"] == frozen, "runtime predecessor evidence changed")
     remaining_restart_attempts(cycle)

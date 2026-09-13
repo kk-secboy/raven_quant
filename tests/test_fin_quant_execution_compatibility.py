@@ -13,6 +13,31 @@ from scripts import run_rdagent_module, run_rdagent_scenario
 pytestmark = pytest.mark.no_database
 
 
+def test_pipe_transport_is_applied_after_upstream_import_before_execution(monkeypatch):
+    calls = []
+    module = ModuleType("pandarallel")
+    module.pandarallel = SimpleNamespace(initialize=lambda **kw: calls.append(kw))
+    monkeypatch.setitem(sys.modules, "pandarallel", module)
+    monkeypatch.setattr(
+        run_rdagent_module, "_enable_qlib_file_tracking_compatibility", lambda: None)
+    monkeypatch.setattr(run_rdagent_module, "_embedding_is_configured", lambda _env: True)
+    monkeypatch.setattr(
+        run_rdagent_module, "_enable_fin_quant_execution_compatibility", lambda: None)
+    monkeypatch.setattr(run_rdagent_module, "_enable_fin_quant_arm_coverage", lambda: None)
+
+    def upstream_import(_name):
+        calls.append("upstream_import_initialized_memory_files")
+        return SimpleNamespace(main=lambda: calls.append("main"))
+
+    monkeypatch.setattr(run_rdagent_module.importlib, "import_module", upstream_import)
+    fire = ModuleType("fire")
+    fire.Fire = lambda entry: entry()
+    monkeypatch.setitem(sys.modules, "fire", fire)
+    run_rdagent_module.main(["runner", "rdagent.app.qlib_rd_loop.quant"])
+    assert calls == ["upstream_import_initialized_memory_files",
+                     {"verbose": 1, "use_memory_fs": False}, "main"]
+
+
 def test_streaming_without_outer_deadline_still_checks_exit_and_redacts(monkeypatch, capsys):
     monkeypatch.setenv("TEST_RUN_API_KEY", "private-value-123")
     run_rdagent_scenario._run_streaming_redacted(

@@ -200,13 +200,13 @@ def require_recovery_lineage(
 ) -> dict[str, Any]:
     """Validate the only permitted cross-cycle model-tournament reference."""
     from .autopilot import _manual_research_event
-    from .fin_quant_runtime_restart import RUNTIME_RESTART_VERSION
+    from .fin_quant_runtime_restart import RUNTIME_RECOVERY_VERSIONS
 
     lineage = deepcopy((cycle.get("state") or {}).get(RECOVERY_KEY))
     require(isinstance(lineage, dict), "lineage is missing")
     digest = lineage.pop("sha256", None)
     require(digest == canonical_sha256(lineage), "lineage hash changed")
-    require(lineage.get("contract_version") in {RECOVERY_VERSION, RUNTIME_RESTART_VERSION}
+    require(lineage.get("contract_version") in {RECOVERY_VERSION, *RUNTIME_RECOVERY_VERSIONS}
             and source is not None and source.get("id") == lineage.get("source_cycle_id")
             and source.get("id") != cycle.get("id"), "source ownership differs")
     require(canonical_sha256(source_identity(source)) == lineage.get("source_cycle_sha256"),
@@ -364,7 +364,7 @@ class FinQuantHandoffRecovery:
 
     def verify(self, cycle: dict[str, Any], *, connection: Any = None) -> dict[str, Any]:
         from .fin_quant_runtime_restart import (
-            RUNTIME_RESTART_VERSION,
+            RUNTIME_RECOVERY_VERSIONS,
             verify_runtime_predecessor,
         )
 
@@ -374,15 +374,18 @@ class FinQuantHandoffRecovery:
         source_id = (cycle.get("state") or {}).get(RECOVERY_KEY, {}).get("source_cycle_id")
         evidence = self._read(connection, source_id)
         require_recovery_evidence(cycle, evidence, self.controller.settings)
-        if cycle["state"][RECOVERY_KEY]["contract_version"] == RUNTIME_RESTART_VERSION:
+        if cycle["state"][RECOVERY_KEY]["contract_version"] in RUNTIME_RECOVERY_VERSIONS:
             verify_runtime_predecessor(self, connection, cycle, evidence)
         return evidence
 
     def _plan(self, connection: Any, source_cycle_id: str, event_key: str,
-              actor: str, reason: str, restart_cycle_id: str | None = None) -> dict[str, Any]:
+              actor: str, reason: str, restart_cycle_id: str | None = None,
+              repair_attempts: int = 0) -> dict[str, Any]:
         from .autopilot import _manual_research_event, _research_event_request
         from .rdagent_runtime import validate_duration_limit
 
+        require(type(repair_attempts) is int and repair_attempts in (0, 1)
+                and (not repair_attempts or restart_cycle_id), "invalid operator repair budget")
         evidence = self._read(connection, source_cycle_id)
         event = _manual_research_event(evidence["source"])
         request = _research_event_request(**{
@@ -428,20 +431,26 @@ class FinQuantHandoffRecovery:
         }
         if restart_cycle_id is not None:
             from .fin_quant_runtime_restart import (
+                RUNTIME_REPAIR_VERSION,
                 RUNTIME_RESTART_VERSION,
                 read_runtime_predecessor,
             )
 
-            prior = read_runtime_predecessor(self, connection, restart_cycle_id, evidence)
-            require(prior["cycle"].get("finished_at") is None,
-                    "runtime restart predecessor was already closed")
+            prior = read_runtime_predecessor(self, connection, restart_cycle_id, evidence,
+                                             operator_repair=bool(repair_attempts))
+            if not repair_attempts:
+                require(prior["cycle"].get("finished_at") is None,
+                        "runtime restart predecessor was already closed")
             require(prior["proof"]["old_release"] != target, "runtime release was not repaired")
             plan.update(contract_version=RUNTIME_RESTART_VERSION,
                         runtime_restart=prior["proof"])
+            if repair_attempts:
+                plan.update(contract_version=RUNTIME_REPAIR_VERSION,
+                            operator_retry_attempts=repair_attempts)
         return plan
 
     def plan_runtime_restart(self, cycle_id: str, event_key: str, actor: str,
-                             reason: str) -> dict[str, Any]:
+                             reason: str, *, repair_attempts: int = 0) -> dict[str, Any]:
         from .autopilot import AutopilotStore
 
         with self.controller.engine.connect() as connection:
@@ -451,7 +460,8 @@ class FinQuantHandoffRecovery:
             prior = store.get_cycle(cycle_id)
             root_id = (prior["state"].get(RECOVERY_KEY) or {}).get("source_cycle_id")
             require(root_id, "runtime predecessor has no sealed model source")
-            return self._plan(connection, root_id, event_key, actor, reason, cycle_id)
+            return self._plan(connection, root_id, event_key, actor, reason, cycle_id,
+                              repair_attempts)
 
     def plan(self, source_cycle_id: str, event_key: str, actor: str,
              reason: str) -> dict[str, Any]:
@@ -461,14 +471,21 @@ class FinQuantHandoffRecovery:
 
     def execute(self, plan: dict[str, Any], *, expected_sha256: str) -> dict[str, Any]:
         from .autopilot import AutopilotStore, _manual_research_event, _now
-        from .fin_quant_runtime_restart import RUNTIME_RESTART_VERSION, read_runtime_predecessor
+        from .fin_quant_runtime_restart import (
+            RUNTIME_RECOVERY_VERSIONS,
+            RUNTIME_REPAIR_VERSION,
+            read_runtime_predecessor,
+        )
 
         require(canonical_sha256(plan) == expected_sha256, "approved plan hash changed")
-        require(plan.get("contract_version") in {RECOVERY_VERSION, RUNTIME_RESTART_VERSION},
+        require(plan.get("contract_version") in {RECOVERY_VERSION, *RUNTIME_RECOVERY_VERSIONS},
                 "unsupported recovery plan")
         restart = plan.get("runtime_restart")
-        require(bool(restart) == (plan["contract_version"] == RUNTIME_RESTART_VERSION),
+        require(bool(restart) == (plan["contract_version"] in RUNTIME_RECOVERY_VERSIONS),
                 "runtime restart binding is missing or unexpected")
+        repair_attempts = plan.get("operator_retry_attempts", 0)
+        require((repair_attempts == 1) == (plan["contract_version"] == RUNTIME_REPAIR_VERSION),
+                "operator repair budget is missing or unexpected")
         request = plan["request"]
         with self.controller.engine.begin() as connection:
             AutopilotStore._lock_horizon(connection, request["horizon_profile"])
@@ -504,7 +521,7 @@ class FinQuantHandoffRecovery:
                 return existing
             actual = self._plan(connection, plan["source_cycle_id"], request["event_key"],
                                 request["actor"], request["reason"],
-                                restart["cycle_id"] if restart else None)
+                                restart["cycle_id"] if restart else None, repair_attempts)
             require(actual == plan, "live state or target release changed after planning")
             # Prevent duplicate operator recovery with a different event key.
             owner_column = autopilot_cycles.c.state_json[RECOVERY_KEY]["source_cycle_id"]
@@ -522,11 +539,13 @@ class FinQuantHandoffRecovery:
             closed_restart = None
             if restart:
                 prior = store.get_cycle(restart["cycle_id"])
-                store.set_cycle_state(prior["id"], state=prior["state"],
-                    stage="runtime_restart_preserved", status="paused", finished=True,
-                    error="Unexported research preserved; restart uses repaired runtime.")
+                if prior["finished_at"] is None:
+                    store.set_cycle_state(prior["id"], state=prior["state"],
+                        stage="runtime_restart_preserved", status="paused", finished=True,
+                        error="Unexported research preserved; restart uses repaired runtime.")
                 closed_restart = read_runtime_predecessor(
-                    self, connection, prior["id"], evidence)["proof"]
+                    self, connection, prior["id"], evidence,
+                    operator_repair=bool(repair_attempts))["proof"]
             cycle = store.create_research_event(
                 request=request, dataset=evidence["dataset"], config=source_event["config"],
                 config_revision=source_event["config_revision"],

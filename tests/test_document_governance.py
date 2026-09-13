@@ -1250,3 +1250,13 @@ def test_runtime_restart_keeps_history_and_remaining_attempt_budget() -> None:
         "终结旧活动、创建新活动和审计必须同一事务成功或全部回滚",
     ):
         assert contract in specification
+
+
+def test_operator_runtime_repair_records_new_budget_without_resetting_history() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`fin-quant-runtime-repair-v1`", "`--repair-attempts 1`",
+        "禁止重置历史尝试次数", "每个失败活动一个后继", "递归核验全部前驱记录",
+        "默认耗尽尝试后不再自动重启", "同一事务提交或全部回滚",
+    ):
+        assert contract in specification

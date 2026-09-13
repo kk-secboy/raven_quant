@@ -15,6 +15,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-cycle")
     parser.add_argument("--restart-cycle", help="Restart unexported research on a repaired release")
+    parser.add_argument("--repair-attempts", type=int, choices=(1,),
+                        help="Explicitly grant one new attempt to an exhausted failed activity")
     parser.add_argument("--event-key")
     parser.add_argument("--actor", default="codex-operator")
     parser.add_argument("--reason")
@@ -34,9 +36,12 @@ def main() -> None:
         if (bool(args.source_cycle) == bool(args.restart_cycle)
                 or not args.event_key or not args.reason):
             parser.error("planning requires one source/restart cycle, --event-key and --reason")
+        if args.repair_attempts and not args.restart_cycle:
+            parser.error("--repair-attempts requires --restart-cycle")
         planner = service.plan_runtime_restart if args.restart_cycle else service.plan
+        options = {"repair_attempts": args.repair_attempts} if args.repair_attempts else {}
         print(json.dumps(planner(args.restart_cycle or args.source_cycle,
-                                 args.event_key, args.actor, args.reason),
+                                 args.event_key, args.actor, args.reason, **options),
                          sort_keys=True, indent=2, ensure_ascii=False))
 
 
