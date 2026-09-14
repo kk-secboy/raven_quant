@@ -21,8 +21,8 @@ pytestmark = pytest.mark.no_database
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_v43_seals_the_complete_mainline_runner_and_preserves_prior_schema() -> None:
-    assert RECIPE_VERSION == "qlib-rdagent-single-mainline-2026-09-08-v43"
+def test_v44_seals_the_complete_mainline_runner_and_preserves_prior_schema() -> None:
+    assert RECIPE_VERSION == "qlib-rdagent-single-mainline-2026-09-14-v44"
     assert runtime.STRATEGY_RESEARCH_TARGET_RECIPE_VERSION == RECIPE_VERSION
     assert runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 == hashlib.sha256(
         (ROOT / "scripts/run_multifactor_backtest.py").read_bytes().replace(b"\r\n", b"\n")
@@ -54,7 +54,7 @@ def test_v43_seals_the_complete_mainline_runner_and_preserves_prior_schema() -> 
     assert "src/quant_platform/parameter_experiment_store.py" not in paths
 
 
-def test_v43_migration_and_metadata_preserve_the_previous_runtime_seals() -> None:
+def test_v44_migration_and_metadata_preserve_the_previous_runtime_seals() -> None:
     migrations = [
         runpy.run_path(str(ROOT / "migrations/versions" / f"{revision}.py"))
         for revision in (
@@ -63,7 +63,7 @@ def test_v43_migration_and_metadata_preserve_the_previous_runtime_seals() -> Non
             "0108_strategy_runtime_v37", "0109_strategy_runtime_v38",
             "0110_strategy_runtime_v39", "0112_strategy_runtime_v40",
             "0113_strategy_runtime_v41", "0114_strategy_runtime_v42",
-            "0115_strategy_runtime_v43",
+            "0115_strategy_runtime_v43", "0116_strategy_runtime_v44",
         )
     ]
     current = migrations[-1]
@@ -72,22 +72,22 @@ def test_v43_migration_and_metadata_preserve_the_previous_runtime_seals() -> Non
         for item in strategy_versions.constraints
         if hasattr(item, "sqltext")
     }
-    assert current["revision"] == "0115_strategy_runtime_v43"
+    assert current["revision"] == "0116_strategy_runtime_v44"
     assert current["RECIPE_VERSION"] == RECIPE_VERSION
     assert current["RUNNER_SHA256"] == runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
     assert current["RUNTIME_BUNDLE_SHA256"] == (
         runtime.STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     )
     for version, migration in zip(
-        (33, 34, 35, 36, 37, 38, 39, 40, 41, 42), migrations[:-1], strict=True,
+        (33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43), migrations[:-1], strict=True,
     ):
         for field in ("RECIPE_VERSION", "RUNNER_SHA256", "RUNTIME_BUNDLE_SHA256"):
             assert getattr(runtime, f"STRATEGY_RESEARCH_V{version}_TARGET_{field}") == (
                 migration[field]
             )
-    assert current["down_revision"] == "0114_strategy_runtime_v42"
+    assert current["down_revision"] == "0115_strategy_runtime_v43"
     activity = runpy.run_path(str(ROOT / "migrations/versions/0111_autopilot_research_events.py"))
-    assert activity["down_revision"] == migrations[-5]["revision"]
+    assert activity["down_revision"] == migrations[-6]["revision"]
     for migration in migrations:
         assert constraints[migration["CONSTRAINT"]] == migration["_constraint"]()
     # Execution/cadence change while the sealed economic runner bytes stay unchanged.
@@ -98,7 +98,7 @@ def test_v43_migration_and_metadata_preserve_the_previous_runtime_seals() -> Non
 @pytest.mark.parametrize(
     "recipe_id", ["short_relative_strength", "swing_trend", "long_quality_value"],
 )
-def test_v43_bound_job_checks_current_runner_bundle_and_worker_image(
+def test_v44_bound_job_checks_current_runner_bundle_and_worker_image(
     monkeypatch: pytest.MonkeyPatch, recipe_id: str,
 ) -> None:
     image = "sha256:" + "1" * 64
@@ -123,24 +123,24 @@ def test_v43_bound_job_checks_current_runner_bundle_and_worker_image(
     ) == runtime.STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
     with monkeypatch.context() as changed:
         changed.setattr(runtime, "_file_sha256", lambda _path: "0" * 64)
-        with pytest.raises(ValueError, match="transparent v43 runner bytes differ"):
+        with pytest.raises(ValueError, match="transparent v44 runner bytes differ"):
             runtime.require_transparent_baseline_runner(
                 config=config, job_payload=payload, runner_path=runner_path
             )
     with monkeypatch.context() as changed:
         changed.setattr(runtime, "position_risk_bundle_sha256", lambda _root: "0" * 64)
-        with pytest.raises(ValueError, match="transparent v43 runtime bundle differs"):
+        with pytest.raises(ValueError, match="transparent v44 runtime bundle differs"):
             runtime.require_transparent_baseline_runner(
                 config=config, job_payload=payload, runner_path=runner_path
             )
     payload[runtime.TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = "sha256:" + "2" * 64
-    with pytest.raises(ValueError, match="transparent v43 worker runtime image differs"):
+    with pytest.raises(ValueError, match="transparent v44 worker runtime image differs"):
         runtime.require_transparent_baseline_runner(
             config=config, job_payload=payload, runner_path=runner_path
         )
 
 
-@pytest.mark.parametrize("version", [33, 34, 35, 36, 37, 38, 39, 40, 41, 42])
+@pytest.mark.parametrize("version", [33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43])
 @pytest.mark.parametrize(
     "recipe_id", ["short_relative_strength", "swing_trend", "long_quality_value"],
 )
@@ -188,7 +188,7 @@ def test_historical_identity_cannot_execute_current_runner_or_current_closure(
     assert payload == old_payload
 
 
-def test_v43_seal_normalization_keeps_economic_source_changes_visible() -> None:
+def test_v44_seal_normalization_keeps_economic_source_changes_visible() -> None:
     relative = "src/quant_platform/transparent_baseline_runner.py"
     source = (ROOT / relative).read_text(encoding="utf-8")
     original = _normalized_seal_payload(relative, source)
@@ -217,7 +217,7 @@ def test_v43_seal_normalization_keeps_economic_source_changes_visible() -> None:
         )
 
 
-def test_v43_database_normalization_does_not_hide_admission_rules() -> None:
+def test_v44_database_normalization_does_not_hide_admission_rules() -> None:
     relative = "src/quant_data/database.py"
     source = (ROOT / relative).read_text(encoding="utf-8")
     original = _normalized_seal_payload(relative, source)
@@ -236,7 +236,7 @@ def test_v43_database_normalization_does_not_hide_admission_rules() -> None:
 @pytest.mark.parametrize(
     "recipe_id", ["short_relative_strength", "swing_trend", "long_quality_value"],
 )
-def test_v43_current_admission_binds_release_without_weakening_sealed_oos(
+def test_v44_current_admission_binds_release_without_weakening_sealed_oos(
     monkeypatch: pytest.MonkeyPatch, recipe_id: str,
 ) -> None:
     image = "sha256:" + "1" * 64
@@ -256,7 +256,7 @@ def test_v43_current_admission_binds_release_without_weakening_sealed_oos(
         runtime.TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: image,
     }
     for mode in ("pre_registered_replay", None):
-        with pytest.raises(ValueError, match="v43.*requires sealed final OOS"):
+        with pytest.raises(ValueError, match="v44.*requires sealed final OOS"):
             _bind_current_transparent_runtime_identity({**config, "evidence_mode": mode})
     for field in bound["transparent_baseline_bootstrap"]:
         mismatched = deepcopy(bound)
@@ -266,14 +266,14 @@ def test_v43_current_admission_binds_release_without_weakening_sealed_oos(
             _bind_current_transparent_runtime_identity(mismatched)
         assert mismatched == before
     monkeypatch.delenv(runtime.WORKER_RUNTIME_IMAGE_DIGEST_ENV)
-    with pytest.raises(ValueError, match="v43 worker runtime image digest is missing"):
+    with pytest.raises(ValueError, match="v44 worker runtime image digest is missing"):
         _bind_current_transparent_runtime_identity(config)
 
 
-def test_v43_migration_only_adds_and_removes_its_own_constraint(
+def test_v44_migration_only_adds_and_removes_its_own_constraint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    migration = runpy.run_path(str(ROOT / "migrations/versions/0115_strategy_runtime_v43.py"))
+    migration = runpy.run_path(str(ROOT / "migrations/versions/0116_strategy_runtime_v44.py"))
     operations = []
     monkeypatch.setattr(
         migration["op"], "create_check_constraint",
@@ -291,10 +291,10 @@ def test_v43_migration_only_adds_and_removes_its_own_constraint(
     migration["downgrade"]()
     assert operations == [
         ("create", (
-            "ck_strategy_versions_v43_runtime_identity", "strategy_versions",
+            "ck_strategy_versions_v44_runtime_identity", "strategy_versions",
             migration["_constraint"](),
         ), {"schema": "quantlab"}),
-        ("drop", ("ck_strategy_versions_v43_runtime_identity", "strategy_versions"), {
+        ("drop", ("ck_strategy_versions_v44_runtime_identity", "strategy_versions"), {
             "schema": "quantlab", "type_": "check",
         }),
     ]

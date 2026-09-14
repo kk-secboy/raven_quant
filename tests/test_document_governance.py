@@ -330,7 +330,7 @@ def test_capacity_rounding_contract_keeps_constraints_and_versions_separate() ->
     ):
         assert contract in capacity
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-08-v43`" in readme
+    assert "当前受管策略运行时为 `qlib-rdagent-single-mainline-2026-09-14-v44`" in readme
     assert "不能沿用旧结果宣称等价" in readme
 
 
@@ -1210,6 +1210,18 @@ def test_v43_observes_model_progress_without_erasing_failures_or_duplicate_trial
         "重复资源预检并入首个正式实验格", "成功制品直接计入原有三窗口、三种子实验集合",
         "首格失败保留真实失败和资源证据", "不增加统计机会，不减少正式格，不重开 OOS",
         "新合同只在正常的新活动边界启用",
+    ):
+        assert contract in specification
+
+
+def test_v44_revalidates_factor_history_without_rewriting_failed_research() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+    for contract in (
+        "`qlib-rdagent-single-mainline-2026-09-14-v44`", "`0116_strategy_runtime_v44`",
+        "提交历史不得缩短冻结训练区间", "正式样本外上界继续隔离",
+        "`RESEARCH_MEMORY_BUDGET_GB`", "`fin-quant-history-revalidation-v1`",
+        "不新增 RD-Agent 研究轮次", "旧失败试验和执行记录保持不变",
+        "不继承旧统计结论或准入权限", "每个源活动只能创建一个此类验证后继",
     ):
         assert contract in specification
 
