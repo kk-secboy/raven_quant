@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from copy import deepcopy
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -44,6 +45,75 @@ def _module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("expression", [False, True])
+def test_factor_recompute_covers_history_before_model_fit_window(
+    monkeypatch, tmp_path, expression,
+):
+    module = _module()
+    dates = pd.date_range("2009-01-05", periods=8, freq="B")
+    frame = pd.DataFrame(
+        {"$close": range(1, 9)},
+        index=pd.MultiIndex.from_product(
+            [["SH600000"], dates], names=["instrument", "datetime"]),
+        dtype=float,
+    )
+    cutoff = dates[5].date().isoformat()
+    periods = {"train_start": dates[3].date().isoformat(), "valid_end": cutoff}
+    original_periods = deepcopy(periods)
+    view = tmp_path / "view"
+    (view / "calendars").mkdir(parents=True)
+    (view / "calendars" / "day.txt").write_text(
+        "2008-01-02\n" + "\n".join(d.date().isoformat() for d in dates[:6]), encoding="utf-8")
+    calls = []
+
+    def features(_instruments, _fields, *, start_time, end_time, freq):
+        calls.append((start_time, end_time))
+        dt = frame.index.get_level_values("datetime")
+        return frame.loc[(dt >= start_time) & (dt <= end_time)]
+
+    data = SimpleNamespace(instruments=lambda _: ["SH600000"], features=features)
+    monkeypatch.setitem(sys.modules, "qlib", SimpleNamespace(init=lambda **_: None))
+    monkeypatch.setitem(sys.modules, "qlib.data", SimpleNamespace(D=data))
+    expected = frame.iloc[:6].swaplevel().sort_index().rolling(3).mean()
+    submitted = tmp_path / "submitted.h5"
+    expected.to_hdf(submitted, key="data", mode="w")
+    factor = {"candidate_id": "factor", "code_path": "factor.py", "code_sha256": "a" * 64,
+              "submitted_values_path": str(submitted)}
+
+    def execute(**kwargs):
+        inputs = pd.read_hdf(kwargs["input_path"])
+        return inputs.rolling(3).mean(), {"executor_version": "test"}
+
+    monkeypatch.setattr(module, "execute_factor_code", execute)
+    monkeypatch.setattr(module, "validate_factor_prefix_invariance", lambda **_: {"passed": True})
+    if expression:
+        factor.update(implementation_kind="qlib_expression", expression="Mean($close,3)",
+                      required_fields=["close"])
+        monkeypatch.setattr(module, "compile_qlib_expression", lambda _: SimpleNamespace(
+            expression="Mean($close,3)", expression_sha256="b" * 64, required_fields=["close"]))
+
+        def expression_values(_data, _instruments, _expression, *, start, end):
+            assert start == dates[0].date().isoformat() and end == cutoff
+            return expected
+
+        def prefix_checks(_data, _instruments, _expression, _values, *, start):
+            assert start == dates[0].date().isoformat()
+            return {"passed": True}
+
+        monkeypatch.setattr(module, "_expression_values", expression_values)
+        monkeypatch.setattr(module, "_expression_prefix_checks", prefix_checks)
+    path, evidence = module._freeze_factor_values(
+        bundle={"factors": [factor]}, view=view, periods=periods,
+        output=tmp_path / "output", universe="cn_all",
+    )
+    assert calls == [(dates[0].date().isoformat(), cutoff)]
+    assert periods == original_periods
+    actual = pd.read_parquet(path)
+    assert actual.index.equals(expected.index)
+    assert evidence[0]["submitted_comparison"]["exact_match"] is True
+    assert evidence[0]["pit_invariance"]["passed"] is True
 
 
 def test_quant_bundle_materializes_qlib_signal_record_dependencies() -> None:

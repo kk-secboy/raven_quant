@@ -246,6 +246,15 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml ps
 恢复只补交原结果至独立验证，保留失败执行任务和原状态审计，不重新训练，
 也不替代独立消融、策略验证、正式样本外或模拟盘验证。
 
+若独立重算因实现历史被误截为模型训练区间而失败，先在原封存数据上修复并验证
+全部原始因子的精确坐标、数值及三个时点的未来数据泄漏检查，再使用
+`scripts/revalidate_fin_quant_result.py --cycle ... --event-key ... --reason ... --preflight ...`
+生成恢复计划。`--check` 回滚演练；`--execute --plan ... --plan-sha256 ...` 校验后提交。
+恢复创建新验证活动与试验记录，通过一次 `quant_result_import` 导入原研究结果；
+旧候选、失败试验和执行记录保持不变，新活动不记作新增研究轮次，也不继承准入结论。
+因子容器使用已有 `RESEARCH_MEMORY_BUDGET_GB`，不再覆盖为固定 2 GB；未配置研究预算的
+独立运行仍保留原默认值。模型训练区间、样本外边界及一致性容差保持原定义。
+
 ## 测试
 
 ```powershell

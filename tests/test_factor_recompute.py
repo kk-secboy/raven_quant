@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
+from quant_platform import factor_recompute as recompute_module
 from quant_platform.factor_recompute import (
     FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION,
+    _warmup_rows_are_prefix,
     compare_submitted_values,
     execute_factor_code,
     require_exact_oos_coverage,
@@ -16,6 +20,69 @@ from quant_platform.factor_recompute import (
 )
 
 pytestmark = pytest.mark.no_database
+
+
+@pytest.mark.parametrize("budget,expected", [("40", "40g"), ("12", "12g"), ("0", "2g")])
+def test_factor_sandbox_uses_configured_research_memory(monkeypatch, tmp_path, budget, expected):
+    monkeypatch.setenv("RESEARCH_MEMORY_BUDGET_GB", budget)
+    monkeypatch.setattr(recompute_module.shutil, "which", lambda _: "docker")
+    code = tmp_path / "factor.py"
+    code.write_text("pass", encoding="utf-8")
+    (tmp_path / "daily_pv.h5").touch()
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="sha256:" + "a" * 64, stderr="")
+
+    monkeypatch.setattr(recompute_module.subprocess, "run", run)
+    _, evidence = recompute_module._run_container_sandbox(
+        workspace=tmp_path, runtime_code=code, image="sandbox", timeout_seconds=300)
+    command = commands[-1]
+    assert command[command.index("--memory") + 1] == expected
+    assert command[command.index("--memory-swap") + 1] == expected
+    assert evidence["memory_limit_bytes"] == int(expected[:-1]) * 1024**3
+    assert command[command.index("--network") + 1] == "none"
+    assert "--read-only" in command and "no-new-privileges" in command
+
+
+def test_grouped_warmup_boundaries_match_original_instrument_rules():
+    rng = np.random.default_rng(193)
+    index = pd.MultiIndex.from_product(
+        [pd.date_range("2024-01-01", periods=17), ["A", "B", "C", "D"]],
+        names=["datetime", "instrument"],
+    )
+    instruments = index.get_level_values("instrument")
+    for _ in range(100):
+        finite = rng.random(len(index)) > 0.4
+        missing = ~finite & (rng.random(len(index)) > 0.5)
+        expected = True
+        for instrument in instruments[missing].unique():
+            positions = np.flatnonzero(instruments == instrument)
+            finite_positions = np.flatnonzero(finite[positions])
+            warmup_positions = np.flatnonzero(missing[positions])
+            if not len(finite_positions) or warmup_positions.max() >= finite_positions.min():
+                expected = False
+                break
+        assert _warmup_rows_are_prefix(index, finite, missing) is expected
+
+
+@pytest.mark.parametrize("case", ["leading", "all_nan", "interior", "no_warmup"])
+def test_grouped_warmup_boundaries_keep_strict_missing_value_checks(case):
+    index = pd.MultiIndex.from_product(
+        [pd.date_range("2024-01-01", periods=4), ["A", "B"]],
+        names=["datetime", "instrument"],
+    )
+    finite = np.array([False, True, True, True, True, True, True, True])
+    missing = np.array([True, False, False, False, False, False, False, False])
+    if case == "all_nan":
+        finite[::2] = False
+    elif case == "interior":
+        finite[4] = False
+        missing[4] = True
+    elif case == "no_warmup":
+        missing[:] = False
+    assert _warmup_rows_are_prefix(index, finite, missing) is (case in {"leading", "no_warmup"})
 
 
 def test_factor_code_is_reexecuted_against_supplied_snapshot(

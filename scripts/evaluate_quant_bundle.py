@@ -16,6 +16,7 @@ from quant_platform.factor_recompute import (
     compare_submitted_values,
     execute_factor_code,
     normalize_factor_input,
+    normalize_factor_values,
     require_exact_factor_index,
     sha256_file,
     validate_factor_prefix_invariance,
@@ -710,6 +711,24 @@ def _freeze_factor_values(
 
     qlib.init(provider_uri=str(view), region="cn")
     output.mkdir(parents=True, exist_ok=True)
+    # RD-Agent's implementation history can precede model fitting. Preserve that
+    # input boundary: truncating to train_start loses submitted rows, while adding
+    # earlier provider history changes rolling warm-up (including all-NaN factors
+    # for stocks delisted shortly after the implementation boundary). Never let a
+    # submitted slice shorten the independently frozen model training window.
+    calendar_start = (view / "calendars" / "day.txt").read_text(encoding="utf-8").splitlines()[0]
+    history_start = periods["train_start"]
+    for factor in bundle["factors"]:
+        submitted_path = factor.get("submitted_values_path")
+        if submitted_path:
+            submitted_values = normalize_factor_values(pd.read_hdf(submitted_path))
+            start = submitted_values.index.get_level_values("datetime").min()
+            if pd.isna(start):
+                raise ValueError("quant factor submitted history is empty")
+            history_start = min(history_start, start.date().isoformat())
+            del submitted_values
+    if not calendar_start <= history_start <= periods["train_start"] <= periods["valid_end"]:
+        raise ValueError("quant factor history does not cover the frozen training periods")
     declared_fields = {
         str(field)
         for factor in bundle["factors"]
@@ -731,7 +750,7 @@ def _freeze_factor_values(
                     | declared_fields
                 )
             ],
-            start_time=periods["train_start"],
+            start_time=history_start,
             end_time=periods["valid_end"],
             freq="day",
         )
@@ -754,7 +773,7 @@ def _freeze_factor_values(
                 D,
                 instruments,
                 compiled.expression,
-                start=periods["train_start"],
+                start=history_start,
                 end=periods["valid_end"],
             )
             execution = {
@@ -767,7 +786,7 @@ def _freeze_factor_values(
                 instruments,
                 compiled.expression,
                 recomputed,
-                start=periods["train_start"],
+                start=history_start,
             )
         else:
             recomputed, execution = execute_factor_code(

@@ -568,6 +568,10 @@ def _run_container_sandbox(
     if not image_id.startswith("sha256:") or len(image_id) != 71:
         raise ValueError("factor sandbox image identity is invalid")
     cidfile = workspace / "container.cid"
+    configured_memory_gb = int(os.environ.get("RESEARCH_MEMORY_BUDGET_GB", "0"))
+    if not 0 <= configured_memory_gb <= 2048:
+        raise ValueError("factor sandbox research memory budget is invalid")
+    memory_gb = configured_memory_gb or 2
     command = [
         "docker",
         "run",
@@ -584,7 +588,9 @@ def _run_container_sandbox(
         "--pids-limit",
         "128",
         "--memory",
-        "2g",
+        f"{memory_gb}g",
+        "--memory-swap",
+        f"{memory_gb}g",
         "--cpus",
         "1",
         "--user",
@@ -628,9 +634,30 @@ def _run_container_sandbox(
         "capabilities_dropped": "ALL",
         "no_new_privileges": True,
         "pids_limit": 128,
-        "memory_limit_bytes": 2 * 1024**3,
+        "memory_limit_bytes": memory_gb * 1024**3,
+        "memory_budget_source": (
+            "RESEARCH_MEMORY_BUDGET_GB" if configured_memory_gb else "standalone_default"
+        ),
         "cpu_limit": 1,
     }
+
+
+def _warmup_rows_are_prefix(
+    index: pd.MultiIndex, submitted_finite: np.ndarray, missing_from_submitted: np.ndarray,
+) -> bool:
+    """Compare per-instrument boundaries without scanning the full panel per stock."""
+    instrument_level = index.names.index("instrument")
+    codes = index.codes[instrument_level]
+    group_count = len(index.levels[instrument_level])
+    first_finite = np.full(group_count, len(index), dtype=np.int64)
+    last_warmup = np.full(group_count, -1, dtype=np.int64)
+    finite_positions = np.flatnonzero(submitted_finite)
+    warmup_positions = np.flatnonzero(missing_from_submitted)
+    np.minimum.at(first_finite, codes[finite_positions], finite_positions)
+    np.maximum.at(last_warmup, codes[warmup_positions], warmup_positions)
+    affected = last_warmup >= 0
+    return bool(np.all((first_finite[affected] < len(index))
+                       & (last_warmup[affected] < first_finite[affected])))
 
 
 def compare_submitted_values(
@@ -711,20 +738,9 @@ def compare_submitted_values(
         warmup_prefix_rows = int(missing_from_submitted.sum())
         warmup_prefix_only = True
         if warmup_prefix_rows:
-            instruments = submitted.index.get_level_values("instrument")
-            for instrument in instruments[missing_from_submitted].unique():
-                instrument_positions = np.flatnonzero(instruments == instrument)
-                instrument_submitted_finite = submitted_finite[instrument_positions]
-                instrument_warmup = missing_from_submitted[instrument_positions]
-                finite_positions = np.flatnonzero(instrument_submitted_finite)
-                warmup_positions = np.flatnonzero(instrument_warmup)
-                if (
-                    not len(finite_positions)
-                    or not len(warmup_positions)
-                    or int(warmup_positions.max()) >= int(finite_positions.min())
-                ):
-                    warmup_prefix_only = False
-                    break
+            warmup_prefix_only = _warmup_rows_are_prefix(
+                submitted.index, submitted_finite, missing_from_submitted,
+            )
         equal = bool(
             finite_value_match
             and warmup_prefix_only
