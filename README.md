@@ -240,6 +240,12 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml ps
 若原任务已经失败并耗尽尝试，修复发布后可显式指定 `--repair-attempts 1`，
 把一次新的操作员重试预算记入计划和审计；旧尝试计数、失败及实验记录保持不变。
 
+如果研究已成功导出，而联合候选交接因 `candidate_id` 被误读为 `id` 失败，
+使用 `scripts/recover_fin_quant_result.py` 生成结果交接恢复计划。它校验原始库存、
+结果、因子与模型文件及模型选拔归属；`--check` 演练后回滚数据库，`--execute` 才提交。
+恢复只补交原结果至独立验证，保留失败执行任务和原状态审计，不重新训练，
+也不替代独立消融、策略验证、正式样本外或模拟盘验证。
+
 ## 测试
 
 ```powershell

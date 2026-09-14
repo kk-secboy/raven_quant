@@ -4835,6 +4835,9 @@ class LocalJobWorker:
         for bundle in result.get("quant_bundles") or []:
             factors = []
             for factor in bundle.get("factors") or []:
+                factor_id = str(factor.get("candidate_id") or "").strip()
+                if not factor_id:
+                    raise ValueError("RD-Agent quant factor candidate identity is missing")
                 code_path = Path(str(_local_artifact_path(factor.get("code_path"))))
                 if not code_path.is_file() or _sha256_path(code_path) != factor.get("code_sha256"):
                     raise ValueError("RD-Agent quant factor artifact is invalid")
@@ -4844,13 +4847,13 @@ class LocalJobWorker:
                 if formulation:
                     try:
                         definition = self.factor_library.register_expression_definition(
-                            name=str(factor.get("name") or factor["id"]),
+                            name=str(factor.get("name") or factor_id),
                             expression=formulation,
                             proposed_family=str(
                                 (factor.get("variables") or {}).get("economic_family")
                                 or ""
                             ),
-                            alias=f"rdagent-quant:{factor['id']}",
+                            alias=f"rdagent-quant:{factor_id}",
                             source_ref=(
                                 f"rdagent-quant-run:{payload['research_run_id']}"
                             ),
